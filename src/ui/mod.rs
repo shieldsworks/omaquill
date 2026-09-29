@@ -87,8 +87,11 @@ pub struct Win {
 }
 
 pub fn run() -> glib::ExitCode {
+    // A test or demo copy can run beside the real one under its own id
+    // (OMAQUILL_APP_ID); with the same id GTK hands it to the running app.
+    let app_id = std::env::var("OMAQUILL_APP_ID").unwrap_or_else(|_| APP_ID.to_string());
     let app = adw::Application::builder()
-        .application_id(APP_ID)
+        .application_id(app_id)
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
     let theme: Rc<RefCell<Option<theme::Theme>>> = Rc::default();
@@ -126,6 +129,7 @@ pub fn run() -> glib::ExitCode {
         win.window.present();
     });
     app.connect_open(|app, files, _| {
+        let shots = std::env::var_os("OMAQUILL_SCREENSHOT").map(PathBuf::from);
         for f in files {
             let Some(path) = f.path() else { continue };
             let path = project_dir(&path);
@@ -137,6 +141,9 @@ pub fn run() -> glib::ExitCode {
             let win = Win::new(app);
             win.open_project(&path);
             win.window.present();
+            if let Some(shot) = &shots {
+                win.screenshot_then_quit(shot.clone());
+            }
         }
     });
     // Logout and shutdown send SIGTERM: close windows the normal way so
@@ -807,6 +814,41 @@ impl Win {
         } else if self.notes.view.has_focus() {
             self.notes.toggle(tag);
         }
+    }
+
+    /// For README and listing images: renders this window to a PNG at 2x
+    /// once it has settled, then quits (`OMAQUILL_SCREENSHOT=out.png
+    /// omaquill PROJECT`). GTK draws it itself, so the window needn't be on
+    /// screen.
+    fn screenshot_then_quit(self: &Rc<Self>, path: PathBuf) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+            let Some(w) = weak.upgrade() else { return };
+            let (width, height) = (w.window.width() as f64, w.window.height() as f64);
+            let paintable = gtk::WidgetPaintable::new(Some(&w.window));
+            let snapshot = gtk::Snapshot::new();
+            snapshot.scale(2.0, 2.0);
+            paintable.snapshot(&snapshot, width, height);
+            let saved = snapshot.to_node().and_then(|node| {
+                let renderer = w.window.native()?.renderer()?;
+                let texture = renderer.render_texture(
+                    &node,
+                    Some(&gtk::graphene::Rect::new(
+                        0.0,
+                        0.0,
+                        width as f32 * 2.0,
+                        height as f32 * 2.0,
+                    )),
+                );
+                texture.save_to_png(&path).ok()
+            });
+            if saved.is_none() {
+                eprintln!("omaquill: couldn't render the screenshot");
+            }
+            if let Some(app) = w.window.application() {
+                app.quit();
+            }
+        });
     }
 
     /// Puts the keyboard in the editor (or the binder) once the window is

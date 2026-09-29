@@ -3,6 +3,8 @@
 A writing studio for [Omarchy](https://omarchy.org) that opens your
 Scrivener projects.
 
+![omaquill with a Moby-Dick project open](preview.png)
+
 omaquill reads and writes Scrivener 3's `.scriv` format directly. Point it at
 the project you've been writing in on the Mac and keep going: the binder,
 your chapters and scenes, synopses, notes, labels and status are all there,
@@ -21,18 +23,52 @@ snapshots, comments and footnotes, aren't here yet. See
 
 ## Install
 
-On Omarchy (or any Arch system with GTK 4.12+ and libadwaita 1.5+):
+omaquill is two pieces from this one repository: the **app**, a GTK 4
+program built from source, and the **bar widget**, an Omarchy shell plugin
+(`io.github.shieldsworks.omaquill`) showing today's word count. The widget
+opens the app when clicked, so install both.
+
+**Needs:** GTK 4.12+ and libadwaita 1.5+ (already on Omarchy), and Rust
+to build. With [mise](https://mise.jdx.dev) (on Omarchy already) the install
+script fetches the exact Rust version this repository pins; otherwise
+install `rustup`. The build downloads its Rust crates (the GTK bindings)
+from crates.io once. Nothing else runs as root, and nothing is fetched
+while you use it.
+
+From the Omarchy plugin marketplace, or by hand, add the widget, then
+build the app from the same checkout:
+
+```sh
+omarchy plugin add https://github.com/shieldsworks/omaquill --enable
+bash ~/.config/omarchy/plugins/io.github.shieldsworks.omaquill/scripts/install-local.sh
+```
+
+Or clone it anywhere and let the script do both:
 
 ```sh
 git clone https://github.com/shieldsworks/omaquill ~/.local/share/omaquill/src
-cd ~/.local/share/omaquill/src
-bash scripts/install-local.sh --plugin
+bash ~/.local/share/omaquill/src/scripts/install-local.sh --plugin
 ```
 
-That builds a release (you need Rust: `mise install` in the checkout gets
-the right one), puts `omaquill` in `~/.local/bin`, and adds it to the app
-launcher with its icon. `.scrivx` files open in it, and `--plugin` adds the
-bar widget. There's also an AUR-style `packaging/PKGBUILD`.
+The script builds a release, puts `omaquill` in `~/.local/bin`, and adds
+it to the app launcher with its icon. `.scrivx` files open in it. It
+changes no existing configuration. There's also an AUR-style
+`packaging/PKGBUILD`.
+
+To update, pull (or `omarchy plugin update io.github.shieldsworks.omaquill`)
+and run `install-local.sh` again.
+
+## Remove
+
+```sh
+bash scripts/uninstall-local.sh            # the app: binary, launcher entry, icon, file type
+omarchy plugin remove io.github.shieldsworks.omaquill   # the bar widget
+```
+
+Your projects are never touched. omaquill's own settings
+(`~/.config/omaquill`), state (`~/.local/state/omaquill`) and your project
+backups (`~/.local/share/omaquill/backups`) stay until you delete them
+yourself.
 
 For text that looks like it did on the Mac, install the TeX Gyre fonts. They
 closely match Palatino, Times, Helvetica and Courier:
@@ -184,15 +220,10 @@ loses any Scrivener-only formatting listed above.
 
 ## The Omarchy bar widget
 
-`org.omaquill.words` shows the words you've written today, like `󰏫 312/500`
+`io.github.shieldsworks.omaquill` shows the words you've written today, like `󰏫 312/500`
 with a daily target set in Preferences. It's highlighted once you reach the
-target. Click it to open omaquill. To add it without the install script:
-
-```sh
-omarchy plugin add https://github.com/shieldsworks/omaquill --enable
-```
-
-The widget reads `~/.local/state/omaquill/today.json`, which the app keeps
+target. Click it to open omaquill (see [Install](#install); the widget does
+nothing else without the app). The widget reads `~/.local/state/omaquill/today.json`, which the app keeps
 current as you type.
 
 ## Development

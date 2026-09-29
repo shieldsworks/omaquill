@@ -9,7 +9,7 @@ import qs.Commons
 // Click to open omaquill (or bring it forward).
 BarWidget {
     id: root
-    moduleName: "org.omaquill.words"
+    moduleName: "io.github.shieldsworks.omaquill"
 
     readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME")
         || Quickshell.env("HOME") + "/.local/state") + "/omaquill"

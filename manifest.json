@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "org.omaquill.words",
+  "id": "io.github.shieldsworks.omaquill",
   "name": "omaquill",
   "version": "0.1.0",
   "author": "Casey Shields",
