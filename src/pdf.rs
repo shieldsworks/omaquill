@@ -1,6 +1,7 @@
 //! Compile to PDF, laid out by Pango and written by Cairo (the text engine
 //! and PDF writer GTK itself uses), so real fonts are embedded and text
-//! is shaped, hyphen-free justified and searchable.
+//! is shaped, justified (and in the paperback, hyphenated) and
+//! searchable.
 //!
 //! Two layouts:
 //! - **Manuscript** (`Options::manuscript`): US Letter, 1" margins, Times
@@ -289,10 +290,23 @@ impl Doc<'_> {
         align: Align,
         indent: f64,
     ) -> Result<()> {
-        let text: String = p.runs.iter().map(|r| r.text.as_str()).collect();
+        // The paperback's justified text is hyphenated (soft hyphens,
+        // shown only where a line actually breaks); a manuscript never is.
+        let texts: Vec<String> = p
+            .runs
+            .iter()
+            .map(|r| {
+                if self.book && align == Align::Justify {
+                    crate::hyphen::en_us().soft_hyphens(&r.text)
+                } else {
+                    r.text.clone()
+                }
+            })
+            .collect();
+        let text: String = texts.concat();
         let layout = self.layout(&text, size, align, self.g.text_width());
         layout.set_indent((indent * pango::SCALE as f64) as i32);
-        layout.set_attributes(Some(&attributes(p)));
+        layout.set_attributes(Some(&attributes(p, &texts)));
         let mut iter = layout.iter();
         loop {
             if self.y + leading > self.bottom_limit() + 0.01 {
@@ -421,11 +435,12 @@ impl Doc<'_> {
 
 /// Emphasis from the runs as Pango attributes. Fonts and sizes come from
 /// the layout, not the draft: a compiled book has one typeface.
-fn attributes(p: &Paragraph) -> pango::AttrList {
+/// `texts`: each run's text as laid out (hyphenated or not), for offsets.
+fn attributes(p: &Paragraph, texts: &[String]) -> pango::AttrList {
     let list = pango::AttrList::new();
     let mut at = 0u32;
-    for r in &p.runs {
-        let end = at + r.text.len() as u32;
+    for (r, text) in p.runs.iter().zip(texts) {
+        let end = at + text.len() as u32;
         let add = |mut a: pango::Attribute| {
             a.set_start_index(at);
             a.set_end_index(end);

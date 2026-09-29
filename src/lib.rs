@@ -2,6 +2,7 @@
 
 pub mod compile;
 pub mod fonts;
+pub mod hyphen;
 pub mod pdf;
 pub mod project;
 pub mod rtf;

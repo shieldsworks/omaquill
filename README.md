@@ -110,8 +110,9 @@ folder's documents are its scenes, separated by `#`. The formats:
     page with word count, "Surname / TITLE / page" header. The same look
     as the Word file.
   - **Paperback** (switch off): a 6×9" page with mirrored margins,
-    justified text in your book's own typeface, chapters opening a third
-    of the way down, running heads and page numbers. For proofreading or
+    justified and hyphenated text in your book's own typeface (TeX's
+    hyphenation patterns, words of six letters or more), chapters opening
+    a third of the way down, running heads and page numbers. For proofreading or
     a self-publishing draft.
 
   Fonts are embedded. With `tex-gyre-fonts` installed, a Palatino book

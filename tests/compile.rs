@@ -563,7 +563,19 @@ fn pdf_manuscript_and_book() {
                 .stdout,
         )
         .unwrap();
-        let squashed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The paperback hyphenates: rejoin words split at a soft hyphen.
+        let mut joined = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{ad}' {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+            } else {
+                joined.push(c);
+            }
+        }
+        let squashed = joined.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(squashed.contains("Chapter One"), "{squashed}");
         assert!(
             squashed.contains("The storm came in off the point at dusk."),
