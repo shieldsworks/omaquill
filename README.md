@@ -11,7 +11,8 @@ step and no second copy.
 
 It's written from scratch in Rust with GTK 4 and libadwaita. The Scrivener
 reader and writer, the RTF engine, and the DOCX and EPUB writers are omaquill's
-own, so the only dependencies are GTK and libadwaita. The Omarchy theme
+own. The only dependencies are GTK and libadwaita, plus GTK's own Pango and
+Cairo for PDF layout. The Omarchy theme
 colors the window and follows theme changes live.
 
 **Status: v0.1.** It's for writing. Most of Scrivener's Compile, and its
@@ -104,12 +105,25 @@ folder's documents are its scenes, separated by `#`. The formats:
   double spaced, 1" margins, 0.5" indents, a title page with your name and
   word count, and a running header. Turn that off to keep the text's own
   formatting.
+- **PDF**, in either of two layouts, picked by the same switch:
+  - **Standard manuscript**: US Letter, Times 12 pt double spaced, title
+    page with word count, "Surname / TITLE / page" header. The same look
+    as the Word file.
+  - **Paperback** (switch off): a 6×9" page with mirrored margins,
+    justified text in your book's own typeface, chapters opening a third
+    of the way down, running heads and page numbers. For proofreading or
+    a self-publishing draft.
+
+  Fonts are embedded. With `tex-gyre-fonts` installed, a Palatino book
+  prints in its close match, TeX Gyre Pagella.
 - **EPUB**, **Markdown**, **plain text** and **RTF**.
 
 From a terminal, too:
 
 ```sh
 omaquill compile "Novel.scriv" novel.docx --author "Your Name"
+omaquill compile "Novel.scriv" novel.pdf              # manuscript
+omaquill compile "Novel.scriv" book.pdf --book        # paperback
 omaquill compile "Novel.scriv" novel.epub
 ```
 

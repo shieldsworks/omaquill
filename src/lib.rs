@@ -1,6 +1,8 @@
 //! omaquill's core: Scrivener projects read and written without a GUI.
 
 pub mod compile;
+pub mod fonts;
+pub mod pdf;
 pub mod project;
 pub mod rtf;
 pub mod sha1;

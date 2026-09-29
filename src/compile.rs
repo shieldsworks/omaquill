@@ -1,5 +1,5 @@
-//! Compile: the manuscript out as one file (DOCX, EPUB, Markdown, RTF or
-//! plain text).
+//! Compile: the manuscript out as one file (DOCX, PDF, EPUB, Markdown, RTF
+//! or plain text). PDF is laid out in [`crate::pdf`].
 //!
 //! Structure follows Scrivener's novel convention: every item directly in
 //! the Draft folder is a chapter, and the text documents inside it (at any
@@ -24,11 +24,13 @@ pub enum Format {
     Markdown,
     PlainText,
     Rtf,
+    Pdf,
 }
 
 impl Format {
-    pub const ALL: [Format; 5] = [
+    pub const ALL: [Format; 6] = [
         Format::Docx,
+        Format::Pdf,
         Format::Epub,
         Format::Markdown,
         Format::PlainText,
@@ -42,6 +44,7 @@ impl Format {
             Format::Markdown => "md",
             Format::PlainText => "txt",
             Format::Rtf => "rtf",
+            Format::Pdf => "pdf",
         }
     }
 
@@ -52,6 +55,7 @@ impl Format {
             Format::Markdown => "Markdown",
             Format::PlainText => "Plain text",
             Format::Rtf => "RTF",
+            Format::Pdf => "PDF",
         }
     }
 }
@@ -141,7 +145,7 @@ fn collect_scenes(project: &Project, item: &Item, scenes: &mut Vec<RichText>) ->
     Ok(())
 }
 
-fn is_blank(p: &Paragraph) -> bool {
+pub(crate) fn is_blank(p: &Paragraph) -> bool {
     p.runs.iter().all(|r| r.text.trim().is_empty())
 }
 
@@ -198,6 +202,7 @@ pub fn compile(project: &Project, opts: &Options, format: Format) -> Result<Vec<
         Format::Markdown => markdown(&sections, opts).into_bytes(),
         Format::PlainText => plain_text(&sections, opts).into_bytes(),
         Format::Rtf => rtf_file(&sections, opts).into_bytes(),
+        Format::Pdf => crate::pdf::pdf(&sections, opts)?,
     })
 }
 
@@ -261,7 +266,7 @@ fn scene_text(text: &RichText, opts: &Options) -> RichText {
 }
 
 /// "about 12,300 words": manuscripts give the length to the nearest hundred.
-fn about_words(n: usize) -> String {
+pub(crate) fn about_words(n: usize) -> String {
     let rounded = if n == 0 {
         0
     } else {
@@ -278,7 +283,7 @@ fn about_words(n: usize) -> String {
     format!("about {grouped} words")
 }
 
-fn surname(author: &str) -> &str {
+pub(crate) fn surname(author: &str) -> &str {
     author.split_whitespace().last().unwrap_or("")
 }
 

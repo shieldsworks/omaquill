@@ -312,6 +312,21 @@ impl Win {
             )
             .active(opts.manuscript)
             .build();
+        // For PDF the switch picks between the two page layouts.
+        {
+            let manuscript = manuscript.clone();
+            let describe = move |f: Format| {
+                manuscript.set_subtitle(if f == Format::Pdf {
+                    "On: US Letter, Times 12 pt, double spaced, title page. Off: a 6×9\" paperback in your book's typeface."
+                } else {
+                    "Times 12 pt, double spaced, 1\" margins, title page. For agents and editors."
+                });
+            };
+            describe(Format::ALL[0]);
+            format.connect_selected_notify(move |row| {
+                describe(Format::ALL[row.selected() as usize % Format::ALL.len()]);
+            });
+        }
         let headings = adw::ComboRow::builder()
             .title("Chapter Headings")
             .model(&gtk::StringList::new(&[

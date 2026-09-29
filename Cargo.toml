@@ -12,6 +12,10 @@ libc = "0.2"
 # The app; the core (lib.rs) doesn't use these.
 gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
 adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
+# PDF Compile: GTK's own text layout (Pango) and PDF writer (Cairo).
+cairo-rs = { version = "0.22", features = ["pdf", "v1_16"] }
+pango = { version = "0.22", features = ["v1_44"] }
+pangocairo = "0.22"
 # SIGTERM at logout: close windows so pending text saves.
 glib-unix = "0.22"
 

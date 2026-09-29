@@ -238,7 +238,7 @@ fn skips_items_left_out_of_compile() {
 #[test]
 fn format_names() {
     let exts: Vec<_> = Format::ALL.iter().map(|f| f.extension()).collect();
-    assert_eq!(exts, ["docx", "epub", "md", "txt", "rtf"]);
+    assert_eq!(exts, ["docx", "pdf", "epub", "md", "txt", "rtf"]);
     assert!(Format::ALL.iter().all(|f| !f.label().is_empty()));
 }
 
@@ -529,4 +529,53 @@ fn rtf_output_reads_back() {
             .flat_map(|p| &p.runs)
             .any(|r| r.style.italic && r.text.contains("Twelve"))
     );
+}
+
+/// Both PDF layouts: a real PDF with the text, the right page size, the
+/// title and author set. Text is checked with pdftotext when installed.
+#[test]
+fn pdf_manuscript_and_book() {
+    let p = fixture();
+    for (manuscript, size) in [(true, "612 x 792"), (false, "432 x 648")] {
+        let o = Options {
+            manuscript,
+            ..opts(&p)
+        };
+        let bytes = compile::compile(&p, &o, Format::Pdf).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        if !(have("pdftotext") && have("pdfinfo")) {
+            continue;
+        }
+        let dir = scratch(&format!("pdf-{manuscript}"));
+        let file = dir.0.join("out.pdf");
+        std::fs::write(&file, &bytes).unwrap();
+        let info =
+            String::from_utf8(Command::new("pdfinfo").arg(&file).output().unwrap().stdout).unwrap();
+        assert!(info.contains(size), "{info}");
+        assert!(info.contains("Ada Q. Writer"), "{info}");
+        let text = String::from_utf8(
+            Command::new("pdftotext")
+                .arg("-layout")
+                .arg(&file)
+                .arg("-")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let squashed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(squashed.contains("Chapter One"), "{squashed}");
+        assert!(
+            squashed.contains("The storm came in off the point at dusk."),
+            "{squashed}"
+        );
+        assert!(
+            squashed.contains("a boat lay on the rocks below the cliff"),
+            "{squashed}"
+        );
+        if manuscript {
+            assert!(squashed.contains("Writer / LIGHTHOUSE / 2"), "{squashed}");
+            assert!(squashed.contains("about 100 words"), "{squashed}");
+        }
+    }
 }

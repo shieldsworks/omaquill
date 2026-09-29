@@ -1482,7 +1482,7 @@ fn apply_look(settings: &Settings, widget: Option<&adw::ApplicationWindow>) {
     rich::set_look(rich::Look {
         zoom: settings.zoom,
         font_override: settings.editor_font.clone(),
-        substitutes: rich::find_substitutes(&installed),
+        substitutes: omaquill::fonts::find_substitutes(&installed),
     });
 }
 

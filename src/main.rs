@@ -4,8 +4,9 @@
 //! omaquill [PROJECT.scriv]                  open the app
 //! omaquill check PROJECT.scriv              read everything, report, change nothing
 //! omaquill compile PROJECT.scriv OUT.docx   compile from the terminal
-//!     [--format docx|epub|md|txt|rtf] [--author NAME] [--title TITLE]
-//!     [--plain] (keep the text's own formatting, no manuscript format)
+//!     [--format docx|pdf|epub|md|txt|rtf] [--author NAME] [--title TITLE]
+//!     [--plain | --book] (no manuscript format: the text's own formatting,
+//!     or for PDF a 6x9" paperback)
 //! ```
 
 mod ui;
@@ -46,8 +47,8 @@ fn main() -> ExitCode {
 const USAGE: &str = "\
 usage: omaquill [PROJECT.scriv]
        omaquill check PROJECT.scriv
-       omaquill compile PROJECT.scriv OUT [--format docx|epub|md|txt|rtf]
-                [--author NAME] [--title TITLE] [--plain]
+       omaquill compile PROJECT.scriv OUT [--format docx|pdf|epub|md|txt|rtf]
+                [--author NAME] [--title TITLE] [--plain | --book]
 ";
 
 fn cli(r: Result<(), String>) -> ExitCode {
@@ -167,7 +168,8 @@ fn compile_cli(args: &[String]) -> Result<(), String> {
                 opts.title = value()?;
                 i += 1;
             }
-            "--plain" => opts.manuscript = false,
+            // Keep the text's own formatting; for PDF, the paperback layout.
+            "--plain" | "--book" => opts.manuscript = false,
             other => return Err(format!("unknown option {other}")),
         }
         i += 1;
@@ -179,7 +181,9 @@ fn compile_cli(args: &[String]) -> Result<(), String> {
             Format::ALL
                 .into_iter()
                 .find(|f| f.extension() == ext)
-                .ok_or("give --format, or an output name ending .docx .epub .md .txt or .rtf")?
+                .ok_or(
+                    "give --format, or an output name ending .docx .pdf .epub .md .txt or .rtf",
+                )?
         }
     };
     let bytes = compile::compile(&p, &opts, format).map_err(|e| e.to_string())?;
