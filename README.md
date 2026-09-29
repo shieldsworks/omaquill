@@ -70,12 +70,9 @@ Your projects are never touched. omaquill's own settings
 backups (`~/.local/share/omaquill/backups`) stay until you delete them
 yourself.
 
-For text that looks like it did on the Mac, install the TeX Gyre fonts. They
-closely match Palatino, Times, Helvetica and Courier:
-
-```sh
-sudo pacman -S tex-gyre-fonts
-```
+For text that looks like it did on the Mac, install the optional
+`tex-gyre-fonts` package from the Arch repositories. Its fonts closely
+match Palatino, Times, Helvetica and Courier.
 
 Your files keep their original font names either way. The stand-ins are
 only used on screen.
