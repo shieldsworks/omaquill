@@ -334,7 +334,10 @@ mod tests {
             t.baseline,
             t.manuscript
         );
-        assert_eq!(json_field(&json, "project").unwrap(), "Lighthouse \"Book\" 1");
+        assert_eq!(
+            json_field(&json, "project").unwrap(),
+            "Lighthouse \"Book\" 1"
+        );
         assert_eq!(json_field(&json, "manuscript").unwrap(), "450");
         assert_eq!(json_field(&json, "open").unwrap(), "true");
         assert_eq!(t.words(), 350);
