@@ -496,7 +496,7 @@ impl Editor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use omaquill::rtf::{self, Align};
 
@@ -507,11 +507,7 @@ mod tests {
 
     /// Typed text takes the formatting around it, and Ctrl+B with nothing
     /// selected applies to what's typed next. Needs a display.
-    #[test]
-    fn empty_paragraphs_keep_their_style_and_lines_align_alone() {
-        if adw::init().is_err() {
-            return;
-        }
+    pub(crate) fn empty_paragraphs_keep_their_style_and_lines_align_alone() {
         let ed = Editor::new(true);
         let src = r"{\rtf1\pard one\
 \pard\qc \
@@ -533,12 +529,7 @@ mod tests {
         assert_eq!(t.paragraphs[1].style.align, Align::Center);
     }
 
-    #[test]
-    fn typing_carries_formatting() {
-        if adw::init().is_err() {
-            eprintln!("no display; skipped");
-            return;
-        }
+    pub(crate) fn typing_carries_formatting() {
         let ed = Editor::new(true);
         let src = r"{\rtf1\ansi{\fonttbl\f0 Palatino-Roman;}\pard\qc\fi720\f0\fs26 plain {\i slanted} end\
 next}";
@@ -589,14 +580,6 @@ next}";
         assert_eq!(bold.len(), 1);
         assert_eq!(bold[0].text, "B");
 
-        // A paste brings its own size; the text keeps one size, not two.
-        let s0 = ed.buffer.iter_at_offset(0);
-        let s1 = ed.buffer.iter_at_offset(2);
-        ed.buffer
-            .apply_tag(&rich::tag(&ed.buffer, "c:size=40"), &s0, &s1);
-        let names = rich::tag_names(&ed.buffer.iter_at_offset(0));
-        assert_eq!(names.iter().filter(|n| n.starts_with("c:size=")).count(), 1);
-
         // Bold on a selection, then off again.
         let s = ed.buffer.iter_at_offset(0);
         let e = ed.buffer.iter_at_offset(5);
@@ -606,5 +589,13 @@ next}";
         assert_eq!(ed.text().paragraphs[0].runs[0].text, "plain");
         ed.toggle("c:b");
         assert!(!ed.text().paragraphs[0].runs[0].style.bold);
+
+        // A paste brings its own size; the text keeps one size, not two.
+        let s0 = ed.buffer.iter_at_offset(0);
+        let s1 = ed.buffer.iter_at_offset(2);
+        ed.buffer
+            .apply_tag(&rich::tag(&ed.buffer, "c:size=40"), &s0, &s1);
+        let names = rich::tag_names(&ed.buffer.iter_at_offset(0));
+        assert_eq!(names.iter().filter(|n| n.starts_with("c:size=")).count(), 1);
     }
 }

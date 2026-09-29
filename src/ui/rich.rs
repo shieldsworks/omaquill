@@ -453,7 +453,7 @@ pub fn save(buffer: &TextBuffer) -> RichText {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use omaquill::rtf;
     use std::path::Path;
@@ -485,12 +485,7 @@ mod tests {
     /// Every document survives the trip into a GTK buffer and back. Needs
     /// a display; skipped without one. Set OMAQUILL_REAL_PROJECT to also
     /// run a real project's documents through it.
-    #[test]
-    fn buffer_round_trip() {
-        if gtk::init().is_err() {
-            eprintln!("no display; skipped");
-            return;
-        }
+    pub(crate) fn buffer_round_trip() {
         let mut files = Vec::new();
         rtf_files(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),

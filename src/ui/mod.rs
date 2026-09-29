@@ -1506,3 +1506,19 @@ fn join_words(list: &[&str]) -> String {
         [init @ .., last] => format!("{} and {last}", init.join(", ")),
     }
 }
+
+/// Every GTK check, from one test: gtk-rs allows GTK only on the thread
+/// that started it, and each #[test] gets its own thread. Needs a display;
+/// skipped without one (CI).
+#[cfg(test)]
+#[test]
+fn gtk_checks() {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        eprintln!("no display; GTK checks skipped");
+        return;
+    }
+    adw::init().unwrap();
+    rich::tests::buffer_round_trip();
+    editor::tests::typing_carries_formatting();
+    editor::tests::empty_paragraphs_keep_their_style_and_lines_align_alone();
+}
