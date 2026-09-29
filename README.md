@@ -162,6 +162,13 @@ keywords, custom metadata, project targets, and most of Scrivener's Compile
 options. Undo brings back deleted words but not their formatting (italics
 come back plain), a limit of GTK's undo; retype or reformat them.
 
+The RTF omaquill writes has been checked against macOS's own RTF reader
+(the one Scrivener uses): a real novel with every document rewritten, plus
+a scene using every kind of formatting, read back by `textutil` with the
+same text in every file and the same bold and italic. Opening an
+omaquill-edited project in Scrivener itself hasn't been tested yet; if you
+have Scrivener, a report either way is welcome.
+
 omaquill is built for moving to Linux, not for going back and forth. A
 project it has edited still opens in Scrivener, but a document edited here
 loses any Scrivener-only formatting listed above.

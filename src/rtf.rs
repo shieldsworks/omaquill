@@ -898,22 +898,19 @@ pub fn write(text: &RichText) -> String {
         ..CharStyle::default()
     };
     let mut cf = usize::MAX;
-    let mut cb = 0usize;
     // An open `\field`: its link, and the formatting outside it, which
     // comes back when its groups close.
-    let mut field: Option<(String, CharStyle, usize, usize)> = None;
+    let mut field: Option<(String, CharStyle, usize)> = None;
     fn close_field(
         out: &mut String,
-        field: &mut Option<(String, CharStyle, usize, usize)>,
+        field: &mut Option<(String, CharStyle, usize)>,
         ch: &mut CharStyle,
         cf: &mut usize,
-        cb: &mut usize,
     ) {
-        if let Some((_, outer, f, b)) = field.take() {
+        if let Some((_, outer, f)) = field.take() {
             out.push_str("}}");
             *ch = outer;
             *cf = f;
-            *cb = b;
         }
     }
     for (pi, p) in text.paragraphs.iter().enumerate() {
@@ -925,7 +922,7 @@ pub fn write(text: &RichText) -> String {
         for r in &p.runs {
             let s = &r.style;
             if field.as_ref().map(|f| &f.0) != s.link.as_ref() {
-                close_field(&mut out, &mut field, &mut ch, &mut cf, &mut cb);
+                close_field(&mut out, &mut field, &mut ch, &mut cf);
                 if let Some(url) = &s.link {
                     let url: String = url
                         .chars()
@@ -935,7 +932,7 @@ pub fn write(text: &RichText) -> String {
                         out,
                         "{{\\field{{\\*\\fldinst{{HYPERLINK \"{url}\"}}}}{{\\fldrslt "
                     );
-                    field = Some((s.link.clone().unwrap(), ch.clone(), cf, cb));
+                    field = Some((s.link.clone().unwrap(), ch.clone(), cf));
                 }
             }
             let mut codes = String::new();
@@ -977,19 +974,23 @@ pub fn write(text: &RichText) -> String {
                 let _ = write!(codes, "\\cf{want_cf}");
                 cf = want_cf;
             }
-            let want_cb = color_index(s.highlight);
-            if want_cb != cb {
-                let _ = write!(codes, "\\cb{want_cb}");
-                cb = want_cb;
-            }
             if !codes.is_empty() {
                 out.push_str(&codes);
                 out.push(' ');
             }
-            rtf_escape_into(&mut out, &r.text);
+            // Highlight goes in a group of its own: Cocoa reads `\cb0` as
+            // a black highlight, not as none, so it can't be switched off.
+            match color_index(s.highlight) {
+                0 => rtf_escape_into(&mut out, &r.text),
+                cb => {
+                    let _ = write!(out, "{{\\cb{cb} ");
+                    rtf_escape_into(&mut out, &r.text);
+                    out.push('}');
+                }
+            }
             ch = s.clone();
         }
-        close_field(&mut out, &mut field, &mut ch, &mut cf, &mut cb);
+        close_field(&mut out, &mut field, &mut ch, &mut cf);
         if pi + 1 < text.paragraphs.len() {
             out.push_str("\\\n");
         }
@@ -1191,6 +1192,25 @@ mod tests {
         );
         let again = parse(write(&t).as_bytes());
         assert_eq!(again.paragraphs, t.paragraphs);
+    }
+
+    #[test]
+    fn highlight_is_grouped_never_cb0() {
+        let mut t = RichText::from_plain("a b c");
+        let mut runs = Vec::new();
+        for (text, hl) in [("a ", None), ("b", Some((255, 230, 120))), (" c", None)] {
+            let mut r = t.paragraphs[0].runs[0].clone();
+            r.text = text.into();
+            r.style.highlight = hl;
+            r.style.font = Some("Palatino".into());
+            runs.push(r);
+        }
+        t.paragraphs[0].runs = runs;
+        let rtf = write(&t);
+        // macOS takes \cb0 as a black highlight.
+        assert!(!rtf.contains("\\cb0"), "{rtf}");
+        assert!(rtf.contains("{\\cb2 b}"), "{rtf}");
+        assert_eq!(parse(rtf.as_bytes()).paragraphs, t.paragraphs);
     }
 
     #[test]
