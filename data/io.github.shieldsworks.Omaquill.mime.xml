@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A Scrivener project is a folder; its .scrivx file is what a file
+     manager can open. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-scrivener-project">
+    <comment>Scrivener project</comment>
+    <sub-class-of type="application/xml"/>
+    <glob pattern="*.scrivx"/>
+    <root-XML localName="ScrivenerProject"/>
+  </mime-type>
+</mime-info>

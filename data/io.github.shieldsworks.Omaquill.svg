@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e3150"/>
+      <stop offset="1" stop-color="#171826"/>
+    </linearGradient>
+    <linearGradient id="vane" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d9dcef"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bg)"/>
+  <!-- a line of ink under the nib -->
+  <path d="M30 101 C 44 97, 58 104, 72 99 S 94 96, 100 99" fill="none" stroke="#7aa2f7" stroke-width="3" stroke-linecap="round" opacity="0.9"/>
+  <!-- feather: vane on both sides of a curved shaft, nib at the lower left -->
+  <path d="M34 92
+           C 40 70, 52 48, 72 32
+           C 84 22, 98 17, 104 18
+           C 105 26, 100 40, 90 52
+           L 84 50 L 87 57
+           C 78 66, 66 74, 52 80
+           L 48 76 L 47 83
+           C 42 86, 38 89, 34 92 Z" fill="url(#vane)"/>
+  <!-- shaft -->
+  <path d="M104 18 C 84 34, 56 62, 34 92" fill="none" stroke="#8e93b8" stroke-width="2.2" stroke-linecap="round"/>
+  <!-- nib -->
+  <path d="M34 92 L 27 103 L 38 96 Z" fill="#e0af68"/>
+  <path d="M29.5 99.5 L 33 94.5" stroke="#171826" stroke-width="1.2" stroke-linecap="round"/>
+</svg>

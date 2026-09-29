@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=omaquill
+GenericName=Writing Studio
+Comment=Write novels in Scrivener projects, on Omarchy
+Exec=omaquill %F
+TryExec=omaquill
+Icon=io.github.shieldsworks.Omaquill
+Terminal=false
+StartupNotify=true
+StartupWMClass=io.github.shieldsworks.Omaquill
+Categories=Office;WordProcessor;GTK;
+MimeType=application/x-scrivener-project;
+Keywords=scrivener;novel;writing;manuscript;book;corkboard;scriv;

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "org.omaquill.words",
+  "name": "omaquill",
+  "version": "0.1.0",
+  "author": "Casey Shields",
+  "license": "MIT",
+  "homepage": "https://github.com/shieldsworks/omaquill",
+  "description": "Words written today in omaquill, the writing studio that opens Scrivener projects",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "ui/WordsBar.qml"
+  },
+  "barWidget": {
+    "displayName": "omaquill",
+    "description": "Words written today, against your daily target; click to write",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

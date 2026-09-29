@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ScrivenerProject Identifier="0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0" Version="2.0" Creator="SCRMAC-3.5.2-17487" Device="Test-Mac" Author="" Modified="2026-09-01 10:00:00 -0700" ModID="11111111-2222-4333-8444-555555555555">
+    <Binder>
+        <BinderItem UUID="1D0E6B55-1E50-4C0B-9D47-3A0B6F6C1A01" Type="DraftFolder" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+            <Title>Manuscript</Title>
+            <Children>
+                <BinderItem UUID="2B7A1E3C-4F5D-4E6A-8B9C-0D1E2F3A4B02" Type="Folder" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+                    <Title>Chapter One</Title>
+                    <MetaData>
+                        <IncludeInCompile>Yes</IncludeInCompile>
+                    </MetaData>
+                    <TextSettings>
+                        <TextSelection>0,0</TextSelection>
+                    </TextSettings>
+                    <Children>
+                        <BinderItem UUID="3C8B2F4D-5A6E-4F7B-9CAD-1E2F3A4B5C03" Type="Text" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-02 09:00:00 -0800">
+                            <Title>The Storm</Title>
+                            <MetaData>
+                                <LabelID>11</LabelID>
+                                <StatusID>2</StatusID>
+                                <IncludeInCompile>Yes</IncludeInCompile>
+                            </MetaData>
+                            <TextSettings>
+                                <TextSelection>42,0</TextSelection>
+                            </TextSettings>
+                        </BinderItem>
+                        <BinderItem UUID="4D9C3A5E-6B7F-4A8C-ADBE-2F3A4B5C6D04" Type="Text" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-02 09:00:00 -0800">
+                            <Title>Morning &amp; After</Title>
+                            <MetaData>
+                                <IncludeInCompile>Yes</IncludeInCompile>
+                            </MetaData>
+                        </BinderItem>
+                    </Children>
+                </BinderItem>
+            </Children>
+        </BinderItem>
+        <BinderItem UUID="5EAD4B6F-7C8A-4B9D-BECF-3A4B5C6D7E05" Type="ResearchFolder" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+            <Title>Research</Title>
+            <Children>
+                <BinderItem UUID="9CEB8FAD-BACE-4FDB-FCAD-7E8F9AABBC09" Type="Text" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+                    <Title>Keeper&apos;s Log</Title>
+                </BinderItem>
+                <BinderItem UUID="6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06" Type="Image" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+                    <Title>Lamp</Title>
+                    <MetaData>
+                        <FileExtension>png</FileExtension>
+                    </MetaData>
+                    <MediaSettings>
+                        <ImageScaleFactor>1.0</ImageScaleFactor>
+                    </MediaSettings>
+                </BinderItem>
+            </Children>
+        </BinderItem>
+        <BinderItem UUID="7ACF6D8B-9EAC-4DBF-DAEB-5C6D7E8F9A07" Type="TrashFolder" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+            <Title>Trash</Title>
+            <Children>
+                <BinderItem UUID="8BDA7E9C-AFBD-4ECA-EBFC-6D7E8F9AAB08" Type="Text" Created="2026-01-01 09:00:00 -0800" Modified="2026-01-01 09:00:00 -0800">
+                    <Title>Cut Scene</Title>
+                </BinderItem>
+            </Children>
+        </BinderItem>
+    </Binder>
+    <Collections>
+        <Collection Type="Binder" ID="AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE" Color="0.091141 0.091141 0.091141">
+            <Title>Binder</Title>
+        </Collection>
+    </Collections>
+    <SectionTypes>
+        <TypeDefinitions>
+            <Type ID="9AFECE21-8C79-45E0-9B9F-D6D62A9729D3">Scene</Type>
+        </TypeDefinitions>
+    </SectionTypes>
+    <LabelSettings>
+        <Title>Label</Title>
+        <DefaultLabelID>-1</DefaultLabelID>
+        <Labels>
+            <Label ID="-1">No Label</Label>
+            <Label ID="7" Color="0.993495 0.701207 0.732587">Red</Label>
+            <Label ID="11" Color="0.702319 0.888276 0.974252">Blue</Label>
+        </Labels>
+    </LabelSettings>
+    <StatusSettings>
+        <Title>Status</Title>
+        <DefaultStatusID>-1</DefaultStatusID>
+        <StatusItems>
+            <Status ID="-1">No Status</Status>
+            <Status ID="1">To Do</Status>
+            <Status ID="2">First Draft</Status>
+        </StatusItems>
+    </StatusSettings>
+    <PrintSettings PaperSize="612.0,792.0" LeftMargin="72.0" RightMargin="72.0"/>
+</ScrivenerProject>

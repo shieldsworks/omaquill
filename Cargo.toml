@@ -1,0 +1,19 @@
+[package]
+name = "omaquill"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A writing studio for Omarchy that opens Scrivener projects"
+license = "MIT"
+repository = "https://github.com/shieldsworks/omaquill"
+
+[dependencies]
+libc = "0.2"
+# The app; the core (lib.rs) doesn't use these.
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
+# SIGTERM at logout: close windows so pending text saves.
+glib-unix = "0.22"
+
+[profile.release]
+debug = "line-tables-only"
