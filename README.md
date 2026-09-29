@@ -111,7 +111,8 @@ folder's documents are its scenes, separated by `#`. The formats:
     as the Word file.
   - **Paperback** (switch off): a 6×9" page with mirrored margins,
     justified and hyphenated text in your book's own typeface (TeX's
-    hyphenation patterns, words of six letters or more), chapters opening
+    hyphenation patterns, words of six letters or more, never more than
+    two hyphenated lines in a row), chapters opening
     a third of the way down, running heads and page numbers. For proofreading or
     a self-publishing draft.
 

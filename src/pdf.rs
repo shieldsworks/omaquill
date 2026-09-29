@@ -292,7 +292,7 @@ impl Doc<'_> {
     ) -> Result<()> {
         // The paperback's justified text is hyphenated (soft hyphens,
         // shown only where a line actually breaks); a manuscript never is.
-        let texts: Vec<String> = p
+        let mut texts: Vec<String> = p
             .runs
             .iter()
             .map(|r| {
@@ -303,10 +303,18 @@ impl Doc<'_> {
                 }
             })
             .collect();
-        let text: String = texts.concat();
-        let layout = self.layout(&text, size, align, self.g.text_width());
-        layout.set_indent((indent * pango::SCALE as f64) as i32);
-        layout.set_attributes(Some(&attributes(p, &texts)));
+        let layout = loop {
+            let text: String = texts.concat();
+            let layout = self.layout(&text, size, align, self.g.text_width());
+            layout.set_indent((indent * pango::SCALE as f64) as i32);
+            layout.set_attributes(Some(&attributes(p, &texts)));
+            // At most two hyphenated lines in a row: the word that would
+            // make a third loses its break points and moves down whole.
+            match third_hyphen(&layout, &text) {
+                Some(at) if unhyphenate_word(&mut texts, at) => continue,
+                _ => break layout,
+            }
+        };
         let mut iter = layout.iter();
         loop {
             if self.y + leading > self.bottom_limit() + 0.01 {
@@ -435,6 +443,56 @@ impl Doc<'_> {
 
 /// Emphasis from the runs as Pango attributes. Fonts and sizes come from
 /// the layout, not the draft: a compiled book has one typeface.
+/// Most hyphenated lines allowed in a row.
+const MAX_HYPHENS_IN_A_ROW: usize = 2;
+
+/// The byte offset (in `text`) of the soft hyphen ending a line that
+/// would be the third hyphenated line in a row, if any.
+fn third_hyphen(layout: &pango::Layout, text: &str) -> Option<usize> {
+    let mut run = 0;
+    for line in layout.lines_readonly() {
+        let end = (line.start_index() + line.length()) as usize;
+        if text.get(..end).is_some_and(|t| t.ends_with('\u{ad}')) {
+            run += 1;
+            if run > MAX_HYPHENS_IN_A_ROW {
+                return Some(end - '\u{ad}'.len_utf8());
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
+/// Removes the soft hyphens from the word around byte `at` of the joined
+/// `texts`. False if there was nothing to remove.
+fn unhyphenate_word(texts: &mut [String], at: usize) -> bool {
+    let mut start = 0;
+    for t in texts.iter_mut() {
+        if at < start + t.len() {
+            let local = at - start;
+            let in_word = |c: char| c.is_alphabetic() || c == '\u{ad}';
+            let from = t[..local]
+                .char_indices()
+                .rev()
+                .find(|&(_, c)| !in_word(c))
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            let to = t[local..]
+                .char_indices()
+                .find(|&(_, c)| !in_word(c))
+                .map_or(t.len(), |(i, _)| local + i);
+            let word: String = t[from..to].chars().filter(|&c| c != '\u{ad}').collect();
+            if word.len() == to - from {
+                return false;
+            }
+            t.replace_range(from..to, &word);
+            return true;
+        }
+        start += t.len();
+    }
+    false
+}
+
 /// `texts`: each run's text as laid out (hyphenated or not), for offsets.
 fn attributes(p: &Paragraph, texts: &[String]) -> pango::AttrList {
     let list = pango::AttrList::new();
@@ -473,4 +531,49 @@ fn attributes(p: &Paragraph, texts: &[String]) -> pango::AttrList {
         at = end;
     }
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unhyphenates_one_word() {
+        let mut texts = vec![
+            "a con\u{ad}cen\u{ad}trated ".to_string(),
+            "sto\u{ad}ry".to_string(),
+        ];
+        assert!(unhyphenate_word(&mut texts, "a con\u{ad}cen".len()));
+        assert_eq!(texts[0], "a concentrated ");
+        assert_eq!(texts[1], "sto\u{ad}ry");
+        assert!(!unhyphenate_word(&mut texts, 3));
+    }
+
+    /// A narrow column of long words would hyphenate line after line;
+    /// never more than two in a row.
+    #[test]
+    fn at_most_two_hyphenated_lines_in_a_row() {
+        let ctx = pangocairo::FontMap::default().create_context();
+        let words = "concentrated uncomfortable illuminated anticipation \
+                     investigations transportation extraordinary \
+                     metronome interrogation neighborhood ";
+        let base = words.repeat(6);
+        let mut texts = vec![crate::hyphen::en_us().soft_hyphens(&base)];
+        let mut rounds = 0;
+        let layout = loop {
+            let text = texts.concat();
+            let layout = pango::Layout::new(&ctx);
+            layout.set_width(90 * pango::SCALE);
+            layout.set_justify(true);
+            layout.set_text(&text);
+            match third_hyphen(&layout, &text) {
+                Some(at) if unhyphenate_word(&mut texts, at) => rounds += 1,
+                _ => break layout,
+            }
+        };
+        assert!(rounds > 0, "the test column never needed the cap");
+        let text = texts.concat();
+        assert_eq!(third_hyphen(&layout, &text), None);
+        assert_eq!(text.replace('\u{ad}', ""), base);
+    }
 }
