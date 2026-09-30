@@ -144,6 +144,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct Project {
     pub path: PathBuf,
+    /// `path` with every symlink resolved: nothing outside it is ever read,
+    /// written or deleted (see [`Project::inside`]).
+    root: PathBuf,
     scrivx: PathBuf,
     doc: xml::Document,
     /// `lowercase-uuid/file` → SHA-1, in file order.
@@ -160,13 +163,15 @@ type Loc = Vec<usize>;
 impl Project {
     pub fn open(path: &Path) -> Result<Project> {
         let path = path.to_path_buf();
+        let root = std::fs::canonicalize(&path)?;
         let scrivx = find_scrivx(&path).ok_or_else(|| Error::NotAProject(path.clone()))?;
-        let text = std::fs::read_to_string(&scrivx)?;
+        let text = String::from_utf8_lossy(&read_inside(&root, &scrivx)?).into_owned();
         let doc = xml::parse(&text)?;
         if doc.root.name != "ScrivenerProject" || doc.root.child("Binder").is_none() {
             return Err(Error::NotAProject(path));
         }
-        let checksums = std::fs::read_to_string(path.join("Files/Data/docs.checksum"))
+        let checksums = read_inside(&root, &path.join("Files/Data/docs.checksum"))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default()
             .lines()
             .filter_map(|l| l.split_once('='))
@@ -174,6 +179,7 @@ impl Project {
             .collect();
         Ok(Project {
             path,
+            root,
             scrivx,
             doc,
             checksums,
@@ -708,10 +714,7 @@ impl Project {
             if !is_uuid(uuid) {
                 continue;
             }
-            let dir = self.data_dir(uuid);
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)?;
-            }
+            remove_dir_inside(&self.root, &self.data_dir(uuid))?;
             let prefix = format!("{}/", uuid.to_lowercase());
             self.checksums.retain(|(k, _)| !k.starts_with(&prefix));
             self.reindex.insert(uuid.to_uppercase(), ());
@@ -731,11 +734,11 @@ impl Project {
     pub fn media_path(&self, uuid: &str) -> Option<PathBuf> {
         let ext = self.item(uuid)?.extension?;
         let p = self.data_dir(uuid).join(format!("content.{ext}"));
-        p.exists().then_some(p)
+        (p.exists() && inside(&self.root, &p)).then_some(p)
     }
 
     fn read_rtf(&self, uuid: &str, file: &str) -> Result<RichText> {
-        match std::fs::read(self.data_dir(uuid).join(file)) {
+        match read_inside(&self.root, &self.data_dir(uuid).join(file)) {
             Ok(bytes) => Ok(rtf::parse(&bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RichText::from_plain("")),
             Err(e) => Err(e.into()),
@@ -755,9 +758,13 @@ impl Project {
     /// the manuscript's first paragraph of text, so a new scene looks like
     /// the rest of the book.
     pub fn default_style(&self) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
-        let prefs = std::fs::read_to_string(self.path.join("Settings/projectpreferences.xml"))
-            .ok()
-            .and_then(|t| xml::parse(&t).ok());
+        let prefs = read_inside(
+            &self.root,
+            &self.path.join("Settings/projectpreferences.xml"),
+        )
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .and_then(|t| xml::parse(&t).ok());
         if let Some(prefs) = prefs
             && prefs.root.child_text("UseProjectPreferences").as_deref() == Some("Yes")
             && let Some(hex) = prefs.root.child_text("TextFormatRTFData")
@@ -792,7 +799,9 @@ impl Project {
     }
 
     pub fn synopsis(&self, uuid: &str) -> String {
-        std::fs::read_to_string(self.data_dir(uuid).join("synopsis.txt")).unwrap_or_default()
+        read_inside(&self.root, &self.data_dir(uuid).join("synopsis.txt"))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
     }
 
     /// Writes (or, for empty content, removes) one of an item's files, and
@@ -803,8 +812,8 @@ impl Project {
         let key = format!("{}/{file}", uuid.to_lowercase());
         match bytes {
             Some(bytes) => {
-                std::fs::create_dir_all(&dir)?;
-                write_atomic(&path, bytes)?;
+                create_dir_inside(&self.root, &dir)?;
+                write_inside(&self.root, &path, bytes)?;
                 let sum = sha1::hex(bytes);
                 match self.checksums.iter_mut().find(|(k, _)| *k == key) {
                     Some(slot) => slot.1 = sum,
@@ -812,9 +821,7 @@ impl Project {
                 }
             }
             None => {
-                if path.exists() {
-                    std::fs::remove_file(&path)?;
-                }
+                remove_file_inside(&self.root, &path)?;
                 self.checksums.retain(|(k, _)| *k != key);
             }
         }
@@ -854,7 +861,7 @@ impl Project {
             if self.doc.root.attr("ModID").is_some() {
                 self.doc.root.set_attr("ModID", &new_uuid());
             }
-            write_atomic(&self.scrivx, self.doc.to_xml().as_bytes())?;
+            write_inside(&self.root, &self.scrivx, self.doc.to_xml().as_bytes())?;
             self.scrivx_dirty = false;
         }
         if self.checksums_dirty {
@@ -863,8 +870,8 @@ impl Project {
                 out.push_str(&format!("{k}={v}\n"));
             }
             let dir = self.path.join("Files/Data");
-            std::fs::create_dir_all(&dir)?;
-            write_atomic(&dir.join("docs.checksum"), out.as_bytes())?;
+            create_dir_inside(&self.root, &dir)?;
+            write_inside(&self.root, &dir.join("docs.checksum"), out.as_bytes())?;
             self.checksums_dirty = false;
         }
         if !self.reindex.is_empty() {
@@ -876,7 +883,9 @@ impl Project {
 
     fn save_search_index(&mut self) -> Result<()> {
         let path = self.path.join("Files/search.indexes");
-        let existing = std::fs::read_to_string(&path).ok();
+        let existing = read_inside(&self.root, &path)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
         let mut doc = match existing.as_deref().map(xml::parse) {
             Some(Ok(doc)) if doc.root.child("Documents").is_some() => doc,
             _ => xml::parse(
@@ -916,7 +925,7 @@ impl Project {
             let n = docs.elements().count();
             docs.insert_element(n, entry, "\n    ");
         }
-        write_atomic(&path, doc.to_xml().as_bytes())?;
+        write_inside(&self.root, &path, doc.to_xml().as_bytes())?;
         Ok(())
     }
 
@@ -1065,6 +1074,109 @@ fn find_scrivx(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| p.extension().is_some_and(|e| e == "scrivx"))
+}
+
+// ------------------------------------------------------------ containment
+//
+// A `.scriv` folder can come from anyone. Its files could be symlinks (or
+// sit under a symlinked folder) pointing at the user's other files, and
+// editing a chapter must never overwrite `~/.bashrc`. So every read, write
+// and delete resolves the path first and acts only if it lands inside the
+// project's own (resolved) folder. Links that stay inside still work.
+
+/// Resolves `p` through every symlink that exists, keeping the parts that
+/// don't exist yet (a file about to be created).
+fn resolve(p: &Path) -> Option<PathBuf> {
+    let mut existing = p;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        rest.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?;
+    }
+}
+
+/// `p` resolves to somewhere inside `root`.
+fn inside(root: &Path, p: &Path) -> bool {
+    resolve(p).is_some_and(|r| r.starts_with(root))
+}
+
+fn outside_error(p: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} links outside the project; omaquill won't follow it",
+            p.display()
+        ),
+    )
+}
+
+fn read_inside(root: &Path, p: &Path) -> io::Result<Vec<u8>> {
+    if !p.exists() {
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    if !inside(root, p) {
+        return Err(outside_error(p));
+    }
+    std::fs::read(p)
+}
+
+/// Writes `p` if its folder is inside the project. A file that's a symlink
+/// out of the project is replaced by an ordinary file (the link goes, what
+/// it pointed at is left alone).
+fn write_inside(root: &Path, p: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = p.parent().unwrap_or(p);
+    if !inside(root, parent) {
+        return Err(outside_error(p));
+    }
+    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link && !std::fs::canonicalize(p).is_ok_and(|t| t.starts_with(root)) {
+        std::fs::remove_file(p)?; // the link itself
+    }
+    write_atomic(p, bytes)
+}
+
+fn create_dir_inside(root: &Path, dir: &Path) -> io::Result<()> {
+    if !inside(root, dir) {
+        return Err(outside_error(dir));
+    }
+    std::fs::create_dir_all(dir)
+}
+
+fn remove_file_inside(root: &Path, p: &Path) -> io::Result<()> {
+    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if !p.exists() && !is_link {
+        return Ok(());
+    }
+    // Removing a link removes only the link, but its folder must be ours.
+    if !inside(root, p.parent().unwrap_or(p)) {
+        return Err(outside_error(p));
+    }
+    std::fs::remove_file(p)
+}
+
+/// Deletes an item's folder. A folder that's a symlink loses just the
+/// link; one that resolves outside the project is left alone.
+fn remove_dir_inside(root: &Path, dir: &Path) -> io::Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Ok(());
+    };
+    if !inside(root, dir.parent().unwrap_or(dir)) {
+        return Err(outside_error(dir));
+    }
+    if meta.file_type().is_symlink() {
+        return std::fs::remove_file(dir);
+    }
+    if !inside(root, dir) {
+        return Err(outside_error(dir));
+    }
+    std::fs::remove_dir_all(dir)
 }
 
 /// Writes through a temporary file and a rename, so a crash never leaves a

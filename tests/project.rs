@@ -353,13 +353,13 @@ fn emptying_trash_never_touches_data_for_malformed_items() {
 }
 
 #[test]
-fn saves_keep_permissions_and_symlinks() {
+fn saves_keep_permissions_and_links_inside_the_project() {
     use std::os::unix::fs::PermissionsExt;
     let c = copy_fixture("perms");
     let file = c.0.join("Files/Data").join(SCENE).join("content.rtf");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // The notes file is a symlink to a file elsewhere.
-    let real = c.0.parent().unwrap().join("notes-elsewhere.rtf");
+    // The notes file links to another file inside the project: followed.
+    let real = c.0.join("Files/notes-elsewhere.rtf");
     let notes = c.0.join("Files/Data").join(SCENE).join("notes.rtf");
     std::fs::rename(&notes, &real).unwrap();
     std::os::unix::fs::symlink(&real, &notes).unwrap();
@@ -378,4 +378,63 @@ fn saves_keep_permissions_and_symlinks() {
             .is_symlink()
     );
     assert!(String::from_utf8_lossy(&std::fs::read(&real).unwrap()).contains("new note"));
+}
+
+/// A project someone sends you can't make omaquill touch your other files
+/// (marketplace review of c1b4b49): a chapter linked to `~/.bashrc` is
+/// never read into the editor, and saving it writes inside the project.
+#[test]
+fn links_out_of_the_project_are_never_followed() {
+    let c = copy_fixture("escape");
+    let outside = c.0.parent().unwrap().join("bashrc");
+    std::fs::write(&outside, "export SECRET=1\n").unwrap();
+    let chapter = c.0.join("Files/Data").join(SCENE).join("content.rtf");
+    std::fs::remove_file(&chapter).unwrap();
+    std::os::unix::fs::symlink(&outside, &chapter).unwrap();
+
+    let mut p = Project::open(&c.0).unwrap();
+    assert!(
+        p.text(SCENE).is_err(),
+        "read through a link out of the project"
+    );
+    p.set_text(SCENE, &RichText::from_plain("new chapter"))
+        .unwrap();
+    p.save().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "export SECRET=1\n"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&chapter)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(p.text(SCENE).unwrap().plain_text(), "new chapter");
+
+    // A whole item folder linked outside: nothing written, nothing deleted.
+    let elsewhere = c.0.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep.txt"), "keep").unwrap();
+    let dir = c.0.join("Files/Data").join(MORNING);
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+    let mut p = Project::open(&c.0).unwrap();
+    assert!(p.set_text(MORNING, &RichText::from_plain("x")).is_err());
+    // Clearing a synopsis deletes synopsis.txt; not one outside.
+    std::fs::write(elsewhere.join("synopsis.txt"), "theirs").unwrap();
+    assert_eq!(p.synopsis(MORNING), "", "read through a linked folder");
+    assert!(p.set_synopsis(MORNING, "").is_err());
+    assert!(elsewhere.join("synopsis.txt").exists());
+    assert!(!elsewhere.join("content.rtf").exists());
+    p.trash(MORNING).unwrap();
+    p.empty_trash().unwrap();
+    assert!(
+        elsewhere.join("keep.txt").exists(),
+        "emptying the Trash reached outside"
+    );
+    assert!(
+        std::fs::symlink_metadata(&dir).is_err(),
+        "the link itself goes"
+    );
 }
