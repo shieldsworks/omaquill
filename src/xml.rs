@@ -51,6 +51,11 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Deepest element nesting accepted. A Scrivener binder nests a few dozen
+/// levels at most; a hostile file nested far deeper would overflow the
+/// stack of the code that walks the tree.
+const MAX_DEPTH: usize = 512;
+
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
@@ -221,6 +226,9 @@ impl<'a> Parser<'a> {
             let el = self.start_tag()?;
             if el.empty {
                 stack.last_mut().unwrap().children.push(Node::Element(el));
+            } else if stack.len() >= MAX_DEPTH {
+                // Walking a tree this deep later would overflow the stack.
+                return self.err("elements nested too deeply");
             } else {
                 stack.push(el);
             }
@@ -712,6 +720,14 @@ mod tests {
         doc.root.insert_element(0, Element::new("y"), "\n");
         assert!(doc.to_xml().contains("<!-- keep -->"));
         assert!(doc.to_xml().contains("<y></y>"));
+    }
+
+    #[test]
+    fn rejects_absurd_nesting() {
+        let deep = format!("{}{}", "<a>".repeat(100_000), "</a>".repeat(100_000));
+        assert!(parse(&deep).is_err());
+        let fine = format!("{}{}", "<a>".repeat(100), "</a>".repeat(100));
+        assert!(parse(&fine).is_ok());
     }
 
     #[test]

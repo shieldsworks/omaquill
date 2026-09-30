@@ -179,6 +179,18 @@ pub fn word_count(text: &str) -> usize {
 
 // ---------------------------------------------------------------- reading
 
+// Limits on what a document can make the reader hold. Every `{` copies the
+// formatting state, so without them a small hostile file (thousands of
+// tab stops, then thousands of nested groups) could demand gigabytes.
+// Real documents stay far below all of these.
+/// Group nesting followed; deeper groups are skipped (and flagged).
+const MAX_DEPTH: usize = 256;
+/// Tab stops kept per paragraph.
+const MAX_TABS: usize = 64;
+/// Characters kept of a font name or a link target.
+const MAX_FONT_NAME: usize = 128;
+const MAX_LINK: usize = 2048;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dest {
     Text,
@@ -214,6 +226,8 @@ struct Reader<'a> {
     stack: Vec<State>,
     st: State,
     fonts: Vec<(i32, String)>,
+    /// Font number → name, for `\fN` lookups (the first definition wins).
+    font_names: std::collections::HashMap<i32, String>,
     font_name: String,
     colors: Vec<Option<Rgb>>,
     color: (u8, u8, u8, bool),
@@ -229,6 +243,8 @@ struct Reader<'a> {
     fldinst: String,
     /// The link the next `\fldrslt` carries.
     field_link: Option<String>,
+    /// Open groups beyond MAX_DEPTH, being skipped.
+    too_deep: usize,
 }
 
 pub fn parse(src: &[u8]) -> RichText {
@@ -247,6 +263,7 @@ pub fn parse(src: &[u8]) -> RichText {
             tab_kind: 'l',
         },
         fonts: Vec::new(),
+        font_names: std::collections::HashMap::new(),
         font_name: String::new(),
         colors: Vec::new(),
         color: (0, 0, 0, false),
@@ -259,6 +276,7 @@ pub fn parse(src: &[u8]) -> RichText {
         final_para: None,
         fldinst: String::new(),
         field_link: None,
+        too_deep: 0,
     };
     r.run();
     r.out
@@ -288,7 +306,11 @@ impl Reader<'_> {
             Dest::FontTable => {
                 if c == ';' {
                     if let Some(entry) = self.fonts.last_mut() {
-                        entry.1 = std::mem::take(&mut self.font_name).trim().to_string();
+                        let name = std::mem::take(&mut self.font_name);
+                        entry.1 = name.trim().chars().take(MAX_FONT_NAME).collect();
+                        self.font_names
+                            .entry(entry.0)
+                            .or_insert_with(|| entry.1.clone());
                     }
                 } else {
                     self.font_name.push(c);
@@ -315,11 +337,7 @@ impl Reader<'_> {
 
     /// Sets the char style's font from a `\fN`.
     fn set_font(&mut self, n: i32) {
-        let name = self
-            .fonts
-            .iter()
-            .find(|(i, _)| *i == n)
-            .map(|(_, name)| name.clone());
+        let name = self.font_names.get(&n).cloned();
         let Some(name) = name else { return };
         let (family, bold, italic) = font_family(&name);
         self.st.ch.font = Some(family);
@@ -344,7 +362,23 @@ impl Reader<'_> {
         while self.pos < self.src.len() {
             let b = self.src[self.pos];
             self.pos += 1;
+            if self.too_deep > 0 {
+                // Inside groups nested past MAX_DEPTH: only count braces
+                // (an escaped one, `\{`, isn't a group).
+                match b {
+                    b'{' => self.too_deep += 1,
+                    b'}' => self.too_deep -= 1,
+                    b'\\' => self.pos += 1,
+                    _ => {}
+                }
+                continue;
+            }
             match b {
+                b'{' if self.stack.len() >= MAX_DEPTH => {
+                    self.flush();
+                    self.lossy("deeply nested groups");
+                    self.too_deep = 1;
+                }
                 b'{' => {
                     self.flush();
                     self.stack.push(self.st.clone());
@@ -700,7 +734,9 @@ impl Reader<'_> {
             "tqc" => self.st.tab_kind = 'c',
             "tqdec" => self.st.tab_kind = 'd',
             "tx" => {
-                self.st.para.tabs.push((n, self.st.tab_kind));
+                if self.st.para.tabs.len() < MAX_TABS {
+                    self.st.para.tabs.push((n, self.st.tab_kind));
+                }
                 self.st.tab_kind = 'l';
             }
             "ql" => self.st.para.align = Align::Left,
@@ -753,7 +789,7 @@ fn hyperlink(inst: &str) -> Option<String> {
     let rest = inst.trim().strip_prefix("HYPERLINK")?.trim_start();
     let rest = rest.strip_prefix('"')?;
     let end = rest.find('"')?;
-    Some(rest[..end].to_string()).filter(|u| !u.is_empty())
+    Some(rest[..end].chars().take(MAX_LINK).collect::<String>()).filter(|u| !u.is_empty())
 }
 
 /// Windows-1252 (and Mac Roman for `\mac` files) to Unicode.
@@ -1211,6 +1247,37 @@ mod tests {
         assert!(!rtf.contains("\\cb0"), "{rtf}");
         assert!(rtf.contains("{\\cb2 b}"), "{rtf}");
         assert_eq!(parse(rtf.as_bytes()).paragraphs, t.paragraphs);
+    }
+
+    /// The marketplace review's case: thousands of tab stops, then
+    /// thousands of nested groups, each copying the state. Must stay small.
+    #[test]
+    fn hostile_nesting_and_tabs_stay_bounded() {
+        let mut src = String::from("{\\rtf1\\pard");
+        for i in 0..10_000 {
+            src.push_str(&format!("\\tx{i}"));
+        }
+        src.push_str(&"{".repeat(10_000));
+        src.push_str("deep");
+        src.push_str(&"}".repeat(10_000));
+        src.push_str(" after}");
+        let started = std::time::Instant::now();
+        let t = parse(src.as_bytes());
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(t.plain_text(), " after");
+        assert!(t.paragraphs.iter().all(|p| p.style.tabs.len() <= MAX_TABS));
+        assert!(t.lossy.contains(&"deeply nested groups"));
+        // Escaped braces in a skipped group don't confuse the count.
+        let mut src = String::from("{\\rtf1 a");
+        src.push_str(&"{".repeat(300));
+        src.push_str("\\{ \\\\");
+        src.push_str(&"}".repeat(300));
+        src.push_str("b}");
+        assert_eq!(parse(src.as_bytes()).plain_text(), "ab");
     }
 
     #[test]
