@@ -296,10 +296,11 @@ impl Doc<'_> {
             .runs
             .iter()
             .map(|r| {
+                let text = keep_dashes_attached(&r.text);
                 if self.book && align == Align::Justify {
-                    crate::hyphen::en_us().soft_hyphens(&r.text)
+                    crate::hyphen::en_us().soft_hyphens(&text)
                 } else {
-                    r.text.clone()
+                    text
                 }
             })
             .collect();
@@ -443,6 +444,22 @@ impl Doc<'_> {
 
 /// Emphasis from the runs as Pango attributes. Fonts and sizes come from
 /// the layout, not the draft: a compiled book has one typeface.
+/// A word joiner (U+2060) before each em or en dash that follows a
+/// letter: line breaking may otherwise start a line with the dash, which
+/// books never do. It's invisible and doesn't change the text.
+fn keep_dashes_attached(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    for c in text.chars() {
+        if matches!(c, '\u{2014}' | '\u{2013}') && prev.is_some_and(|p| !p.is_whitespace()) {
+            out.push('\u{2060}');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
 /// Most hyphenated lines allowed in a row.
 const MAX_HYPHENS_IN_A_ROW: usize = 2;
 
@@ -536,6 +553,15 @@ fn attributes(p: &Paragraph, texts: &[String]) -> pango::AttrList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashes_stay_with_the_word_before() {
+        assert_eq!(
+            keep_dashes_attached("ago\u{2014}never"),
+            "ago\u{2060}\u{2014}never"
+        );
+        assert_eq!(keep_dashes_attached("a \u{2013} b"), "a \u{2013} b");
+    }
 
     #[test]
     fn unhyphenates_one_word() {
