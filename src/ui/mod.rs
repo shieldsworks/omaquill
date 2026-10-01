@@ -1155,8 +1155,16 @@ impl Win {
                     .borrow()
                     .as_ref()
                     .and_then(|p| p.media_path(uuid));
-                self.board.show_image(path.as_deref());
-                self.stack.set_visible_child_name("media");
+                if self.board.show_image(path.as_deref()) {
+                    self.stack.set_visible_child_name("media");
+                } else {
+                    // Missing, unreadable, or too large to decode safely.
+                    self.board.show_file(&item.title, path.as_deref());
+                    if path.is_some() {
+                        self.board.say_image_too_large();
+                    }
+                    self.stack.set_visible_child_name("file");
+                }
             }
             _ => {
                 let path = self

@@ -103,11 +103,26 @@ impl Board {
         }
     }
 
-    pub fn show_image(&self, path: Option<&Path>) {
-        match path {
-            Some(p) => self.picture.set_filename(Some(p)),
-            None => self.picture.set_paintable(gtk::gdk::Paintable::NONE),
+    /// Shows an image, if its header says it's a sane size. A tiny file
+    /// can claim to be 100,000 pixels square; decoding that would exhaust
+    /// memory, so only the header is read first. False: not shown.
+    pub fn show_image(&self, path: Option<&Path>) -> bool {
+        match path.filter(|p| image_size_ok(p)) {
+            Some(p) => {
+                self.picture.set_filename(Some(p));
+                true
+            }
+            None => {
+                self.picture.set_paintable(gtk::gdk::Paintable::NONE);
+                false
+            }
         }
+    }
+
+    pub fn say_image_too_large(&self) {
+        self.file_page.set_description(Some(
+            "This image is too large (or too damaged) for omaquill to show safely.",
+        ));
     }
 
     pub fn show_file(&self, title: &str, path: Option<&Path>) {
@@ -125,6 +140,23 @@ impl Board {
         if let Some(button) = self.file_page.child() {
             button.set_visible(openable);
         }
+    }
+}
+
+/// Largest image omaquill will decode: 100 megapixels, 30,000 on a side.
+const MAX_PIXELS: u64 = 100_000_000;
+const MAX_SIDE: i32 = 30_000;
+
+fn image_size_ok(p: &Path) -> bool {
+    match gtk::gdk_pixbuf::Pixbuf::file_info(p) {
+        Some((_, w, h)) => {
+            w > 0
+                && h > 0
+                && w <= MAX_SIDE
+                && h <= MAX_SIDE
+                && (w as u64) * (h as u64) <= MAX_PIXELS
+        }
+        None => false,
     }
 }
 
@@ -434,11 +466,17 @@ mod tests {
     }
 
     #[test]
-    fn only_documents_and_media_open() {
+    fn images_are_size_checked_and_only_documents_open() {
         let dir = std::env::temp_dir().join(format!("omaquill-media-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let small = dir.join("content.png");
         std::fs::write(&small, png(1, 1)).unwrap();
+        let bomb = dir.join("bomb.png");
+        std::fs::write(&bomb, png(100_000, 100_000)).unwrap();
+        assert!(image_size_ok(&small));
+        assert!(!image_size_ok(&bomb), "a 10-gigapixel header was accepted");
+        assert!(!image_size_ok(&dir.join("missing.png")));
+
         assert!(safe_to_open(&small));
         let script = dir.join("content.sh");
         std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
