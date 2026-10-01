@@ -731,8 +731,13 @@ impl Project {
     }
 
     /// The file behind a media item (`content.png`, `content.pdf` ...).
+    /// The extension comes from the project's XML, so it must be a plain
+    /// one: letters and digits only, no path tricks.
     pub fn media_path(&self, uuid: &str) -> Option<PathBuf> {
         let ext = self.item(uuid)?.extension?;
+        if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
         let p = self.data_dir(uuid).join(format!("content.{ext}"));
         (p.exists() && inside(&self.root, &p)).then_some(p)
     }
@@ -1074,6 +1079,23 @@ fn find_scrivx(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| p.extension().is_some_and(|e| e == "scrivx"))
+}
+
+/// File types omaquill will hand to another app ("Open in Default App"):
+/// documents and media only. A project can name its files anything, and
+/// opening `content.desktop` or `content.sh` from someone's project could
+/// run it.
+const OPENABLE: &[&str] = &[
+    "pdf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif", "mp3", "m4a",
+    "aac", "wav", "aif", "aiff", "flac", "ogg", "opus", "mp4", "m4v", "mov", "webm", "mkv", "txt",
+    "md",
+];
+
+/// Whether `path` is a type omaquill will open in another app.
+pub fn is_openable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| OPENABLE.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 // ------------------------------------------------------------ containment

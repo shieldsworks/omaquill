@@ -438,3 +438,56 @@ fn links_out_of_the_project_are_never_followed() {
         "the link itself goes"
     );
 }
+
+/// The project names its media files' extensions; omaquill only builds
+/// plain ones, and only offers to open documents and media.
+#[test]
+fn media_extensions_are_plain_and_openable_types_are_few() {
+    use omaquill::project::is_openable;
+    let c = copy_fixture("media");
+    let img = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
+    let p = Project::open(&c.0).unwrap();
+    assert!(p.media_path(img).is_some());
+    for (bad, ext) in [("../../x", "png"), ("desktop", "desktop")] {
+        let x = scrivx(&c.0).replace(
+            "<FileExtension>png</FileExtension>",
+            &format!("<FileExtension>{bad}</FileExtension>"),
+        );
+        std::fs::write(c.0.join("Lighthouse.scrivx"), x).unwrap();
+        std::fs::copy(
+            c.0.join("Files/Data").join(img).join("content.png"),
+            c.0.join("Files/Data")
+                .join(img)
+                .join(format!("content.{ext}")),
+        )
+        .unwrap();
+        let p = Project::open(&c.0).unwrap();
+        let path = p.media_path(img);
+        assert!(
+            path.as_deref().is_none_or(|p| !is_openable(p)),
+            "{bad}: {path:?}"
+        );
+        std::fs::write(
+            c.0.join("Lighthouse.scrivx"),
+            scrivx(&c.0).replace(
+                &format!("<FileExtension>{bad}</FileExtension>"),
+                "<FileExtension>png</FileExtension>",
+            ),
+        )
+        .unwrap();
+    }
+    for ok in ["a.pdf", "a.PNG", "a.mp3", "a.txt"] {
+        assert!(is_openable(Path::new(ok)), "{ok}");
+    }
+    for no in [
+        "a.desktop",
+        "a.sh",
+        "a.html",
+        "a.exe",
+        "a.AppImage",
+        "a",
+        "a.py",
+    ] {
+        assert!(!is_openable(Path::new(no)), "{no}");
+    }
+}

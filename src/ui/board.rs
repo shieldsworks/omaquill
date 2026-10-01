@@ -76,7 +76,9 @@ impl Board {
         {
             let file_path = file_path.clone();
             open.connect_clicked(move |_| {
-                if let Some(p) = file_path.borrow().as_ref() {
+                if let Some(p) = file_path.borrow().as_ref()
+                    && safe_to_open(p)
+                {
                     let _ = gio::AppInfo::launch_default_for_uri(
                         &gio::File::for_path(p).uri(),
                         gio::AppLaunchContext::NONE,
@@ -110,15 +112,45 @@ impl Board {
 
     pub fn show_file(&self, title: &str, path: Option<&Path>) {
         self.file_page.set_title(title);
+        let openable = path.is_some_and(safe_to_open);
         self.file_page.set_description(Some(match path {
-            Some(_) => "omaquill doesn't display this kind of file itself.",
+            Some(_) if openable => "omaquill doesn't display this kind of file itself.",
+            Some(_) => {
+                "omaquill doesn't open this kind of file from a project, since it could run code. \
+                 If you trust it, it's in the project's Files/Data folder."
+            }
             None => "The file for this item is missing from the project.",
         }));
         *self.file_path.borrow_mut() = path.map(Path::to_path_buf);
         if let Some(button) = self.file_page.child() {
-            button.set_visible(path.is_some());
+            button.set_visible(openable);
         }
     }
+}
+
+/// An allowed type by name (see `is_openable`) whose contents also look
+/// like a document or media file: the desktop decides how to open a file
+/// partly by sniffing it, so the name alone isn't enough.
+fn safe_to_open(p: &Path) -> bool {
+    use std::io::Read;
+    if !omaquill::project::is_openable(p) {
+        return false;
+    }
+    let mut head = vec![0u8; 4096];
+    let n = std::fs::File::open(p)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    head.truncate(n);
+    let (kind, _) = gio::content_type_guess(Some(p), Some(&head[..]));
+    let mime = gio::content_type_get_mime_type(&kind)
+        .map(|m| m.to_string())
+        .unwrap_or_default();
+    mime == "application/pdf"
+        || mime == "text/plain"
+        || mime == "text/markdown"
+        || ["image/", "audio/", "video/"]
+            .iter()
+            .any(|t| mime.starts_with(t))
 }
 
 fn clear<W: IsA<gtk::Widget>>(container: &W, remove: impl Fn(&gtk::Widget)) {
@@ -364,5 +396,60 @@ impl Win {
             Some("outliner") => self.show_outliner(&item),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&omaquill::zip::crc32(&body).to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        // One stored (uncompressed) deflate block: a 1x1 RGB row.
+        let raw = [0u8, 0, 0, 0];
+        let mut z = vec![0x78, 0x01, 1, raw.len() as u8, 0, !(raw.len() as u8), 0xff];
+        z.extend_from_slice(&raw);
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        for x in raw {
+            a = (a + x as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        chunk(&mut out, b"IDAT", &z);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn only_documents_and_media_open() {
+        let dir = std::env::temp_dir().join(format!("omaquill-media-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("content.png");
+        std::fs::write(&small, png(1, 1)).unwrap();
+        assert!(safe_to_open(&small));
+        let script = dir.join("content.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        assert!(!safe_to_open(&script));
+        let desktop = dir.join("content.desktop");
+        std::fs::write(&desktop, "[Desktop Entry]\nExec=sh\n").unwrap();
+        assert!(!safe_to_open(&desktop));
+        // A script wearing a .txt name is still only text to a viewer.
+        let text = dir.join("content.txt");
+        std::fs::write(&text, "plain words\n").unwrap();
+        assert!(safe_to_open(&text));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
