@@ -133,8 +133,7 @@ pub fn run() -> glib::ExitCode {
         for f in files {
             let Some(path) = f.path() else { continue };
             let path = project_dir(&path);
-            // Already open? Bring that window up.
-            if let Some(w) = find_window(app, &path) {
+            if let Some(w) = find_window(&path) {
                 w.present();
                 continue;
             }
@@ -178,7 +177,7 @@ thread_local! {
     static WINDOWS: RefCell<Vec<Rc<Win>>> = const { RefCell::new(Vec::new()) };
 }
 
-fn find_window(_app: &adw::Application, path: &Path) -> Option<adw::ApplicationWindow> {
+fn find_window(path: &Path) -> Option<adw::ApplicationWindow> {
     WINDOWS.with(|w| {
         w.borrow()
             .iter()
@@ -905,9 +904,7 @@ impl Win {
                     let win =
                         WINDOWS.with(|ws| ws.borrow().iter().find(|w| w.window == window).cloned());
                     if let Some(win) = win {
-                        // Already open in another window: go there.
-                        let app = win.window.application().and_downcast::<adw::Application>();
-                        if let Some(other) = app.and_then(|a| find_window(&a, &project_dir(&path)))
+                        if let Some(other) = find_window(&project_dir(&path))
                             && other != win.window
                         {
                             other.present();
@@ -1083,9 +1080,7 @@ impl Win {
             };
             let Some(path) = folder.path() else { return };
             let path = project_dir(&path);
-            if let Some(existing) =
-                find_window(&w.window.application().and_downcast().unwrap(), &path)
-            {
+            if let Some(existing) = find_window(&path) {
                 existing.present();
                 return;
             }

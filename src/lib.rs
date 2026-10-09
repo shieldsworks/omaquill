@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 //! omaquill's core: Scrivener projects read and written without a GUI.
 
 pub mod compile;

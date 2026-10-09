@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 //! omaquill: a writing studio for Omarchy that opens Scrivener projects.
 //!
 //! ```text

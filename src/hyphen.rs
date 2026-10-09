@@ -42,7 +42,12 @@ impl Hyphenator {
             let mut scores = vec![0u8];
             for c in pat.chars() {
                 match c.to_digit(10) {
-                    Some(d) => *scores.last_mut().unwrap() = d as u8,
+                    Some(d) => {
+                        let slot = scores
+                            .last_mut()
+                            .expect("pattern scores start with a slot and only grow");
+                        *slot = d as u8;
+                    }
                     None => {
                         letters.push(c);
                         scores.push(0);

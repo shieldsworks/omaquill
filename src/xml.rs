@@ -56,6 +56,18 @@ impl std::error::Error for Error {}
 /// stack of the code that walks the tree.
 const MAX_DEPTH: usize = 512;
 
+fn open_element(stack: &[Element]) -> &Element {
+    stack
+        .last()
+        .expect("parser stack is non-empty until the root element returns")
+}
+
+fn open_element_mut(stack: &mut [Element]) -> &mut Element {
+    stack
+        .last_mut()
+        .expect("parser stack is non-empty until the root element returns")
+}
+
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
@@ -182,27 +194,26 @@ impl<'a> Parser<'a> {
     }
 
     fn element(&mut self) -> Result<Element, Error> {
-        let mut stack = vec![self.start_tag()?];
-        if stack[0].empty {
-            return Ok(stack.pop().unwrap());
+        let first = self.start_tag()?;
+        if first.empty {
+            return Ok(first);
         }
+        let mut stack = vec![first];
         loop {
             let rest = self.rest();
             if rest.is_empty() {
-                return self.err(format!("<{}> is never closed", stack.last().unwrap().name));
+                let name = open_element(&stack).name.clone();
+                return self.err(format!("<{name}> is never closed"));
             }
             if !rest.starts_with('<') {
                 let n = rest.find('<').unwrap_or(rest.len());
-                stack
-                    .last_mut()
-                    .unwrap()
-                    .children
-                    .push(Node::Text(rest[..n].to_string()));
+                let text = rest[..n].to_string();
+                open_element_mut(&mut stack).children.push(Node::Text(text));
                 self.pos += n;
                 continue;
             }
             if let Some(node) = self.misc()? {
-                stack.last_mut().unwrap().children.push(node);
+                open_element_mut(&mut stack).children.push(node);
                 continue;
             }
             if rest.starts_with("</") {
@@ -213,7 +224,9 @@ impl<'a> Parser<'a> {
                     return self.err("bad end tag");
                 }
                 self.pos += 1;
-                let done = stack.pop().unwrap();
+                let done = stack
+                    .pop()
+                    .expect("parser stack is non-empty until the root element returns");
                 if done.name != name {
                     return self.err(format!("</{name}> closes <{}>", done.name));
                 }
@@ -225,9 +238,10 @@ impl<'a> Parser<'a> {
             }
             let el = self.start_tag()?;
             if el.empty {
-                stack.last_mut().unwrap().children.push(Node::Element(el));
+                open_element_mut(&mut stack)
+                    .children
+                    .push(Node::Element(el));
             } else if stack.len() >= MAX_DEPTH {
-                // Walking a tree this deep later would overflow the stack.
                 return self.err("elements nested too deeply");
             } else {
                 stack.push(el);
@@ -479,11 +493,13 @@ impl Element {
 
     /// Where this element's closing tag sits: the whitespace before it.
     fn closing_indent(&self, own: &str) -> String {
-        match self.children.last() {
-            Some(Node::Text(ws)) if ws.trim().is_empty() && ws.contains('\n') => {
-                ws[line_start(ws, ws.rfind('\n').unwrap())..].to_string()
-            }
-            _ => own.to_string(),
+        if let Some(Node::Text(ws)) = self.children.last()
+            && ws.trim().is_empty()
+            && let Some(nl) = ws.rfind('\n')
+        {
+            ws[line_start(ws, nl)..].to_string()
+        } else {
+            own.to_string()
         }
     }
 
@@ -535,7 +551,7 @@ impl Element {
                     .children
                     .iter()
                     .rposition(|n| matches!(n, Node::Element(_)))
-                    .unwrap();
+                    .expect("this element has a child element");
                 self.children.insert(last + 1, Node::Element(el));
                 self.children.insert(last + 1, Node::Text(indent));
             }
@@ -733,5 +749,11 @@ mod tests {
     #[test]
     fn rejects_mismatched_tags() {
         assert!(parse("<a><b></a></b>").is_err());
+    }
+
+    #[test]
+    fn unclosed_element_names_the_open_tag() {
+        let err = parse("<chapter><scene>text").unwrap_err();
+        assert_eq!(err.message, "<scene> is never closed");
     }
 }

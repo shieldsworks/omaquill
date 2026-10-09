@@ -959,8 +959,8 @@ pub fn write(text: &RichText) -> String {
             let s = &r.style;
             if field.as_ref().map(|f| &f.0) != s.link.as_ref() {
                 close_field(&mut out, &mut field, &mut ch, &mut cf);
-                if let Some(url) = &s.link {
-                    let url: String = url
+                if let Some(link) = &s.link {
+                    let url: String = link
                         .chars()
                         .filter(|c| !matches!(c, '"' | '{' | '}' | '\\'))
                         .collect();
@@ -968,7 +968,7 @@ pub fn write(text: &RichText) -> String {
                         out,
                         "{{\\field{{\\*\\fldinst{{HYPERLINK \"{url}\"}}}}{{\\fldrslt "
                     );
-                    field = Some((s.link.clone().unwrap(), ch.clone(), cf));
+                    field = Some((link.clone(), ch.clone(), cf));
                 }
             }
             let mut codes = String::new();
@@ -1228,6 +1228,35 @@ mod tests {
         );
         let again = parse(write(&t).as_bytes());
         assert_eq!(again.paragraphs, t.paragraphs);
+    }
+
+    #[test]
+    fn a_quoted_link_stays_one_field() {
+        let mut t = RichText::from_plain("ab");
+        let style = CharStyle {
+            link: Some("https://x.org/a\"b\\c".into()),
+            ..t.paragraphs[0].runs[0].style.clone()
+        };
+        t.paragraphs[0].runs = vec![
+            Run {
+                text: "a".into(),
+                style: style.clone(),
+            },
+            Run {
+                text: "b".into(),
+                style,
+            },
+        ];
+        let rtf = write(&t);
+        assert_eq!(rtf.matches("HYPERLINK").count(), 1, "{rtf}");
+        let back = parse(rtf.as_bytes());
+        assert_eq!(back.plain_text(), "ab");
+        assert!(
+            back.paragraphs[0]
+                .runs
+                .iter()
+                .all(|r| { r.style.link.as_deref() == Some("https://x.org/abc") })
+        );
     }
 
     #[test]
