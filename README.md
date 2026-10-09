@@ -1,25 +1,40 @@
 # omaquill
 
-A writing studio for [Omarchy](https://omarchy.org) that opens your
-Scrivener projects.
+omaquill is a free writing studio, written from scratch, for authors and
+writers on Linux and [Omarchy](https://omarchy.org). Scrivener has no Linux
+version. You can start a fresh novel here.
+
+It has a binder, a corkboard, an outliner, and an inspector. Composition
+mode is full screen, just the text. Compile writes DOCX, PDF, and EPUB,
+plus Markdown, plain text, and RTF.
 
 ![omaquill with a Moby-Dick project open](preview.png)
 
-omaquill reads and writes Scrivener 3's `.scriv` format directly. Point it at
-the project you've been writing in on the Mac and keep going: the binder,
-your chapters and scenes, synopses, notes, labels and status are all there,
-and what you write is saved back into the same project. There's no import
-step and no second copy.
+Projects are Scrivener 3 `.scriv` folders. You can open one you already
+wrote on a Mac. A novel you start here is a folder you can copy to someone
+who uses Scrivener. You are not locked into a private format. See
+[What carries over](#what-carries-over) for what is kept. Opening an
+edited project in Scrivener itself has not been tested yet.
 
-It's written from scratch in Rust with GTK 4 and libadwaita. The Scrivener
-reader and writer, the RTF engine, and the DOCX and EPUB writers are omaquill's
-own. The only dependencies are GTK and libadwaita, plus GTK's own Pango and
-Cairo for PDF layout. The Omarchy theme
-colors the window and follows theme changes live.
+The app is written in Rust, with GTK 4 and libadwaita. The Scrivener
+reader and writer, the RTF engine, and the DOCX and EPUB writers are
+omaquill's own. The only dependencies are GTK and libadwaita, plus GTK's
+own Pango and Cairo for PDF layout. The Omarchy theme colors the window
+and follows theme changes live.
 
-**Status: v0.1.** It's for writing. Most of Scrivener's Compile, and its
-snapshots, comments and footnotes, aren't here yet. See
+**Status: v0.1.** It's for writing. Most of Compile's options, snapshots,
+and the text of comments and footnotes aren't here yet. See
 [What carries over](#what-carries-over).
+
+**Safe to try.** omaquill makes a backup before every open. A document you
+don't edit is never rewritten. To read a project and change nothing, run
+`omaquill check "Novel.scriv"`.
+
+To install the app and the bar widget, run this command.
+
+```sh
+git clone https://github.com/shieldsworks/omaquill ~/.local/share/omaquill/src && bash ~/.local/share/omaquill/src/scripts/install-local.sh --plugin
+```
 
 ## Install
 
@@ -77,7 +92,26 @@ match Palatino, Times, Helvetica and Courier.
 Your files keep their original font names either way. The stand-ins are
 only used on screen.
 
-## Bringing a project over from the Mac
+## Start a new project
+
+Choose **New Project…** from the menu, or press Ctrl+Shift+O. The welcome
+page has the same button. You see that page when omaquill has no project
+to reopen. When you already have a project, omaquill opens your last one.
+The menu item and the shortcut work either way.
+
+The dialog asks where to save the project. The name starts as
+`Untitled.scriv`. If the name does not already end in `.scriv`, omaquill
+adds it. The folder must not already exist.
+
+The new folder is a Scrivener 3 project. The binder starts with
+Manuscript, Research, and Trash. Manuscript contains one empty document,
+Chapter One. Write there, or add a document or a folder from the binder.
+
+The app creates the project. No terminal command creates one.
+`omaquill check` and `omaquill compile` read a `.scriv` folder that
+already exists. `omaquill` on its own opens the app.
+
+## Already use Scrivener?
 
 Copy the whole `.scriv` folder across: AirDrop to a phone and back, a USB
 stick, `scp`, a synced folder, whatever works. With iCloud or Dropbox, make
@@ -112,6 +146,7 @@ you switch documents or close.
 
 | Keys | |
 |---|---|
+| Ctrl+Shift+O | New project |
 | Ctrl+N / Ctrl+Shift+N | New text / new folder |
 | F2 | Rename |
 | Ctrl+B, Ctrl+I, Ctrl+U | Bold, italic, underline |

@@ -6,7 +6,7 @@
   "author": "Casey Shields",
   "license": "MIT",
   "homepage": "https://github.com/shieldsworks/omaquill",
-  "description": "Words written today in omaquill, the writing studio that opens Scrivener projects",
+  "description": "Words written today in omaquill, a free writing studio for authors and writers on Linux and Omarchy",
   "kinds": [
     "bar-widget"
   ],

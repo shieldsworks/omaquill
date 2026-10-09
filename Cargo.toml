@@ -3,7 +3,7 @@ name = "omaquill"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A writing studio for Omarchy that opens Scrivener projects"
+description = "A free writing studio for authors and writers on Linux and Omarchy"
 license = "MIT"
 repository = "https://github.com/shieldsworks/omaquill"
 
