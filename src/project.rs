@@ -142,6 +142,14 @@ impl From<xml::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+fn missing_item(uuid: &str) -> Error {
+    if uuid.is_empty() {
+        Error::Invalid("binder item has no id".into())
+    } else {
+        Error::NoSuchItem(uuid.to_string())
+    }
+}
+
 pub struct Project {
     pub path: PathBuf,
     /// `path` with every symlink resolved: nothing outside it is ever read,
@@ -459,7 +467,9 @@ impl Project {
                 .map_or(0, |i| i + 1);
             e.insert_element(at, Element::new("MetaData"), &own);
         }
-        let meta = e.child_mut("MetaData").unwrap();
+        let meta = e
+            .child_mut("MetaData")
+            .expect("MetaData was inserted when it was missing");
         match value {
             Some(v) => meta.set_child_text(name, v, &inner),
             None => {
@@ -554,7 +564,8 @@ impl Project {
                     .locate(sibling)
                     .ok_or_else(|| Error::NoSuchItem(sibling.to_string()))?;
                 let parent = self.ancestors(sibling).last().cloned();
-                (parent, loc.last().unwrap() + 1)
+                let at = *loc.last().expect("a located binder item has an index");
+                (parent, at + 1)
             }
             None => {
                 let n = self.item(parent).map_or(0, |p| p.children.len());
@@ -598,7 +609,9 @@ impl Project {
                     let n = pe.elements().count();
                     pe.insert_element(n, c, &parent_own);
                 }
-                let children = pe.child_mut("Children").unwrap();
+                let children = pe
+                    .child_mut("Children")
+                    .expect("Children was inserted when it was missing");
                 let at = index.min(children.elements().count());
                 let children_own = format!("{parent_own}    ");
                 children.insert_element(at, el, &children_own);
@@ -633,7 +646,7 @@ impl Project {
                 return Err(Error::Invalid("media items can't hold other items".into()));
             }
         }
-        let loc = self.locate(uuid).unwrap();
+        let loc = self.locate(uuid).ok_or_else(|| missing_item(uuid))?;
         let old_parent = self.ancestors(uuid).last().cloned();
         let mut index = index;
         // Removing first shifts later siblings of the same parent up by one.
@@ -642,7 +655,7 @@ impl Project {
             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
             _ => false,
         };
-        if same_parent && *loc.last().unwrap() < index {
+        if same_parent && *loc.last().expect("a located binder item has an index") < index {
             index -= 1;
         }
         let el = self.detach(&loc)?;
@@ -652,8 +665,8 @@ impl Project {
     }
 
     fn detach(&mut self, loc: &[usize]) -> Result<Element> {
-        let (last, path) = loc.split_last().unwrap();
         let bad = || Error::Invalid("binder changed underneath".into());
+        let (last, path) = loc.split_last().ok_or_else(bad)?;
         let container = if path.is_empty() {
             self.binder_mut()
         } else {
@@ -705,8 +718,9 @@ impl Project {
         }
         let mut doomed = Vec::new();
         all(&trash.children, &mut doomed);
-        let loc = self.locate(&trash.uuid).unwrap();
-        let t = self.element_at_mut(&loc).unwrap();
+        let uuid = trash.uuid.clone();
+        let loc = self.locate(&uuid).ok_or_else(|| missing_item(&uuid))?;
+        let t = self.element_at_mut(&loc).expect("just located");
         t.remove_child("Children");
         for uuid in &doomed {
             // A malformed item (no UUID, or "..") must never turn into
@@ -898,8 +912,11 @@ impl Project {
             )?,
         };
         let uuids: Vec<String> = self.reindex.keys().cloned().collect();
+        let docs = doc
+            .root
+            .child_mut("Documents")
+            .expect("the search index has a Documents element");
         for uuid in uuids {
-            let docs = doc.root.child_mut("Documents").unwrap();
             let pos = docs.elements().position(|e| {
                 e.attr("ID")
                     .is_some_and(|id| id.eq_ignore_ascii_case(&uuid))
@@ -926,7 +943,6 @@ impl Project {
             }
             add("Notes", &self.notes(&uuid)?.plain_text());
             xml::pretty(&mut entry, "\n        ");
-            let docs = doc.root.child_mut("Documents").unwrap();
             let n = docs.elements().count();
             docs.insert_element(n, entry, "\n    ");
         }
@@ -1054,7 +1070,9 @@ fn write_backup(path: &Path, tmp: &Path) -> Result<()> {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e.into()),
                 };
-                let rel = p.strip_prefix(path).unwrap();
+                let rel = p.strip_prefix(path).map_err(|_| {
+                    Error::Invalid(format!("{} is outside the project", p.display()))
+                })?;
                 let entry = format!("{top}/{}", rel.to_string_lossy());
                 zip.add(&entry, &bytes)?;
             }
@@ -1294,6 +1312,8 @@ pub fn timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as libc::time_t;
+    // SAFETY: `libc::tm` is a C struct of integers and one pointer. All-zero
+    // is a valid value, including a null `tm_zone`.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: localtime_r only writes the tm we hand it.
     unsafe { libc::localtime_r(&now, &mut tm) };

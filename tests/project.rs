@@ -333,6 +333,48 @@ fn backups_never_prune_another_projects() {
 }
 
 #[test]
+fn trash_without_an_id_does_not_delete_files() {
+    let c = copy_fixture("trash-id");
+    let x = scrivx(&c.0).replace(
+        "UUID=\"7ACF6D8B-9EAC-4DBF-DAEB-5C6D7E8F9A07\" Type=\"TrashFolder\"",
+        "Type=\"TrashFolder\"",
+    );
+    std::fs::write(c.0.join("Lighthouse.scrivx"), x).unwrap();
+    let mut p = Project::open(&c.0).unwrap();
+    let err = p.empty_trash().unwrap_err();
+    assert_eq!(err.to_string(), "binder item has no id");
+    assert!(
+        c.0.join("Files/Data")
+            .join(SCENE)
+            .join("content.rtf")
+            .exists()
+    );
+}
+
+#[test]
+fn moving_an_item_with_no_id_is_an_error() {
+    let c = copy_fixture("move-id");
+    let x = scrivx(&c.0).replace(&format!("UUID=\"{SCENE}\" "), "");
+    std::fs::write(c.0.join("Lighthouse.scrivx"), x).unwrap();
+    let mut p = Project::open(&c.0).unwrap();
+    let err = p.move_item("", Some(CHAPTER), 0).unwrap_err();
+    assert_eq!(err.to_string(), "binder item has no id");
+    let chapter = p.item(CHAPTER).unwrap();
+    assert!(
+        chapter
+            .children
+            .iter()
+            .any(|c| c.title == "The Storm" && c.uuid.is_empty())
+    );
+    assert!(
+        c.0.join("Files/Data")
+            .join(SCENE)
+            .join("content.rtf")
+            .exists()
+    );
+}
+
+#[test]
 fn emptying_trash_never_touches_data_for_malformed_items() {
     let c = copy_fixture("badtrash");
     // A Trash child with no UUID, as a damaged file might have.
