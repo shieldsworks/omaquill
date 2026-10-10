@@ -45,10 +45,12 @@ What the tests cover:
   text, and RTF. `epubcheck`, `pdfinfo`, and `pdftotext` run only when they
   are already installed. CI does not install them. Without them the PDF test
   still requires a `%PDF-` header, and it skips the page-size check.
-- `tests/real_project.rs` runs only when `OMAQUILL_REAL_PROJECT` points at a
-  `.scriv` folder. It only reads that folder. With the variable unset, those
-  tests return and pass.
-- Modules under `src/` contain their own unit tests.
+- `tests/real_project.rs` runs only when `OMAQUILL_REAL_PROJECT` is set.
+  Point it at a `.scriv` folder. The tests only read that folder. With the
+  variable unset, they return and pass.
+- Some modules under `src/` contain their own unit tests. `src/project.rs`,
+  `src/fonts.rs`, `src/main.rs`, `src/ui/binder.rs`, `src/ui/dialogs.rs`, and
+  `src/ui/inspector.rs` do not.
 - There is no `tests/golden/` directory.
 
 ## The gates are not yours to move
@@ -111,8 +113,10 @@ You will copy what you see. Before copying, check that the code you copy
 passes today's lints and has a test. Old code may predate the rules.
 
 - No `unwrap()` outside tests. Return a `Result`, or call the `expect`
-  method with the invariant that makes the call safe. `src/xml.rs` and
-  `src/project.rs` do the latter, as in `expect("checked on open")`.
+  method with the invariant that makes the call safe. `src/project.rs` does
+  the latter, as in `expect("checked on open")`. `src/xml.rs` does it with
+  the parser's own invariant, as in
+  `expect("parser stack is non-empty until the root element returns")`.
 - Cast lints are not on. Do not rewrite an existing `as` cast in an
   unrelated change. A new `as` that can truncate needs the range stated in
   the change.
@@ -176,8 +180,9 @@ A `.scriv` folder is the user's book. These rules keep a save from leaving
 a half-written chapter. They also keep a write inside the project.
 
 Project text, the `.scrivx`, `Files/Data/docs.checksum`,
-`Files/search.indexes`, and the files in `src/state.rs` are replaced through
-`write_atomic` in `src/project.rs`.
+`Files/search.indexes`, and the files `src/state.rs` writes are replaced
+through `write_atomic` in `src/project.rs`. `Project::create` writes a new
+project's first `.scrivx` and empty `docs.checksum` with `std::fs::write`.
 
 - `write_atomic` creates a new temp file in the same directory. The name is
   `.<filename>.<pid>-<n>.omaquill-tmp`, opened with `create_new`.
@@ -204,14 +209,18 @@ Project text, the `.scrivx`, `Files/Data/docs.checksum`,
   follows it.
 
 `read_inside` refuses a path that resolves outside the project.
-`remove_file_inside` and `remove_dir_inside` do the same for deletes.
-`empty_trash` skips a name that fails `is_uuid`, so a missing id cannot
-become a delete of `Files/Data`.
+`remove_file_inside` and `remove_dir_inside` refuse a parent that resolves
+outside the project. A symlink is removed as a link, and its target is left
+unchanged. A real directory that resolves outside the project is left in
+place. `empty_trash` skips a child name that fails `is_uuid`, so a missing
+id cannot become a delete of `Files/Data`. A Trash folder with no id returns
+an error and deletes nothing.
 
-`set_text`, `set_notes`, and `set_synopsis` write that one file immediately
-through `write_inside`. `Project::save` rewrites the `.scrivx`,
-`docs.checksum`, and the search index only when those are dirty. Do not
-make a save rewrite every document.
+`set_text` writes `content.rtf` immediately through `write_inside`.
+`set_notes` and `set_synopsis` write through `write_inside` when the text
+is not empty, and remove the file through `remove_file_inside` when it is.
+`Project::save` rewrites the `.scrivx`, `docs.checksum`, and the search
+index only when those are dirty. Do not make a save rewrite every document.
 
 Settings, the recent-project list, per-project view state, and `today.json`
 call `write_atomic` directly. They live outside the project, under the paths
@@ -264,7 +273,7 @@ A change to `write_atomic`, the inside checks, `is_uuid` in `empty_trash`,
 - `src/ui/editor.rs` is the text editor.
 - `src/ui/inspector.rs` is the inspector.
 - `src/ui/board.rs` is the corkboard, the outliner, image limits, and opening a file in another app.
-- `src/ui/dialogs.rs` is rename and the shortcut dialog.
+- `src/ui/dialogs.rs` is rename, Compile, preferences, keyboard shortcuts, and about.
 - `src/ui/theme.rs` reads the Omarchy theme colors.
 - `src/ui/rich.rs` maps RTF styles onto a GTK text buffer.
 - `ui/WordsBar.qml` is the bar widget. It reads `today.json` and does not write the project.
