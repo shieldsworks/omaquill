@@ -149,7 +149,7 @@ impl Win {
             .license_type(gtk::License::MitX11)
             .website("https://github.com/shieldsworks/omaquill")
             .issue_url("https://github.com/shieldsworks/omaquill/issues")
-            .comments("A writing studio for Omarchy that opens Scrivener projects.")
+            .comments("A free writing studio for authors and writers on Linux and Omarchy.")
             .build();
         about.present(Some(&self.window));
     }

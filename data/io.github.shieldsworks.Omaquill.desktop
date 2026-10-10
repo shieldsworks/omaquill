@@ -2,7 +2,7 @@
 Type=Application
 Name=omaquill
 GenericName=Writing Studio
-Comment=Write novels in Scrivener projects, on Omarchy
+Comment=Write novels on Omarchy
 Exec=omaquill %F
 TryExec=omaquill
 Icon=io.github.shieldsworks.Omaquill

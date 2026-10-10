@@ -1,5 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-//! omaquill: a writing studio for Omarchy that opens Scrivener projects.
+//! omaquill: a free writing studio for authors and writers on Linux and Omarchy.
 //!
 //! ```text
 //! omaquill [PROJECT.scriv]                  open the app

@@ -1,25 +1,40 @@
 # omaquill
 
-A writing studio for [Omarchy](https://omarchy.org) that opens your
-Scrivener projects.
+A free writing studio for authors on Linux and [Omarchy](https://omarchy.org).
+Scrivener never came to Linux, so omaquill brings the way it works to your
+desktop: a binder for your chapters and scenes, a corkboard of index cards,
+an outliner, an inspector for synopses and notes, distraction-free
+composition mode, and compile to Word, PDF, and EPUB. Start a new novel
+here, or open one you've been writing for years.
 
 ![omaquill with a Moby-Dick project open](preview.png)
 
-omaquill reads and writes Scrivener 3's `.scriv` format directly. Point it at
-the project you've been writing in on the Mac and keep going: the binder,
-your chapters and scenes, synopses, notes, labels and status are all there,
-and what you write is saved back into the same project. There's no import
-step and no second copy.
+Your work is saved in Scrivener's own `.scriv` format, so you're never
+locked in. Open a project you started on a Mac, hand your manuscript to a
+co-writer who uses Scrivener, or move on later with everything intact.
 
-It's written from scratch in Rust with GTK 4 and libadwaita. The Scrivener
-reader and writer, the RTF engine, and the DOCX and EPUB writers are omaquill's
-own. The only dependencies are GTK and libadwaita, plus GTK's own Pango and
-Cairo for PDF layout. The Omarchy theme
-colors the window and follows theme changes live.
+**Safe to try.** omaquill backs up your whole project every time it opens
+it, never rewrites a document you haven't touched, and can read a project
+without changing anything: `omaquill check "Novel.scriv"`.
 
-**Status: v0.1.** It's for writing. Most of Scrivener's Compile, and its
-snapshots, comments and footnotes, aren't here yet. See
+**Status: v0.1.** It's ready for writing. Most of Scrivener's Compile
+options, snapshots, and comment and footnote text aren't here yet. See
 [What carries over](#what-carries-over).
+
+## Quick start
+
+```sh
+git clone https://github.com/shieldsworks/omaquill ~/.local/share/omaquill/src && bash ~/.local/share/omaquill/src/scripts/install-local.sh --plugin
+```
+
+Then open omaquill from your app launcher and choose **New Project**.
+
+## Start a new project
+
+Choose **New Project…** from the menu or press Ctrl+Shift+O. (The welcome
+page has the same button.) Pick where to save it, and omaquill creates a
+fresh project with Manuscript, Research, and Trash, plus an empty
+Chapter One to start writing in.
 
 ## Install
 
@@ -77,7 +92,7 @@ match Palatino, Times, Helvetica and Courier.
 Your files keep their original font names either way. The stand-ins are
 only used on screen.
 
-## Bringing a project over from the Mac
+## Already use Scrivener?
 
 Copy the whole `.scriv` folder across: AirDrop to a phone and back, a USB
 stick, `scp`, a synced folder, whatever works. With iCloud or Dropbox, make
@@ -112,6 +127,7 @@ you switch documents or close.
 
 | Keys | |
 |---|---|
+| Ctrl+Shift+O | New project |
 | Ctrl+N / Ctrl+Shift+N | New text / new folder |
 | F2 | Rename |
 | Ctrl+B, Ctrl+I, Ctrl+U | Bold, italic, underline |
@@ -202,7 +218,7 @@ same text in every file and the same bold and italic. Opening an
 omaquill-edited project in Scrivener itself hasn't been tested yet; if you
 have Scrivener, a report either way is welcome.
 
-omaquill is built for moving to Linux, not for going back and forth. A
+omaquill is built to be your writing studio, not a round-trip editor. A
 project it has edited still opens in Scrivener, but a document edited here
 loses any Scrivener-only formatting listed above.
 
@@ -224,6 +240,12 @@ nothing else without the app). The widget reads `~/.local/state/omaquill/today.j
 current as you type.
 
 ## Development
+
+The app is written in Rust, with GTK 4 and libadwaita. The Scrivener
+reader and writer, the RTF engine, and the DOCX and EPUB writers are
+omaquill's own. The only dependencies are GTK and libadwaita, plus GTK's
+own Pango and Cairo for PDF layout. The Omarchy theme colors the window
+and follows theme changes live.
 
 ```sh
 mise install       # the Rust toolchain
