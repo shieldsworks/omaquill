@@ -56,7 +56,14 @@ What the tests cover:
 ## The gates are not yours to move
 
 These files set the rules. Change them only in a change whose whole purpose
-is changing them, and have a human review that change.
+is changing them. Such a PR merges only after review by someone other than
+its author, either Casey or Casey's delegated reviewer Dev. Dev's review
+means all three. An independent agent verifies the PR head on a clean
+checkout. That agent runs `mise lint` and `mise test` and drives the
+changed behavior. An adversarial review challenges the change. CI is green
+on the exact head SHA merged. The author agent never approves or merges
+its own PR. A `Cargo.lock` change or a dependency change merges only after
+that same review.
 
 - `.github/workflows/`
 - the `lint`, `test`, and `build` tasks in `mise.toml`
@@ -65,7 +72,13 @@ is changing them, and have a human review that change.
 
 This repo has no `[lints]` table, no `clippy.toml`, no `scripts/verify.sh`,
 and no `scripts/check-comments.sh`. Do not add any of them in a change about
-behavior. A new gate is its own change, and a human reviews it.
+behavior. A new gate is its own change. Such a PR merges only after review
+by someone other than its author, either Casey or Casey's delegated
+reviewer Dev. Dev's review means all three. An independent agent verifies
+the PR head on a clean checkout. That agent runs `mise lint` and `mise test`
+and drives the changed behavior. An adversarial review challenges the
+change. CI is green on the exact head SHA merged. The author agent never
+approves or merges its own PR.
 
 Clippy's pedantic lints, the cast lints, `undocumented_unsafe_blocks`, and
 `allow_attributes_without_reason` are not turned on. Do not turn one on in
@@ -139,9 +152,13 @@ site.
 
 ## Review
 
-The agent that wrote a change does not approve, merge, or mark it verified.
-A different agent, with fresh context and a clean checkout, or Casey,
-reviews it. They run `mise lint` and `mise test`.
+A PR merges only after review by someone other than its author, either
+Casey or Casey's delegated reviewer Dev. Dev's review means all three. An
+independent agent verifies the PR head on a clean checkout. That agent runs
+`mise lint` and `mise test` and drives the changed behavior. An adversarial
+review challenges the change. CI is green on the exact head SHA merged. The
+author agent never approves or merges its own PR. The author agent does not
+mark the change verified.
 
 The change lists what changed, the tests that prove it, and what was not
 checked. The reviewer reports what they ran and what they saw.
