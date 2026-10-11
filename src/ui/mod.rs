@@ -47,8 +47,6 @@ pub struct Win {
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
     dirty_text: Cell<bool>,
-    /// The backup started when the project opened. Project replace joins it
-    /// first so two backups cannot share one `zip.part` name.
     backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
     dirty_notes: Cell<bool>,
     dirty_synopsis: Cell<bool>,

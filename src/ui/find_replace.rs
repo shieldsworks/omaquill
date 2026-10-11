@@ -1,7 +1,3 @@
-//! Find and replace. The open document is edited in its text buffer.
-//! The rest of the project is edited by [`omaquill::replace::apply`],
-//! which zips a backup first and skips every file that did not change.
-
 use super::Win;
 use super::editor::Editor;
 use adw::prelude::*;

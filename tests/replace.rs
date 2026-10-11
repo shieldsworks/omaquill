@@ -1,6 +1,3 @@
-//! Find and replace against a temp copy of the Lighthouse fixture.
-//! The fixture in the repo is never written.
-
 use omaquill::project::Project;
 use omaquill::replace::{self, ApplyOutcome, Case, Mode, Options, Word};
 use omaquill::sha1;

@@ -1,10 +1,3 @@
-//! Find and replace over [`RichText`].
-//!
-//! A match is a character range in [`RichText::plain_text`]. The replacement
-//! takes the character style of the first character of that match. `render`
-//! returns `None` when nothing would change, and that is the only signal
-//! that skips `set_text` and `set_notes`.
-
 use crate::project::{self, Item, Kind, Project};
 use crate::rtf::{CharStyle, ParaStyle, Paragraph, RichText, Run};
 use regex::Regex;
@@ -66,7 +59,6 @@ impl std::fmt::Display for QueryError {
     }
 }
 
-/// A compiled search. `regex::Regex` stays inside this type.
 #[derive(Debug, Clone)]
 pub struct Query {
     needle: Regex,
@@ -136,7 +128,6 @@ impl Cursor {
     }
 }
 
-/// `end > start`, in Unicode scalar values of [`RichText::plain_text`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharRange {
     start: usize,
@@ -289,7 +280,6 @@ pub fn plan_all(text: &RichText, query: &Query) -> EditPlan {
     }
 }
 
-/// `None` when `plan` is empty. `Some` copies `text.lossy` onto the result.
 pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
     if plan.edits.is_empty() {
         return None;
@@ -395,7 +385,6 @@ pub struct Group {
     title: String,
     path_label: String,
     in_trash: bool,
-    /// Features `rtf::write` drops if this field is rewritten.
     lossy: Vec<&'static str>,
     rows: Vec<Row>,
 }
@@ -475,7 +464,6 @@ pub enum ApplyOutcome {
 pub enum ApplyError {
     Backup(project::Error),
     Read(project::Error),
-    /// `written` already reached disk. `Project::save` was attempted.
     Write {
         written: Vec<DocId>,
         source: project::Error,
@@ -492,9 +480,6 @@ impl std::fmt::Display for ApplyError {
     }
 }
 
-/// Re-reads each chosen field and writes it only when `render` returns
-/// `Some`. An empty set returns [`ApplyOutcome::NothingToDo`] and does not
-/// zip. A second call with the same preview skips every slice.
 pub fn apply(
     project: &mut Project,
     backup_dir: &Path,

@@ -252,8 +252,6 @@ impl Editor {
         omaquill::rtf::word_count(&self.plain_text())
     }
 
-    /// One undo step. `inserting` stops `after_insert` from painting the
-    /// neighbor over the matched run. `load` and `set_text` are not called.
     pub fn apply_edits(
         &self,
         plan: &omaquill::replace::EditPlan,
@@ -574,9 +572,6 @@ fn tags_for(buffer: &gtk::TextBuffer, style: &omaquill::rtf::CharStyle) -> Vec<g
         .collect()
 }
 
-/// Paragraph style is read from the start of a line. A line created by a
-/// newline in the replacement starts inside `[origin, end)` and takes
-/// `style`. A line that already existed keeps the tags it had.
 fn paint_new_lines(
     buffer: &gtk::TextBuffer,
     origin: i32,
