@@ -266,33 +266,18 @@ impl Win {
 
         let dialog = adw::PreferencesDialog::new();
         dialog.add(&page);
-        let apply = {
+        let look = {
             let weak = Rc::downgrade(self);
-            let (
-                zoom,
-                own_fonts,
-                font_button,
-                target,
-                author,
-                keep,
-                spell_on,
-                in_compose,
-                wait,
-                language,
-            ) = (
+            let (zoom, own_fonts, font_button, target, author, keep) = (
                 zoom.clone(),
                 own_fonts.clone(),
                 font_button.clone(),
                 target.clone(),
                 author.clone(),
                 keep.clone(),
-                spell_on.clone(),
-                in_compose.clone(),
-                wait.clone(),
-                language.clone(),
             );
             let font_row = font_row.clone();
-            Rc::new(move || {
+            move || {
                 let Some(win) = weak.upgrade() else { return };
                 font_row.set_sensitive(!own_fonts.is_active());
                 {
@@ -308,6 +293,25 @@ impl Win {
                     s.daily_target = target.value() as u32;
                     s.author = author.text().to_string();
                     s.backups = keep.value() as usize;
+                    let _ = s.save();
+                }
+                win.apply_look();
+                win.update_totals();
+            }
+        };
+        let look = Rc::new(look);
+        let spell_apply = {
+            let weak = Rc::downgrade(self);
+            let (spell_on, in_compose, wait, language) = (
+                spell_on.clone(),
+                in_compose.clone(),
+                wait.clone(),
+                language.clone(),
+            );
+            move || {
+                let Some(win) = weak.upgrade() else { return };
+                {
+                    let mut s = win.settings.borrow_mut();
                     s.spellcheck = spell_on.is_active();
                     s.spell_in_compose = in_compose.is_active();
                     s.spell_hide_current = wait.is_active();
@@ -323,29 +327,28 @@ impl Win {
                 {
                     action.set_state(&spell_on.is_active().to_variant());
                 }
-                win.apply_look();
-                win.update_totals();
-            })
+            }
         };
-        let a = apply.clone();
+        let spell_apply = Rc::new(spell_apply);
+        let a = look.clone();
         zoom.connect_value_notify(move |_| a());
-        let a = apply.clone();
+        let a = look.clone();
         own_fonts.connect_active_notify(move |_| a());
-        let a = apply.clone();
+        let a = look.clone();
         font_button.connect_font_desc_notify(move |_| a());
-        let a = apply.clone();
+        let a = look.clone();
         target.connect_value_notify(move |_| a());
-        let a = apply.clone();
+        let a = look.clone();
         author.connect_changed(move |_| a());
-        let a = apply.clone();
+        let a = look.clone();
         keep.connect_value_notify(move |_| a());
-        let a = apply.clone();
+        let a = spell_apply.clone();
         spell_on.connect_active_notify(move |_| a());
-        let a = apply.clone();
+        let a = spell_apply.clone();
         in_compose.connect_active_notify(move |_| a());
-        let a = apply.clone();
+        let a = spell_apply.clone();
         wait.connect_active_notify(move |_| a());
-        let a = apply.clone();
+        let a = spell_apply.clone();
         language.connect_changed(move |_| a());
         dialog.present(Some(&self.window));
     }

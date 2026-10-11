@@ -44,23 +44,17 @@ pub struct Session {
     dictionary: RefCell<BTreeSet<String>>,
     ignored: RefCell<BTreeSet<String>>,
     ignore_path: RefCell<Option<PathBuf>>,
-    popover: gtk::Popover,
-    rows: gtk::Box,
-    word_start: Cell<i32>,
-    word_end: Cell<i32>,
     line: Cell<i32>,
     index: Cell<i32>,
     idle: RefCell<Option<glib::SourceId>>,
     me: RefCell<std::rc::Weak<Session>>,
+    /// Buffer offsets of the word the caret was in, so leaving it can mark it.
+    left: Cell<Option<(i32, i32)>>,
+    chars: Cell<i32>,
 }
 
 impl Session {
     pub fn new(editor: &Rc<Editor>, settings: &Settings) -> Rc<Session> {
-        let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        rows.add_css_class("menu");
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&rows));
-        popover.set_position(gtk::PositionType::Bottom);
         let tag = spell::language_tag(&settings.spell_language);
         let session = Rc::new(Session {
             editor: editor.clone(),
@@ -75,14 +69,12 @@ impl Session {
             dictionary: RefCell::new(state::load_words(&state::dictionary_path())),
             ignored: RefCell::new(BTreeSet::new()),
             ignore_path: RefCell::new(None),
-            popover,
-            rows,
-            word_start: Cell::new(0),
-            word_end: Cell::new(0),
             line: Cell::new(0),
             index: Cell::new(0),
             idle: RefCell::new(None),
             me: RefCell::new(std::rc::Weak::new()),
+            left: Cell::new(None),
+            chars: Cell::new(0),
         });
         *session.me.borrow_mut() = Rc::downgrade(&session);
         session.wire_click();
@@ -112,13 +104,17 @@ impl Session {
     }
 
     pub fn apply_settings(&self, settings: &Settings, composing: bool) {
-        *self.policy.borrow_mut() = Policy {
+        let next = Policy {
             enabled: settings.spellcheck,
             composing,
             show_in_compose: settings.spell_in_compose,
             hide_word_at_cursor: settings.spell_hide_current,
         };
         let tag = spell::language_tag(&settings.spell_language);
+        if next == *self.policy.borrow() && tag == *self.language.borrow() {
+            return;
+        }
+        *self.policy.borrow_mut() = next;
         if tag != *self.language.borrow() {
             *self.language.borrow_mut() = tag.clone();
             *self.broker.borrow_mut() = Broker::open(&tag);
@@ -126,21 +122,44 @@ impl Session {
         self.rescan();
     }
 
+    /// A one-character edit checks the words next to the caret. A paste, or
+    /// any larger change, checks the whole buffer.
+    pub fn after_edit(&self) {
+        let n = self.editor.buffer.char_count();
+        let prev = self.chars.replace(n);
+        if (n - prev).abs() > 1 {
+            self.left.set(None);
+            self.rescan();
+            return;
+        }
+        self.refresh_cursor();
+    }
+
     pub fn refresh_cursor(&self) {
         let policy = *self.policy.borrow();
         if !spell::shown(&policy) {
             return;
         }
-        let Some((origin, text, cursor)) = self.window_around_cursor() else {
+        let buffer = &self.editor.buffer;
+        let cursor = buffer.iter_at_mark(&buffer.get_insert()).offset();
+        if let Some((start, end)) = self.left.get()
+            && (cursor < start || cursor > end)
+        {
+            self.paint_slice(&buffer.iter_at_offset(start), &buffer.iter_at_offset(end));
+        }
+        let Some((origin, text, at)) = self.window_around_cursor() else {
             return;
         };
         let mut known = |w: &str| self.known(w);
-        let touches = spell::keystroke_marks(&text, cursor, &policy, &mut known);
+        let touches = spell::keystroke_marks(&text, at, &policy, &mut known);
         self.paint_touches(&origin, &text, &touches);
+        self.remember_cursor_word(&origin, &text, at);
     }
 
     pub fn rescan(&self) {
         self.stop();
+        self.left.set(None);
+        self.chars.set(self.editor.buffer.char_count());
         if !spell::shown(&self.policy.borrow()) {
             self.clear_all();
             return;
@@ -167,35 +186,42 @@ impl Session {
 
     fn wire_click(self: &Rc<Self>) {
         let click = gtk::GestureClick::builder().button(3).build();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
-        click.connect_pressed(move |gesture, _, x, y| {
+        click.connect_pressed(move |_, _, x, y| {
             let Some(session) = weak.upgrade() else {
                 return;
             };
-            if session.popup(x, y) {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-            }
+            session.prepare_click(x, y);
         });
         self.editor.view.add_controller(click);
     }
 
-    fn popup(&self, x: f64, y: f64) -> bool {
-        let mut policy = *self.policy.borrow();
-        policy.hide_word_at_cursor = false;
-        if !spell::shown(&policy) || !self.ensure_menu() {
-            return false;
-        }
+    fn prepare_click(&self, x: f64, y: f64) {
         let (bx, by) = self.editor.view.window_to_buffer_coords(
             gtk::TextWindowType::Widget,
             widget_coord(x),
             widget_coord(y),
         );
         let Some(click) = self.editor.view.iter_at_location(bx, by) else {
-            return false;
+            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
+            return;
         };
-        let mut origin = click;
+        self.prepare_at(&click);
+    }
+
+    /// Suggestions, Add, and Ignore are items on the text view's own menu.
+    /// A second popover would sit under that menu.
+    fn prepare_at(&self, click: &gtk::TextIter) -> bool {
+        let mut policy = *self.policy.borrow();
+        policy.hide_word_at_cursor = false;
+        if !spell::shown(&policy) {
+            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
+            return false;
+        }
+        let mut origin = *click;
         origin.backward_chars(4_200);
-        let mut end = click;
+        let mut end = *click;
         end.forward_chars(80);
         let text = self.editor.buffer.text(&origin, &end, false).to_string();
         let at = byte_between(&text, click.offset() - origin.offset());
@@ -208,6 +234,7 @@ impl Session {
         let mut known = |w: &str| self.known(w);
         let touches = spell::keystroke_marks(&text, at, &policy, &mut known);
         let Some(touch) = touches.into_iter().find(|t| t.start < at && at <= t.end) else {
+            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
             return false;
         };
         let Some(bad) = touch
@@ -216,6 +243,7 @@ impl Session {
             .find(|r| r.start < at && at <= r.end)
             .or(touch.bad.first())
         else {
+            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
             return false;
         };
         let word = text[bad.clone()].to_string();
@@ -226,105 +254,66 @@ impl Session {
             .as_ref()
             .map(|b| b.suggest(&form))
             .unwrap_or_default();
-        self.word_start.set(
-            origin
-                .offset()
-                .saturating_add(chars_before(&text, bad.start)),
-        );
-        self.word_end
-            .set(origin.offset().saturating_add(chars_before(&text, bad.end)));
-        self.fill_menu(&word, &suggestions);
-        self.popover.set_pointing_to(Some(&gdk::Rectangle::new(
-            widget_coord(x),
-            widget_coord(y),
-            1,
-            1,
-        )));
-        self.popover.popup();
+        let start = origin
+            .offset()
+            .saturating_add(chars_before(&text, bad.start));
+        let end = origin.offset().saturating_add(chars_before(&text, bad.end));
+        self.install_menu(&word, &suggestions, start, end);
         true
     }
 
-    fn fill_menu(&self, word: &str, suggestions: &[String]) {
-        while let Some(child) = self.rows.first_child() {
-            self.rows.remove(&child);
+    fn install_menu(&self, word: &str, suggestions: &[String], start: i32, end: i32) {
+        let menu = gtk::gio::Menu::new();
+        let group = gtk::gio::SimpleActionGroup::new();
+        for (i, suggestion) in suggestions.iter().take(8).enumerate() {
+            let name = format!("s{i}");
+            menu.append(Some(suggestion), Some(&format!("spell.{name}")));
+            let action = gtk::gio::SimpleAction::new(&name, None);
+            let replacement = suggestion.clone();
+            let weak_editor = Rc::downgrade(&self.editor);
+            action.connect_activate(move |_, _| {
+                if let Some(editor) = weak_editor.upgrade() {
+                    replace_word(&editor, start, end, &replacement);
+                }
+            });
+            group.add_action(&action);
         }
-        if suggestions.is_empty() {
-            self.rows.append(
-                &gtk::Label::builder()
-                    .label("No suggestions")
-                    .css_classes(["dim-label"])
-                    .margin_top(6)
-                    .margin_bottom(6)
-                    .margin_start(12)
-                    .margin_end(12)
-                    .build(),
-            );
-        } else {
-            for suggestion in suggestions.iter().take(8) {
-                let button = gtk::Button::builder()
-                    .label(suggestion)
-                    .has_frame(false)
-                    .build();
-                let replacement = suggestion.clone();
-                let weak_editor = Rc::downgrade(&self.editor);
-                let start = self.word_start.get();
-                let end = self.word_end.get();
-                let pop = self.popover.clone();
-                button.connect_clicked(move |_| {
-                    if let Some(editor) = weak_editor.upgrade() {
-                        replace_word(&editor, start, end, &replacement);
-                    }
-                    pop.popdown();
-                });
-                self.rows.append(&button);
-            }
-        }
-        self.rows
-            .append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let add = gtk::Button::builder()
-            .label("Add to Dictionary")
-            .has_frame(false)
-            .build();
-        let ignore = gtk::Button::builder()
-            .label("Ignore")
-            .has_frame(false)
-            .build();
+        menu.append(Some("Add to Dictionary"), Some("spell.add"));
+        menu.append(Some("Ignore"), Some("spell.ignore"));
+        let add = gtk::gio::SimpleAction::new("add", None);
+        let ignore = gtk::gio::SimpleAction::new("ignore", None);
         let weak = self.me.borrow().clone();
         let added = word.to_string();
-        let pop = self.popover.clone();
-        add.connect_clicked(move |_| {
+        add.connect_activate(move |_, _| {
             if let Some(session) = weak.upgrade() {
                 session.remember(&added, true);
                 session.rescan();
             }
-            pop.popdown();
         });
         let weak = self.me.borrow().clone();
         let ignored = word.to_string();
-        let pop = self.popover.clone();
-        ignore.connect_clicked(move |_| {
+        ignore.connect_activate(move |_, _| {
             if let Some(session) = weak.upgrade() {
                 session.remember(&ignored, false);
                 session.rescan();
             }
-            pop.popdown();
         });
-        self.rows.append(&add);
-        self.rows.append(&ignore);
+        group.add_action(&add);
+        group.add_action(&ignore);
+        self.editor.view.insert_action_group("spell", Some(&group));
+        self.editor.view.set_extra_menu(Some(&menu));
     }
 
-    /// A popover parented before the text view has a window makes GTK 4.14
-    /// report that the popover is not a child, and layout then repeats that
-    /// report. The menu is attached on the first click that can show it.
-    fn ensure_menu(&self) -> bool {
-        if self.popover.parent().is_some() {
-            return true;
-        }
-        if self.editor.view.root().is_none() {
-            return false;
-        }
-        self.popover.set_parent(&self.editor.view);
-        true
+    fn remember_cursor_word(&self, origin: &gtk::TextIter, text: &str, cursor: usize) {
+        let Some((start, end)) = spell::raw_word(text, cursor) else {
+            self.left.set(None);
+            return;
+        };
+        let base = origin.offset();
+        self.left.set(Some((
+            base.saturating_add(chars_before(text, start)),
+            base.saturating_add(chars_before(text, end)),
+        )));
     }
 
     fn known(&self, word: &str) -> bool {
@@ -490,6 +479,9 @@ impl Session {
             let b = iter_at(start, &text, range.end);
             self.editor.buffer.apply_tag(&tag, &a, &b);
         }
+        if let Some(at) = cursor {
+            self.remember_cursor_word(start, &text, at);
+        }
     }
 
     fn cursor_byte(&self, start: &gtk::TextIter, end: &gtk::TextIter, text: &str) -> Option<usize> {
@@ -508,7 +500,7 @@ impl Session {
     }
 
     fn remember(&self, word: &str, dictionary: bool) {
-        let key = spell::dictionary_form(word).to_lowercase();
+        let key = spell::dictionary_key(word);
         if key.is_empty() {
             return;
         }
@@ -767,5 +759,117 @@ pub(crate) mod tests {
         assert!((rgba.red() - 17.0 / 255.0).abs() < 0.004);
         assert!((rgba.green() - 34.0 / 255.0).abs() < 0.004);
         assert!((rgba.blue() - 51.0 / 255.0).abs() < 0.004);
+    }
+
+    pub(crate) fn leaving_the_word_by_a_jump_marks_it() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        if !session.has_dictionary() {
+            eprintln!("no spelling dictionary; jump check skipped");
+            return;
+        }
+        editor.buffer.set_text("helo storm and more words");
+        editor.buffer.place_cursor(&editor.buffer.start_iter());
+        session.rescan();
+        drain(&session);
+        assert_eq!(marked_words(&editor.buffer), Vec::<String>::new());
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
+        session.refresh_cursor();
+        assert_eq!(marked_words(&editor.buffer), vec!["helo".to_string()]);
+    }
+
+    pub(crate) fn a_paste_marks_every_new_word() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        if !session.has_dictionary() {
+            eprintln!("no spelling dictionary; paste check skipped");
+            return;
+        }
+        editor.buffer.set_text("storm");
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
+        session.rescan();
+        drain(&session);
+        let mut end = editor.buffer.end_iter();
+        editor.buffer.insert(&mut end, " the helo wrld end");
+        session.after_edit();
+        drain(&session);
+        let marks = marked_words(&editor.buffer);
+        assert!(
+            marks.iter().any(|word| word == "helo"),
+            "pasted helo was not marked: {marks:?}"
+        );
+        assert!(
+            marks.iter().any(|word| word == "wrld"),
+            "pasted wrld was not marked: {marks:?}"
+        );
+    }
+
+    pub(crate) fn suggestions_share_the_text_view_menu() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        if !session.has_dictionary() {
+            eprintln!("no spelling dictionary; menu check skipped");
+            return;
+        }
+        editor.buffer.set_text("helo storm");
+        let inside = editor.buffer.iter_at_offset(2);
+        assert!(session.prepare_at(&inside));
+        let model = editor
+            .view
+            .extra_menu()
+            .expect("suggestions are on the text view menu");
+        let menu = model
+            .downcast::<gtk::gio::Menu>()
+            .expect("extra menu is a menu");
+        let mut labels = Vec::new();
+        for i in 0..menu.n_items() {
+            if let Some(label) = menu
+                .item_attribute_value(i, gtk::gio::MENU_ATTRIBUTE_LABEL, None)
+                .and_then(|value| value.get::<String>())
+            {
+                labels.push(label);
+            }
+        }
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case("hello")),
+            "suggestions: {labels:?}"
+        );
+        assert!(labels.iter().any(|label| label == "Add to Dictionary"));
+        assert!(labels.iter().any(|label| label == "Ignore"));
+    }
+
+    pub(crate) fn the_same_spelling_settings_do_not_restart_the_scan() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        editor.buffer.set_text("helo storm");
+        session.rescan();
+        assert_eq!(session.line.get(), 0);
+        session.pump();
+        assert_eq!(session.line.get(), 1);
+        session.apply_settings(&Settings::default(), false);
+        assert_eq!(session.line.get(), 1);
+    }
+
+    pub(crate) fn activating_spellcheck_flips_its_state() {
+        let action = gtk::gio::SimpleAction::new_stateful("spellcheck", None, &true.to_variant());
+        action.connect_change_state(|action, state| {
+            if let Some(state) = state {
+                action.set_state(state);
+            }
+        });
+        action.connect_activate(|action, _| {
+            let on = action
+                .state()
+                .and_then(|state| state.get::<bool>())
+                .unwrap_or(false);
+            action.change_state(&(!on).to_variant());
+        });
+        action.activate(None);
+        assert_eq!(
+            action.state().and_then(|state| state.get::<bool>()),
+            Some(false)
+        );
     }
 }

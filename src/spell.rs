@@ -77,7 +77,12 @@ fn is_combining_mark(c: char) -> bool {
 }
 
 pub fn is_word_char(c: char) -> bool {
-    c.is_alphabetic() || is_apostrophe(c) || is_hyphen(c) || c == '\u{00AD}' || is_combining_mark(c)
+    c.is_alphabetic()
+        || c.is_ascii_digit()
+        || is_apostrophe(c)
+        || is_hyphen(c)
+        || c == '\u{00AD}'
+        || is_combining_mark(c)
 }
 
 fn floor(text: &str, index: usize) -> usize {
@@ -137,8 +142,21 @@ fn token_starting(text: &str, cursor: usize) -> Option<(usize, usize)> {
     token_touching(text, cursor + c.len_utf8())
 }
 
-/// The word that ends at `cursor` or contains it. `cursor` is a byte offset.
-fn token_touching(text: &str, cursor: usize) -> Option<(usize, usize)> {
+/// The word that ends at `cursor` or contains it, including a trailing
+/// apostrophe the author is still typing. `cursor` is a byte offset.
+pub fn raw_word(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let cursor = floor(text, cursor);
+    if let Some(span) = raw_ending(text, cursor) {
+        return Some(span);
+    }
+    let c = text[cursor..].chars().next()?;
+    if !is_word_char(c) {
+        return None;
+    }
+    raw_ending(text, cursor + c.len_utf8())
+}
+
+fn raw_ending(text: &str, cursor: usize) -> Option<(usize, usize)> {
     let cursor = floor(text, cursor);
     let (mut start, _) = char_before(text, cursor).filter(|(_, c)| is_word_char(*c))?;
     let mut chars = 1usize;
@@ -169,6 +187,12 @@ fn token_touching(text: &str, cursor: usize) -> Option<(usize, usize)> {
     if chars > MAX_WORD {
         return None;
     }
+    Some((start, end))
+}
+
+/// The word that ends at `cursor` or contains it, with edge punctuation removed.
+fn token_touching(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let (start, end) = raw_ending(text, cursor)?;
     trim_token(text, start, end)
 }
 
@@ -191,6 +215,16 @@ fn token_before(text: &str, before: usize) -> Option<(usize, usize)> {
 /// The form handed to a dictionary: straight apostrophes, soft hyphens removed.
 pub fn dictionary_form(word: &str) -> String {
     lookup(word, 0, word.len())
+}
+
+/// The key stored for Add to Dictionary. A possessive stores the bare word,
+/// because a later `Zorvath` has to match the `Zorvath's` the author added.
+pub fn dictionary_key(word: &str) -> String {
+    let lower = dictionary_form(word).to_lowercase();
+    match lower.strip_suffix("'s") {
+        Some(stem) if stem.chars().any(char::is_alphabetic) => stem.to_string(),
+        _ => lower,
+    }
 }
 
 fn lookup(text: &str, start: usize, end: usize) -> String {
@@ -344,7 +378,7 @@ pub fn bad_ranges(
         if a >= end {
             break;
         }
-        let hide = policy.hide_word_at_cursor && is_current(a, b, cursor);
+        let hide = policy.hide_word_at_cursor && is_current(raw, j, cursor);
         if hide {
             continue;
         }
@@ -368,7 +402,8 @@ pub fn keystroke_marks(
         return Vec::new();
     }
     let cursor = floor(text, cursor);
-    let current = token_touching(text, cursor);
+    let current_raw = raw_word(text, cursor);
+    let current = current_raw.and_then(|(start, end)| trim_token(text, start, end));
     let previous = match current {
         Some((start, _)) => token_before(text, start),
         None => token_before(text, cursor),
@@ -384,7 +419,10 @@ pub fn keystroke_marks(
     }
     let mut out = Vec::new();
     for (start, end) in spans {
-        let hide = policy.hide_word_at_cursor && is_current(start, end, Some(cursor));
+        let hide = policy.hide_word_at_cursor
+            && current_raw.is_some_and(|(raw_start, raw_end)| {
+                is_current(raw_start, raw_end, Some(cursor)) && start >= raw_start && end <= raw_end
+            });
         let bad = if hide {
             Vec::new()
         } else {
@@ -506,16 +544,33 @@ pub fn tag_from_locale(raw: &str) -> String {
 }
 
 /// Empty means the process locale (`LC_ALL`, then `LC_MESSAGES`, then `LANG`).
-pub fn language_tag(setting: &str) -> String {
-    let raw = setting.trim();
-    if !raw.is_empty() {
+fn nonempty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// `setting` wins. Otherwise the first non-empty locale string, in the
+/// order `LC_ALL`, `LC_MESSAGES`, `LANG`. An empty value is unset.
+pub fn language_from_sources(setting: &str, locales: &[&str]) -> String {
+    if let Some(raw) = nonempty(setting) {
         return tag_from_locale(raw);
     }
-    let raw = std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LC_MESSAGES"))
-        .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_default();
-    tag_from_locale(&raw)
+    for value in locales {
+        if let Some(raw) = nonempty(value) {
+            return tag_from_locale(raw);
+        }
+    }
+    tag_from_locale("")
+}
+
+pub fn language_tag(setting: &str) -> String {
+    let locales = [
+        std::env::var("LC_ALL").unwrap_or_default(),
+        std::env::var("LC_MESSAGES").unwrap_or_default(),
+        std::env::var("LANG").unwrap_or_default(),
+    ];
+    let borrowed: Vec<&str> = locales.iter().map(String::as_str).collect();
+    language_from_sources(setting, &borrowed)
 }
 
 /// Tags to try, most specific first, with English as the last resort.
@@ -799,5 +854,48 @@ mod tests {
                 "en".to_string()
             ]
         );
+        assert_eq!(language_from_sources("", &["", "de_DE.UTF-8"]), "de_DE");
+        assert_eq!(language_from_sources("en-GB", &[""]), "en_GB");
+    }
+
+    #[test]
+    fn an_ordinal_is_looked_up_whole() {
+        let policy = Policy {
+            hide_word_at_cursor: false,
+            ..Policy::default()
+        };
+        let mut known = |w: &str| {
+            matches!(
+                w.to_lowercase().as_str(),
+                "on" | "the" | "and" | "of" | "may" | "4th" | "22nd" | "3rd" | "21st"
+            )
+        };
+        let text = "On the 4th and 22nd of May, the 3rd and 21st.";
+        let bad: Vec<&str> = bad_ranges(text, 0, text.len(), None, &policy, &mut known)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    #[test]
+    fn a_trailing_apostrophe_is_still_the_word_being_typed() {
+        let hide = Policy::default();
+        assert_eq!(marked("isn'", Some(4), &hide), Vec::<String>::new());
+        assert_eq!(marked("isn' well", Some(5), &hide), vec!["isn"]);
+    }
+
+    #[test]
+    fn a_possessive_added_to_the_dictionary_stores_the_bare_word() {
+        assert_eq!(dictionary_key("Zorvath's"), "zorvath");
+        assert_eq!(dictionary_key("Zorvath\u{2019}s"), "zorvath");
+        assert_eq!(dictionary_key("Zorvath"), "zorvath");
+        let policy = Policy {
+            hide_word_at_cursor: false,
+            ..Policy::default()
+        };
+        let mut known = |w: &str| w.eq_ignore_ascii_case("zorvath");
+        assert!(bad_ranges("Zorvath", 0, 7, None, &policy, &mut known).is_empty());
+        assert!(bad_ranges("Zorvath's", 0, 9, None, &policy, &mut known).is_empty());
     }
 }

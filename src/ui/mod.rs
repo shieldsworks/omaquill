@@ -620,7 +620,7 @@ impl Win {
                 w.dirty_text.set(true);
                 w.update_doc_words();
                 w.schedule_save();
-                w.spell.refresh_cursor();
+                w.spell.after_edit();
             }
         });
         let weak = Rc::downgrade(self);
@@ -808,6 +808,13 @@ impl Win {
                 if on && !win.spell.has_dictionary() {
                     win.toast("Spelling needs the enchant library and a dictionary");
                 }
+            });
+            spellcheck.connect_activate(|action, _| {
+                let on = action
+                    .state()
+                    .and_then(|state| state.get::<bool>())
+                    .unwrap_or(false);
+                action.change_state(&(!on).to_variant());
             });
         }
         self.window.add_action(&spellcheck);
@@ -1617,4 +1624,9 @@ fn gtk_checks() {
     spell::tests::a_long_line_does_not_mark_the_tail_of_an_overlong_token();
     spell::tests::undo_drops_the_mark_when_the_word_is_whole_again();
     spell::tests::the_squiggle_uses_the_theme_red();
+    spell::tests::leaving_the_word_by_a_jump_marks_it();
+    spell::tests::a_paste_marks_every_new_word();
+    spell::tests::suggestions_share_the_text_view_menu();
+    spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
+    spell::tests::activating_spellcheck_flips_its_state();
 }
