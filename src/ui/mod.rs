@@ -1613,4 +1613,8 @@ fn gtk_checks() {
     editor::tests::empty_paragraphs_keep_their_style_and_lines_align_alone();
     editor::tests::a_spelling_mark_is_not_saved();
     spell::tests::keystroke_on_a_long_buffer();
+    spell::tests::the_caret_hides_the_word_it_is_in();
+    spell::tests::a_long_line_does_not_mark_the_tail_of_an_overlong_token();
+    spell::tests::undo_drops_the_mark_when_the_word_is_whole_again();
+    spell::tests::the_squiggle_uses_the_theme_red();
 }

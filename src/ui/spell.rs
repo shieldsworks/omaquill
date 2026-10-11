@@ -86,6 +86,7 @@ impl Session {
         });
         *session.me.borrow_mut() = Rc::downgrade(&session);
         session.wire_click();
+        session.wire_history();
         session
     }
 
@@ -147,6 +148,21 @@ impl Session {
         self.line.set(0);
         self.index.set(0);
         self.arm();
+    }
+
+    fn wire_history(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.editor.buffer.connect_undo(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.rescan();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.editor.buffer.connect_redo(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.rescan();
+            }
+        });
     }
 
     fn wire_click(self: &Rc<Self>) {
@@ -432,20 +448,23 @@ impl Session {
             self.index.set(0);
             return glib::ControlFlow::Continue;
         }
-        let mut start = line_start;
-        start.forward_chars(index);
-        let mut end = start;
-        let step = (chars - index).min(1_500);
-        end.forward_chars(step);
-        let mut extra = 0;
-        while extra < 80 && end < line_end && spell::is_word_char(end.char()) {
-            if !end.forward_char() {
-                break;
-            }
-            extra += 1;
+        let text = buffer.text(&line_start, &line_end, false).to_string();
+        let Some(scan) = spell::next_scan(&text, byte_between(&text, index), 1_500) else {
+            self.line.set(line + 1);
+            self.index.set(0);
+            return glib::ControlFlow::Continue;
+        };
+        if scan.end > scan.start {
+            let start = iter_at(&line_start, &text, scan.start);
+            let end = iter_at(&line_start, &text, scan.end);
+            self.paint_slice(&start, &end);
         }
-        self.paint_slice(&start, &end);
-        let next = end.offset() - line_start.offset();
+        if scan.resume > scan.end {
+            let start = iter_at(&line_start, &text, scan.end);
+            let end = iter_at(&line_start, &text, scan.resume);
+            buffer.remove_tag(&self.tag(), &start, &end);
+        }
+        let next = chars_before(&text, scan.resume);
         if next >= chars {
             self.line.set(line + 1);
             self.index.set(0);
@@ -600,5 +619,153 @@ pub(crate) mod tests {
             "median keystroke {:?} on a 100k-word buffer",
             times[10]
         );
+    }
+
+    fn marked_words(buffer: &gtk::TextBuffer) -> Vec<String> {
+        let Some(tag) = buffer.tag_table().lookup(TAG) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut iter = buffer.start_iter();
+        loop {
+            if !iter.starts_tag(Some(&tag)) && !iter.forward_to_tag_toggle(Some(&tag)) {
+                break;
+            }
+            if !iter.starts_tag(Some(&tag)) {
+                continue;
+            }
+            let start = iter;
+            if !iter.forward_to_tag_toggle(Some(&tag)) {
+                break;
+            }
+            out.push(buffer.text(&start, &iter, false).to_string());
+        }
+        out
+    }
+
+    fn drain(session: &Session) {
+        while let glib::ControlFlow::Continue = session.pump() {}
+    }
+
+    /// The caret at the first letter is still in the word, so the mark waits.
+    pub(crate) fn the_caret_hides_the_word_it_is_in() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        if !session.has_dictionary() {
+            eprintln!("no spelling dictionary; caret check skipped");
+            return;
+        }
+        editor.buffer.set_text("helo storm");
+        editor.buffer.place_cursor(&editor.buffer.start_iter());
+        session.rescan();
+        drain(&session);
+        assert_eq!(
+            marked_words(&editor.buffer),
+            Vec::<String>::new(),
+            "the word under the caret stays clear"
+        );
+        editor.buffer.place_cursor(&editor.buffer.iter_at_offset(5));
+        session.refresh_cursor();
+        assert_eq!(marked_words(&editor.buffer), vec!["helo".to_string()]);
+    }
+
+    /// A line the idle walk splits must not spellcheck the tail of a token
+    /// that is longer than the lookup limit.
+    pub(crate) fn a_long_line_does_not_mark_the_tail_of_an_overlong_token() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        if !session.has_dictionary() {
+            eprintln!("no spelling dictionary; long-line check skipped");
+            return;
+        }
+        let mut text = "helo ".repeat(280);
+        text.push_str(&"q".repeat(200));
+        text.push_str(&" helo".repeat(200));
+        editor.buffer.set_text(&text);
+        editor.buffer.place_cursor(&editor.buffer.start_iter());
+        session.rescan();
+        drain(&session);
+        let marks = marked_words(&editor.buffer);
+        assert!(
+            marks.iter().all(|word| !word.contains('q')),
+            "overlong token was marked: {marks:?}"
+        );
+        assert!(
+            marks.iter().any(|word| word == "helo"),
+            "a real misspelling on the long line was missed"
+        );
+    }
+
+    /// Undo puts the previous letters back. The mark has to match those
+    /// letters, because a tag applied after the edit is not an undo entry.
+    pub(crate) fn undo_drops_the_mark_when_the_word_is_whole_again() {
+        let editor = Editor::new(true);
+        let session = Session::new(
+            &editor,
+            &Settings {
+                spell_hide_current: false,
+                ..Settings::default()
+            },
+        );
+        if !session.has_dictionary() {
+            eprintln!("no spelling dictionary; undo check skipped");
+            return;
+        }
+        let buffer = &editor.buffer;
+        buffer.set_text("hello storm");
+        buffer.place_cursor(&buffer.iter_at_offset(3));
+        buffer.begin_user_action();
+        let mut start = buffer.iter_at_offset(2);
+        let mut end = buffer.iter_at_offset(3);
+        buffer.delete(&mut start, &mut end);
+        buffer.end_user_action();
+        session.rescan();
+        drain(&session);
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), false),
+            "helo storm"
+        );
+        assert_eq!(marked_words(buffer), vec!["helo".to_string()]);
+        buffer.undo();
+        drain(&session);
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), false),
+            "hello storm"
+        );
+        assert_eq!(
+            marked_words(buffer),
+            Vec::<String>::new(),
+            "undo of the deleted letter clears the squiggle"
+        );
+        buffer.redo();
+        drain(&session);
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), false),
+            "helo storm"
+        );
+        assert_eq!(marked_words(buffer), vec!["helo".to_string()]);
+    }
+
+    pub(crate) fn the_squiggle_uses_the_theme_red() {
+        set_squiggle_color(Some("#c45c26"));
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        editor.buffer.set_text("helo");
+        session.rescan();
+        drain(&session);
+        let tag = editor
+            .buffer
+            .tag_table()
+            .lookup(TAG)
+            .expect("rescan creates the spell tag");
+        let rgba = tag.underline_rgba().expect("theme red is on the tag");
+        assert!((rgba.red() - 196.0 / 255.0).abs() < 0.004);
+        assert!((rgba.green() - 92.0 / 255.0).abs() < 0.004);
+        assert!((rgba.blue() - 38.0 / 255.0).abs() < 0.004);
+        set_squiggle_color(Some("#112233"));
+        let rgba = tag.underline_rgba().expect("a later theme red replaces it");
+        assert!((rgba.red() - 17.0 / 255.0).abs() < 0.004);
+        assert!((rgba.green() - 34.0 / 255.0).abs() < 0.004);
+        assert!((rgba.blue() - 51.0 / 255.0).abs() < 0.004);
     }
 }

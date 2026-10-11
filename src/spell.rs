@@ -55,8 +55,29 @@ fn is_hyphen(c: char) -> bool {
     matches!(c, '-' | '\u{2010}' | '\u{2011}')
 }
 
+fn is_combining_mark(c: char) -> bool {
+    // `char::is_alphabetic` is false for nonspacing marks, so a decomposed
+    // letter would otherwise split around the accent.
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{0591}'..='\u{05BD}'
+            | '\u{05BF}'
+            | '\u{05C1}'..='\u{05C2}'
+            | '\u{05C4}'..='\u{05C5}'
+            | '\u{05C7}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20F0}'
+            | '\u{3099}'..='\u{309A}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
 pub fn is_word_char(c: char) -> bool {
-    c.is_alphabetic() || is_apostrophe(c) || is_hyphen(c) || c == '\u{00AD}'
+    c.is_alphabetic() || is_apostrophe(c) || is_hyphen(c) || c == '\u{00AD}' || is_combining_mark(c)
 }
 
 fn floor(text: &str, index: usize) -> usize {
@@ -79,24 +100,41 @@ fn char_before(text: &str, index: usize) -> Option<(usize, char)> {
     text[i..index].chars().next().map(|c| (i, c))
 }
 
+fn is_edge(c: char) -> bool {
+    is_apostrophe(c) || is_hyphen(c) || c == '\u{00AD}'
+}
+
 fn trim_token(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
     let mut s = start;
     let mut e = end.min(text.len());
     while s < e {
         let c = text[s..e].chars().next()?;
-        if c.is_alphabetic() {
+        if !is_edge(c) {
             break;
         }
         s += c.len_utf8();
     }
     while s < e {
         let c = text[s..e].chars().next_back()?;
-        if c.is_alphabetic() {
+        if !is_edge(c) {
             break;
         }
         e -= c.len_utf8();
     }
-    (s < e).then_some((s, e))
+    if s >= e || !text[s..e].chars().any(char::is_alphabetic) {
+        return None;
+    }
+    Some((s, e))
+}
+
+/// The word that begins at `cursor`, when the caret is on its first letter.
+fn token_starting(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let cursor = floor(text, cursor);
+    let c = text[cursor..].chars().next()?;
+    if !is_word_char(c) {
+        return None;
+    }
+    token_touching(text, cursor + c.len_utf8())
 }
 
 /// The word that ends at `cursor` or contains it. `cursor` is a byte offset.
@@ -240,7 +278,8 @@ fn is_current(start: usize, end: usize, cursor: Option<usize>) -> bool {
     let Some(cursor) = cursor else {
         return false;
     };
-    start < cursor && cursor <= end
+    // The caret sits on the boundary before a letter and still belongs to that word.
+    start <= cursor && cursor <= end
 }
 
 /// Misspelled slices in `start..end` (byte offsets). The walk starts at
@@ -286,6 +325,15 @@ pub fn bad_ranges(
             chars += 1;
         }
         if chars > MAX_WORD {
+            while j < text.len() {
+                let Some(ch) = text[j..].chars().next() else {
+                    break;
+                };
+                if !is_word_char(ch) {
+                    break;
+                }
+                j += ch.len_utf8();
+            }
             i = j;
             continue;
         }
@@ -307,8 +355,9 @@ pub fn bad_ranges(
 
 /// The word at the cursor and the word just before it.
 ///
-/// This walks back from `cursor` only. A document of any length costs the
-/// same as those two words.
+/// This walks back from `cursor` only, and looks at the word that begins
+/// there when the caret is on its first letter. A document of any length
+/// costs the same as those words.
 pub fn keystroke_marks(
     text: &str,
     cursor: usize,
@@ -324,8 +373,17 @@ pub fn keystroke_marks(
         Some((start, _)) => token_before(text, start),
         None => token_before(text, cursor),
     };
+    let mut spans = Vec::new();
+    for span in [previous, current, token_starting(text, cursor)]
+        .into_iter()
+        .flatten()
+    {
+        if !spans.contains(&span) {
+            spans.push(span);
+        }
+    }
     let mut out = Vec::new();
-    for (start, end) in [previous, current].into_iter().flatten() {
+    for (start, end) in spans {
         let hide = policy.hide_word_at_cursor && is_current(start, end, Some(cursor));
         let bad = if hide {
             Vec::new()
@@ -335,6 +393,107 @@ pub fn keystroke_marks(
         out.push(Touch { start, end, bad });
     }
     out
+}
+
+/// One idle pass over a line. `start..end` holds only whole tokens.
+/// `resume` is the next byte index, past an overlong token when one was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scan {
+    pub start: usize,
+    pub end: usize,
+    pub resume: usize,
+}
+
+/// `(start, end, chars)` of the token that contains `at`, if `at` is inside one.
+fn token_extent(text: &str, at: usize) -> Option<(usize, usize, usize)> {
+    let at = floor(text, at);
+    let inside = char_before(text, at).is_some_and(|(_, c)| is_word_char(c))
+        || text[at..].chars().next().is_some_and(is_word_char);
+    if !inside {
+        return None;
+    }
+    let mut start = at;
+    while let Some((i, _)) = char_before(text, start).filter(|(_, c)| is_word_char(*c)) {
+        start = i;
+    }
+    let mut chars = 0usize;
+    let mut end = start;
+    while end < text.len() {
+        let Some(ch) = text[end..].chars().next() else {
+            break;
+        };
+        if !is_word_char(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+        chars += 1;
+    }
+    (chars > 0).then_some((start, end, chars))
+}
+
+/// The next piece of `text` to paint, starting at byte `index`.
+///
+/// A pass stops on a token boundary after about `budget` characters. A token
+/// longer than the lookup limit is not painted, and `resume` lands after it.
+pub fn next_scan(text: &str, index: usize, budget: usize) -> Option<Scan> {
+    let origin = floor(text, index);
+    if origin >= text.len() || budget == 0 {
+        return None;
+    }
+    let mut index = origin;
+    if let Some((start, end, chars)) = token_extent(text, origin)
+        && start < origin
+        && origin < end
+    {
+        if chars > MAX_WORD {
+            return Some(Scan {
+                start: origin,
+                end: origin,
+                resume: end,
+            });
+        }
+        index = start;
+    }
+    let start = index;
+    let mut end = index;
+    let mut counted = 0usize;
+    let mut i = index;
+    while i < text.len() && counted < budget {
+        let Some(c) = text[i..].chars().next() else {
+            break;
+        };
+        if !is_word_char(c) {
+            i += c.len_utf8();
+            end = i;
+            counted += 1;
+            continue;
+        }
+        let Some((token_start, token_end, chars)) = token_extent(text, i) else {
+            break;
+        };
+        if chars > MAX_WORD {
+            return Some(Scan {
+                start,
+                end,
+                resume: token_end,
+            });
+        }
+        if counted > 0 && counted + chars > budget {
+            return Some(Scan {
+                start,
+                end,
+                resume: token_start,
+            });
+        }
+        end = token_end;
+        counted += chars;
+        i = token_end;
+    }
+    let resume = i.max(end);
+    if resume <= origin {
+        return None;
+    }
+    Some(Scan { start, end, resume })
 }
 
 /// `en_US.UTF-8` and `en-GB` become the tag Enchant asks a provider for.
@@ -440,6 +599,88 @@ mod tests {
         let mut known = |w: &str| known_word(w) || w.eq_ignore_ascii_case("xyzzy");
         let bad = bad_ranges("the xyzzy", 0, 9, None, &policy, &mut known);
         assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn a_token_past_the_lookup_limit_is_not_marked() {
+        let policy = Policy {
+            hide_word_at_cursor: false,
+            ..Policy::default()
+        };
+        let word = "q".repeat(90);
+        assert_eq!(marked(&word, None, &policy), Vec::<String>::new());
+        let sentence = format!("the {word} well");
+        assert_eq!(marked(&sentence, None, &policy), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_decomposed_letter_stays_inside_the_word() {
+        let policy = Policy {
+            hide_word_at_cursor: false,
+            ..Policy::default()
+        };
+        assert_eq!(
+            marked("nai\u{0308}ve", None, &policy),
+            vec!["nai\u{0308}ve"]
+        );
+        assert_eq!(marked("cafe\u{0301}", None, &policy), vec!["cafe\u{0301}"]);
+        assert_eq!(
+            marked("\u{0643}\u{064E}\u{062A}\u{0628}", None, &policy),
+            vec!["\u{0643}\u{064E}\u{062A}\u{0628}"]
+        );
+    }
+
+    #[test]
+    fn the_word_at_the_caret_includes_the_position_before_its_first_letter() {
+        let hide = Policy::default();
+        assert_eq!(marked("wrld", Some(0), &hide), Vec::<String>::new());
+        assert_eq!(marked("the wrld", Some(4), &hide), Vec::<String>::new());
+        assert_eq!(marked("the wrld", Some(8), &hide), Vec::<String>::new());
+        assert_eq!(marked("the wrld", Some(3), &hide), vec!["wrld"]);
+        let touches = keystroke_marks("wrld", 0, &hide, &mut known_word);
+        assert_eq!(
+            touches,
+            vec![Touch {
+                start: 0,
+                end: 4,
+                bad: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_long_line_paints_whole_words_and_skips_an_overlong_token() {
+        let policy = Policy {
+            hide_word_at_cursor: false,
+            ..Policy::default()
+        };
+        let q = "q".repeat(200);
+        let text = format!("{}{q} {}", "helo ".repeat(280), "helo");
+        let mut marks = Vec::new();
+        let mut index = 0usize;
+        let mut steps = 0usize;
+        while let Some(scan) = next_scan(&text, index, 1_500) {
+            steps += 1;
+            assert!(steps < 20, "scan did not advance from {index}");
+            assert!(scan.resume > index, "{scan:?} from {index}");
+            assert!(scan.start <= scan.end && scan.end <= scan.resume);
+            if scan.end > scan.start {
+                let slice = &text[scan.start..scan.end];
+                assert!(!slice.contains(&q));
+                for range in bad_ranges(slice, 0, slice.len(), None, &policy, &mut known_word) {
+                    let word = slice[range].to_string();
+                    assert!(!word.contains('q'), "{word}");
+                    marks.push(word);
+                }
+            }
+            index = scan.resume;
+        }
+        assert_eq!(index, text.len());
+        assert_eq!(marks.iter().filter(|m| *m == "helo").count(), 281);
+
+        let mid = next_scan(&q, 10, 1_500).expect("a mid-token start still resumes");
+        assert_eq!(mid.end, mid.start);
+        assert_eq!(mid.resume, q.len());
     }
 
     #[test]
