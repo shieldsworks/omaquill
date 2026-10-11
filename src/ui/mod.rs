@@ -49,6 +49,8 @@ pub struct Win {
     dirty_notes: Cell<bool>,
     dirty_synopsis: Cell<bool>,
     save_source: RefCell<Option<glib::SourceId>>,
+    /// Set when a settings save found the file busy. The callback tries again.
+    settings_retry: RefCell<Option<glib::SourceId>>,
     folder_view: Cell<FolderView>,
     composing: Cell<bool>,
     /// Words in each text item, for the manuscript total.
@@ -555,6 +557,7 @@ impl Win {
             dirty_notes: Cell::new(false),
             dirty_synopsis: Cell::new(false),
             save_source: RefCell::new(None),
+            settings_retry: RefCell::new(None),
             folder_view: Cell::new(FolderView::Corkboard),
             composing: Cell::new(false),
             counts: RefCell::new(HashMap::new()),
@@ -734,6 +737,7 @@ impl Win {
             let Some(w) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            w.flush_settings();
             if let Err(e) = w.close_project() {
                 return w.confirm_close_after_error(&e);
             }
@@ -802,8 +806,8 @@ impl Win {
                 {
                     let mut settings = win.settings.borrow_mut();
                     settings.spellcheck = on;
-                    let _ = settings.save();
                 }
+                win.persist_settings();
                 win.spell.set_enabled(on);
                 if on && !win.spell.has_dictionary() {
                     win.toast("Spelling needs the enchant library and a dictionary");
@@ -1524,7 +1528,7 @@ impl Win {
 
     // ------------------------------------------------------------ look
 
-    fn zoom(&self, factor: f64) {
+    fn zoom(self: &Rc<Self>, factor: f64) {
         {
             let mut s = self.settings.borrow_mut();
             s.zoom = if factor == 0.0 {
@@ -1532,10 +1536,63 @@ impl Win {
             } else {
                 (s.zoom * factor).clamp(0.5, 3.0)
             };
-            let _ = s.save();
         }
+        self.persist_settings();
         self.apply_look();
         self.toast(&format!("Zoom {:.0}%", self.settings.borrow().zoom * 100.0));
+    }
+
+    /// Writes settings. A busy lock returns at once and a later callback
+    /// writes the values still held in memory.
+    fn persist_settings(self: &Rc<Self>) {
+        let saved = self.settings.borrow_mut().save();
+        match saved {
+            Ok(()) => {
+                if let Some(id) = self.settings_retry.borrow_mut().take() {
+                    id.remove();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.arm_settings_retry(),
+            Err(_) => {}
+        }
+    }
+
+    fn arm_settings_retry(self: &Rc<Self>) {
+        if self.settings_retry.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            win.settings_retry.borrow_mut().take();
+            win.persist_settings();
+        });
+        *self.settings_retry.borrow_mut() = Some(id);
+    }
+
+    /// If a settings save is still waiting on the lock, try until the other
+    /// writer finishes or a short wait is up. A stuck holder does not keep
+    /// the window open.
+    fn flush_settings(&self) {
+        let Some(id) = self.settings_retry.borrow_mut().take() else {
+            return;
+        };
+        id.remove();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            match self.settings.borrow_mut().save() {
+                Ok(()) => return,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     pub fn apply_look(&self) {

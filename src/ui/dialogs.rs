@@ -293,8 +293,8 @@ impl Win {
                     s.daily_target = target.value() as u32;
                     s.author = author.text().to_string();
                     s.backups = keep.value() as usize;
-                    let _ = s.save();
                 }
+                win.persist_settings();
                 win.apply_look();
                 win.update_totals();
             }
@@ -316,8 +316,8 @@ impl Win {
                     s.spell_in_compose = in_compose.is_active();
                     s.spell_hide_current = wait.is_active();
                     s.spell_language = language.text().trim().to_string();
-                    let _ = s.save();
                 }
+                win.persist_settings();
                 win.spell
                     .apply_settings(&win.settings.borrow(), win.composing.get());
                 if let Some(action) = win
@@ -464,7 +464,8 @@ impl Win {
                 let mut s = win.settings.borrow_mut();
                 if s.author != opts.author {
                     s.author = opts.author.clone();
-                    let _ = s.save();
+                    drop(s);
+                    win.persist_settings();
                 }
             }
             let name = format!(

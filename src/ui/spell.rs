@@ -692,13 +692,9 @@ pub(crate) mod tests {
     /// letters, because a tag applied after the edit is not an undo entry.
     pub(crate) fn undo_drops_the_mark_when_the_word_is_whole_again() {
         let editor = Editor::new(true);
-        let session = Session::new(
-            &editor,
-            &Settings {
-                spell_hide_current: false,
-                ..Settings::default()
-            },
-        );
+        let mut settings = Settings::default();
+        settings.spell_hide_current = false;
+        let session = Session::new(&editor, &settings);
         if !session.has_dictionary() {
             eprintln!("no spelling dictionary; undo check skipped");
             return;
