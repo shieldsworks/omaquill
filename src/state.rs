@@ -466,6 +466,30 @@ mod tests {
     }
 
     #[test]
+    fn saving_spelling_in_one_copy_keeps_zoom_from_the_other() {
+        let path = std::env::temp_dir().join(format!(
+            "omaquill-settings-{}-two-windows.conf",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut zoomed = Settings::load_from(&path);
+        let mut spelling = Settings::load_from(&path);
+        zoomed.zoom = 2.0;
+        zoomed.save_to(&path).unwrap();
+        spelling.spellcheck = false;
+        spelling.save_to(&path).unwrap();
+        let disk = Settings::load_from(&path);
+        assert_eq!(disk.zoom, 2.0);
+        assert!(!disk.spellcheck);
+        spelling.spellcheck = true;
+        spelling.save_to(&path).unwrap();
+        let disk = Settings::load_from(&path);
+        assert_eq!(disk.zoom, 2.0);
+        assert!(disk.spellcheck);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn an_ignore_list_is_words_outside_the_project() {
         let dir = std::env::temp_dir().join(format!("omaquill-words-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
