@@ -7,6 +7,7 @@ pub mod fonts;
 pub mod hyphen;
 pub mod pdf;
 pub mod project;
+pub mod replace;
 pub mod rtf;
 pub mod sha1;
 pub mod spell;

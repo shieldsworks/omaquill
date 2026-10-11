@@ -10,6 +10,7 @@ mod binder;
 mod board;
 mod dialogs;
 mod editor;
+mod find_replace;
 mod inspector;
 pub mod rich;
 mod spell;
@@ -46,6 +47,9 @@ pub struct Win {
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
     dirty_text: Cell<bool>,
+    /// The backup started when the project opened. Project replace joins it
+    /// first so two backups cannot share one `zip.part` name.
+    backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
     dirty_notes: Cell<bool>,
     dirty_synopsis: Cell<bool>,
     save_source: RefCell<Option<glib::SourceId>>,
@@ -213,6 +217,7 @@ fn set_accels(app: &adw::Application) {
         ("win.italic", &["<Ctrl>i"]),
         ("win.underline", &["<Ctrl>u"]),
         ("win.find", &["<Ctrl>f"]),
+        ("win.replace", &["<Ctrl>h"]),
         ("win.project-search", &["<Ctrl><Shift>f"]),
         ("win.view-text", &["<Ctrl>1"]),
         ("win.view-corkboard", &["<Ctrl>2"]),
@@ -554,6 +559,7 @@ impl Win {
             current: RefCell::new(None),
             editor_uuid: RefCell::new(None),
             dirty_text: Cell::new(false),
+            backup_job: RefCell::new(None),
             dirty_notes: Cell::new(false),
             dirty_synopsis: Cell::new(false),
             save_source: RefCell::new(None),
@@ -779,6 +785,7 @@ impl Win {
                 w.editor.show_find();
             }
         });
+        simple("replace", |w| find_replace::present(w));
         simple("project-search", |w| {
             w.outer.set_show_sidebar(true);
             w.binder.search.grab_focus();
@@ -977,6 +984,12 @@ impl Win {
         self.view_buttons.set_visible(false);
     }
 
+    fn join_backup(&self) {
+        if let Some(job) = self.backup_job.borrow_mut().take() {
+            let _ = job.join();
+        }
+    }
+
     pub fn open_project(self: &Rc<Self>, path: &Path) {
         let path = project_dir(path);
         // Open the new one first: if it isn't a project, the one on screen
@@ -996,14 +1009,16 @@ impl Win {
         // A backup before anything is touched, off the main thread.
         let keep = self.settings.borrow().backups;
         if keep > 0 {
+            self.join_backup();
             let path = project.path.clone();
-            std::thread::spawn(move || {
+            let job = std::thread::spawn(move || {
                 if let Err(e) =
                     omaquill::project::backup(&path, &omaquill::state::backup_dir(), keep)
                 {
                     eprintln!("omaquill: backup of {} failed: {e}", path.display());
                 }
             });
+            *self.backup_job.borrow_mut() = Some(job);
         }
         omaquill::state::add_recent(&project.path);
         self.title.set_title(&project.name());
@@ -1674,6 +1689,7 @@ fn gtk_checks() {
     adw::init().unwrap();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
+    editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();
     editor::tests::empty_paragraphs_keep_their_style_and_lines_align_alone();
     editor::tests::a_spelling_mark_is_not_saved();
     spell::tests::keystroke_on_a_long_buffer();
