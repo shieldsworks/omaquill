@@ -63,6 +63,53 @@ fn write_kv(path: &Path, header: &str, kv: &BTreeMap<String, String>) -> std::io
     crate::project::write_atomic(path, out.as_bytes())
 }
 
+const SETTINGS_HEADER: &str = "# omaquill settings; the Preferences window writes this file.\n";
+
+#[must_use = "the lock releases when this value is dropped"]
+struct SettingsLock {
+    _file: std::fs::File,
+}
+
+fn settings_lock(path: &Path) -> std::io::Result<SettingsLock> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = path
+        .file_name()
+        .expect("settings path includes a file name");
+    let lock_path = path.with_file_name(format!(".{}.lock", name.to_string_lossy()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.lock()?;
+    Ok(SettingsLock { _file: file })
+}
+
+fn overlay_changes(
+    disk: &BTreeMap<String, String>,
+    loaded: &BTreeMap<String, String>,
+    mine: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut out = disk.clone();
+    let mut next = loaded.clone();
+    for (key, value) in mine {
+        if loaded.get(key) != Some(value) {
+            out.insert(key.clone(), value.clone());
+            next.insert(key.clone(), value.clone());
+        }
+    }
+    (out, next)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Origin {
+    Fresh,
+    Loaded(BTreeMap<String, String>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// Text size in the editor, 1.0 = the document's own sizes.
@@ -83,6 +130,7 @@ pub struct Settings {
     pub spell_hide_current: bool,
     /// Empty follows the system locale. Otherwise an Enchant tag such as `en_GB`.
     pub spell_language: String,
+    origin: Origin,
 }
 
 impl Default for Settings {
@@ -97,6 +145,7 @@ impl Default for Settings {
             spell_in_compose: false,
             spell_hide_current: true,
             spell_language: String::new(),
+            origin: Origin::Fresh,
         }
     }
 }
@@ -114,7 +163,7 @@ impl Settings {
         Self::load_from(&config_dir().join("settings.conf"))
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
+    pub fn save(&mut self) -> std::io::Result<()> {
         self.save_to(&config_dir().join("settings.conf"))
     }
 
@@ -122,17 +171,23 @@ impl Settings {
         Settings::from_kv(&read_kv(path))
     }
 
-    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        write_kv(
-            path,
-            "# omaquill settings; the Preferences window writes this file.\n",
-            &self.to_kv(),
-        )
+    /// Re-reads a loaded file and writes keys that differ from that load.
+    /// A value built in memory writes every key.
+    pub fn save_to(&mut self, path: &Path) -> std::io::Result<()> {
+        let _lock = settings_lock(path)?;
+        let mine = self.to_kv();
+        let (kv, next) = match &self.origin {
+            Origin::Loaded(loaded) => overlay_changes(&read_kv(path), loaded, &mine),
+            Origin::Fresh => (mine.clone(), mine),
+        };
+        write_kv(path, SETTINGS_HEADER, &kv)?;
+        self.origin = Origin::Loaded(next);
+        Ok(())
     }
 
     fn from_kv(kv: &BTreeMap<String, String>) -> Settings {
         let d = Settings::default();
-        Settings {
+        let mut parsed = Settings {
             zoom: kv
                 .get("zoom")
                 .and_then(|v| v.parse().ok())
@@ -152,7 +207,10 @@ impl Settings {
             spell_in_compose: flag(kv, "spell_in_compose", d.spell_in_compose),
             spell_hide_current: flag(kv, "spell_hide_current", d.spell_hide_current),
             spell_language: kv.get("spell_language").cloned().unwrap_or_default(),
-        }
+            origin: Origin::Fresh,
+        };
+        parsed.origin = Origin::Loaded(parsed.to_kv());
+        parsed
     }
 
     fn to_kv(&self) -> BTreeMap<String, String> {
@@ -448,7 +506,7 @@ mod tests {
         assert!(!fresh.spell_in_compose);
         assert!(fresh.spell_hide_current);
         assert!(fresh.spell_language.is_empty());
-        let saved = Settings {
+        let mut saved = Settings {
             spellcheck: false,
             spell_in_compose: true,
             spell_hide_current: false,
@@ -486,6 +544,25 @@ mod tests {
         let disk = Settings::load_from(&path);
         assert_eq!(disk.zoom, 2.0);
         assert!(disk.spellcheck);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saving_spelling_keeps_zoom_written_with_one_decimal() {
+        let path = std::env::temp_dir().join(format!(
+            "omaquill-settings-{}-zoom-decimal.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, "zoom = 1.5\n").unwrap();
+        let mut spelling = Settings::load_from(&path);
+        let mut zoomed = Settings::load_from(&path);
+        zoomed.zoom = 2.0;
+        zoomed.save_to(&path).unwrap();
+        spelling.spellcheck = false;
+        spelling.save_to(&path).unwrap();
+        let disk = Settings::load_from(&path);
+        assert_eq!(disk.zoom, 2.0);
+        assert!(!disk.spellcheck);
         let _ = std::fs::remove_file(&path);
     }
 
