@@ -279,7 +279,7 @@ fn preview_lists_every_match_and_writes_nothing() {
         .flat_map(|g| g.rows().iter().map(|r| r.snippet().matched.clone()))
         .collect();
     assert_eq!(matched, ["Mara", "Mara", "Mara"]);
-    assert!(preview.groups().iter().all(|g| g.lossy().is_empty()));
+    assert!(preview.skipped().is_empty());
     assert_eq!(file_bytes(&copy.0), before);
     assert_eq!(zip_count(&backups), 0);
 }
@@ -442,9 +442,7 @@ fn lossy_project(tag: &str) -> (Copy, Project, String, String) {
     let mut project = Project::open(&copy.0).unwrap();
     let draft = project.root_folder(Kind::Draft).unwrap().uuid.clone();
     let plate = project.add_item(Kind::Text, "Plate", &draft, None).unwrap();
-    let aside = project
-        .add_item(Kind::Text, "Aside", &draft, None)
-        .unwrap();
+    let aside = project.add_item(Kind::Text, "Aside", &draft, None).unwrap();
     project.save().unwrap();
     plant(
         &project,
@@ -486,8 +484,8 @@ fn preview_marks_embedded_images_and_other_lossy_text_as_skipped() {
             "Aside: Skipped. Rewriting would drop footnotes".to_string(),
         ]
     );
-    assert!(preview.groups().iter().any(|g| g.id().uuid() == SCENE));
-    assert!(preview.groups().iter().all(|g| g.lossy().is_empty()));
+    assert_eq!(preview.groups().len(), 1);
+    assert_eq!(preview.groups()[0].id().uuid(), SCENE);
     assert!(preview.skipped().iter().all(|s| !s.rows().is_empty()));
     assert!(preview.skipped().iter().all(|s| {
         s.rows()
@@ -523,11 +521,7 @@ fn apply_keeps_lossy_documents_and_replaces_the_rest() {
     assert!(storm.plain_text().contains("Marian"));
     assert!(!storm.plain_text().contains("Mara lit"));
     assert_eq!(
-        report
-            .skipped
-            .iter()
-            .map(|s| s.line())
-            .collect::<Vec<_>>(),
+        report.skipped.iter().map(|s| s.line()).collect::<Vec<_>>(),
         vec![
             "Morning & After notes: Skipped. Rewriting would drop images".to_string(),
             "Plate: Skipped. Rewriting would drop images".to_string(),
@@ -536,7 +530,7 @@ fn apply_keeps_lossy_documents_and_replaces_the_rest() {
     );
     assert_eq!(
         replace::updated_message(report.written.len(), &report.skipped),
-        "Updated 1 files. Morning & After notes: Skipped. Rewriting would drop images. Plate: Skipped. Rewriting would drop images. Aside: Skipped. Rewriting would drop footnotes."
+        "Updated 1 files. Morning & After notes: Skipped. Rewriting would drop images. Plate: Skipped. Rewriting would drop images. Aside: Skipped. Rewriting would drop footnotes"
     );
     assert!(report.written.iter().any(|id| id.uuid() == SCENE));
     assert!(report.written.iter().all(|id| id.uuid() != plate));
@@ -559,10 +553,7 @@ fn only_a_lossy_match_does_not_rewrite_or_backup() {
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0].title(), "Plate");
     assert_eq!(skipped[0].id().uuid(), plate);
-    assert_eq!(
-        skipped[0].label(),
-        "Skipped. Rewriting would drop images"
-    );
+    assert_eq!(skipped[0].label(), "Skipped. Rewriting would drop images");
     assert_eq!(
         replace::skipped_lines(&skipped),
         "Plate: Skipped. Rewriting would drop images"

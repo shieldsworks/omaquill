@@ -385,7 +385,6 @@ pub struct Group {
     title: String,
     path_label: String,
     in_trash: bool,
-    lossy: Vec<&'static str>,
     rows: Vec<Row>,
 }
 
@@ -404,10 +403,6 @@ impl Group {
 
     pub fn in_trash(&self) -> bool {
         self.in_trash
-    }
-
-    pub fn lossy(&self) -> &[&'static str] {
-        &self.lossy
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -457,7 +452,11 @@ impl Skipped {
     }
 
     pub fn line(&self) -> String {
-        format!("{}: {}", field_title(self.id.field, &self.title), self.label())
+        format!(
+            "{}: {}",
+            field_title(self.id.field, &self.title),
+            self.label()
+        )
     }
 }
 
@@ -520,12 +519,16 @@ pub enum ReplaceBlock {
     NoMatch,
 }
 
+/// Plans every replacement in one document. A non-empty `reason` is content
+/// the reader dropped, and the plan is refused.
 pub fn plan_document(
     reason: &[&'static str],
     text: &RichText,
     query: &Query,
 ) -> Result<EditPlan, ReplaceBlock> {
-    let _ = reason;
+    if !reason.is_empty() {
+        return Err(ReplaceBlock::Lossy(reason.to_vec()));
+    }
     let plan = plan_all(text, query);
     if plan.is_empty() {
         Err(ReplaceBlock::NoMatch)
@@ -536,19 +539,18 @@ pub fn plan_document(
 
 pub fn preview(project: &Project, query: &Query) -> Result<Preview, project::Error> {
     let mut groups = Vec::new();
+    let mut skipped = Vec::new();
     let mut next = 0u32;
     let items = project.items();
     let mut scan = Scan {
         project,
         query,
         groups: &mut groups,
+        skipped: &mut skipped,
         next: &mut next,
     };
     walk(&mut scan, &items, "", false)?;
-    Ok(Preview {
-        groups,
-        skipped: Vec::new(),
-    })
+    Ok(Preview { groups, skipped })
 }
 
 #[derive(Debug)]
@@ -564,7 +566,7 @@ pub struct Report {
 #[derive(Debug)]
 pub enum ApplyOutcome {
     NothingToDo,
-    /// Every matched document would lose content if it were rewritten.
+    /// Nothing was written, so there is no backup.
     SkippedOnly(Vec<Skipped>),
     Done(Report),
 }
@@ -616,8 +618,12 @@ pub fn apply(
             pending.push((group.id().clone(), next));
         }
     }
+    let skipped = preview.skipped().to_vec();
     if pending.is_empty() {
-        return Ok(ApplyOutcome::NothingToDo);
+        if skipped.is_empty() {
+            return Ok(ApplyOutcome::NothingToDo);
+        }
+        return Ok(ApplyOutcome::SkippedOnly(skipped));
     }
     let backup = project
         .backup(backup_dir, keep.max(1))
@@ -641,7 +647,7 @@ pub fn apply(
         backup,
         written,
         missed,
-        skipped: Vec::new(),
+        skipped,
     }))
 }
 
@@ -1005,6 +1011,7 @@ struct Scan<'a> {
     project: &'a Project,
     query: &'a Query,
     groups: &'a mut Vec<Group>,
+    skipped: &'a mut Vec<Skipped>,
     next: &'a mut u32,
 }
 
@@ -1060,17 +1067,30 @@ fn push_group(
     if rows.is_empty() {
         return;
     }
-    scan.groups.push(Group {
-        id: DocId {
-            uuid: item.uuid.clone(),
-            field,
-        },
-        title: item.title.clone(),
-        path_label: path.to_string(),
-        in_trash,
-        lossy: text.lossy.clone(),
-        rows,
-    });
+    let id = DocId {
+        uuid: item.uuid.clone(),
+        field,
+    };
+    let title = item.title.clone();
+    let path_label = path.to_string();
+    if text.lossy.is_empty() {
+        scan.groups.push(Group {
+            id,
+            title,
+            path_label,
+            in_trash,
+            rows,
+        });
+    } else {
+        scan.skipped.push(Skipped {
+            id,
+            title,
+            path_label,
+            in_trash,
+            reason: text.lossy.clone(),
+            rows,
+        });
+    }
 }
 
 fn snippet_of(plain: &str, range: CharRange, replacement: &str) -> Snippet {
