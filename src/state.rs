@@ -825,6 +825,59 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_keeps_future_layout_in_a_backup() {
+        let dir = temp_dir("bad-utf8");
+        let path = dir.join("settings.conf");
+        let mut original = b"future_layout = columns\n".to_vec();
+        original.push(0xff);
+        std::fs::write(&path, &original).unwrap();
+        let mut settings = Settings::load_from(&path);
+        settings.spellcheck = false;
+        settings.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("spellcheck = false"), "{text}");
+        let backup = backup_with(dir.as_path(), b"future_layout = columns");
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_keyless_file_keeps_future_layout_in_a_backup() {
+        let dir = temp_dir("keyless");
+        let path = dir.join("settings.conf");
+        let original = b"future_layout columns\nstill not a key\n";
+        std::fs::write(&path, original).unwrap();
+        let mut settings = Settings::load_from(&path);
+        settings.spellcheck = false;
+        settings.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("spellcheck = false"), "{text}");
+        assert!(!text.contains("future_layout"), "{text}");
+        let backup = backup_with(dir.as_path(), b"future_layout");
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn backup_with(dir: &Path, needle: &[u8]) -> PathBuf {
+        let found: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("settings.conf.bad-"))
+                    && std::fs::read(p)
+                        .unwrap()
+                        .windows(needle.len())
+                        .any(|w| w == needle)
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found[0].clone()
+    }
+
+    #[test]
     fn an_unknown_key_survives_a_spelling_save() {
         let dir = temp_dir("unknown");
         let path = dir.join("settings.conf");
