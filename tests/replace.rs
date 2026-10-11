@@ -279,7 +279,7 @@ fn preview_lists_every_match_and_writes_nothing() {
         .flat_map(|g| g.rows().iter().map(|r| r.snippet().matched.clone()))
         .collect();
     assert_eq!(matched, ["Mara", "Mara", "Mara"]);
-    assert!(preview.groups().iter().all(|g| g.lossy().is_empty()));
+    assert!(preview.skipped().is_empty());
     assert_eq!(file_bytes(&copy.0), before);
     assert_eq!(zip_count(&backups), 0);
 }
@@ -431,48 +431,132 @@ fn literal_dollar_and_regex_group_round_trip() {
     assert!(plain.contains("[$1] lit"), "{plain}");
 }
 
-#[test]
-fn lossy_image_is_named_before_the_rewrite_drops_it() {
-    let copy = copy_fixture("pict");
-    let backups = copy.0.parent().unwrap().join("backups");
+fn plant(project: &Project, uuid: &str, file: &str, raw: &[u8]) {
+    let dir = project.data_dir(uuid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(file), raw).unwrap();
+}
+
+fn lossy_project(tag: &str) -> (Copy, Project, String, String) {
+    let copy = copy_fixture(tag);
     let mut project = Project::open(&copy.0).unwrap();
     let draft = project.root_folder(Kind::Draft).unwrap().uuid.clone();
-    let id = project.add_item(Kind::Text, "Plate", &draft, None).unwrap();
+    let plate = project.add_item(Kind::Text, "Plate", &draft, None).unwrap();
+    let aside = project.add_item(Kind::Text, "Aside", &draft, None).unwrap();
     project.save().unwrap();
-    let raw = b"{\\rtf1\\ansi\\pard alpha {\\pict\\pngblip deadbeef} beta}";
-    std::fs::create_dir_all(project.data_dir(&id)).unwrap();
-    std::fs::write(project.data_dir(&id).join("content.rtf"), raw).unwrap();
+    plant(
+        &project,
+        &plate,
+        "content.rtf",
+        br"{\rtf1\ansi\pard Mara saw zircon {\pict\pngblip deadbeef} the lamp}",
+    );
+    plant(
+        &project,
+        &aside,
+        "content.rtf",
+        br"{\rtf1\ansi\pard Mara{\footnote A side note} went}",
+    );
+    plant(
+        &project,
+        MORNING,
+        "notes.rtf",
+        br"{\rtf1\ansi\pard Mara {\*\shppict{\pict\pngblip cafebabe}} note}",
+    );
     let project = Project::open(&copy.0).unwrap();
-    let seen = project.text(&id).unwrap();
-    assert_eq!(seen.lossy, ["images"]);
-    assert!(seen.plain_text().contains("alpha"));
-    let query = literal("alpha", "omega");
+    assert_eq!(project.text(&plate).unwrap().lossy, ["images"]);
+    assert_eq!(project.text(&aside).unwrap().lossy, ["footnotes"]);
+    assert_eq!(project.notes(MORNING).unwrap().lossy, ["images"]);
+    (copy, project, plate, aside)
+}
+
+#[test]
+fn preview_marks_embedded_images_and_other_lossy_text_as_skipped() {
+    let (copy, project, _plate, _aside) = lossy_project("pict-preview");
+    let _ = copy;
+    let query = literal("Mara", "Marian");
     let preview = replace::preview(&project, &query).unwrap();
-    let plate = preview
-        .groups()
-        .iter()
-        .find(|g| g.id().uuid() == id)
-        .unwrap();
-    assert_eq!(plate.lossy(), ["images"]);
-    let before = std::fs::read(project.data_dir(&id).join("content.rtf")).unwrap();
-    assert!(before.windows(4).any(|w| w == b"pict"));
+    let lines: Vec<_> = preview.skipped().iter().map(|s| s.line()).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "Morning & After notes: Skipped. Rewriting would drop images".to_string(),
+            "Plate: Skipped. Rewriting would drop images".to_string(),
+            "Aside: Skipped. Rewriting would drop footnotes".to_string(),
+        ]
+    );
+    assert_eq!(preview.groups().len(), 1);
+    assert_eq!(preview.groups()[0].id().uuid(), SCENE);
+    assert!(preview.skipped().iter().all(|s| !s.rows().is_empty()));
+    assert!(preview.skipped().iter().all(|s| {
+        s.rows()
+            .iter()
+            .all(|row| row.snippet().matched == "Mara" && row.snippet().replacement == "Marian")
+    }));
+}
+
+#[test]
+fn apply_keeps_lossy_documents_and_replaces_the_rest() {
+    let (copy, project, plate, aside) = lossy_project("pict-apply");
+    let backups = copy.0.parent().unwrap().join("backups");
+    let plate_before = bytes(&project, &plate, "content.rtf");
+    let aside_before = bytes(&project, &aside, "content.rtf");
+    let notes_before = bytes(&project, MORNING, "notes.rtf");
+    let morning_before = bytes(&project, MORNING, "content.rtf");
+    assert!(plate_before.windows(4).any(|w| w == b"pict"));
+    assert!(notes_before.windows(4).any(|w| w == b"pict"));
+    assert!(aside_before.windows(8).any(|w| w == b"footnote"));
+    let query = literal("Mara", "Marian");
+    let preview = replace::preview(&project, &query).unwrap();
     let mut project = project;
-    let ids = preview
-        .groups()
-        .iter()
-        .filter(|g| g.id().uuid() == id)
-        .flat_map(|g| g.rows().iter().map(|r| r.id()))
-        .collect::<Vec<_>>();
-    replace::apply(&mut project, &backups, 2, &preview, &ids).unwrap();
-    let after = std::fs::read(project.data_dir(&id).join("content.rtf")).unwrap();
-    assert!(!after.windows(4).any(|w| w == b"pict"));
-    assert!(
-        Project::open(&copy.0)
-            .unwrap()
-            .text(&id)
-            .unwrap()
-            .plain_text()
-            .contains("omega")
+    let outcome = replace::apply(&mut project, &backups, 2, &preview, &preview.ids()).unwrap();
+    let ApplyOutcome::Done(report) = outcome else {
+        panic!("the storm scene still has a plain Mara");
+    };
+    assert!(report.backup.is_file());
+    assert_eq!(bytes(&project, &plate, "content.rtf"), plate_before);
+    assert_eq!(bytes(&project, &aside, "content.rtf"), aside_before);
+    assert_eq!(bytes(&project, MORNING, "notes.rtf"), notes_before);
+    assert_eq!(bytes(&project, MORNING, "content.rtf"), morning_before);
+    let storm = Project::open(&copy.0).unwrap().text(SCENE).unwrap();
+    assert!(storm.plain_text().contains("Marian"));
+    assert!(!storm.plain_text().contains("Mara lit"));
+    assert_eq!(
+        report.skipped.iter().map(|s| s.line()).collect::<Vec<_>>(),
+        vec![
+            "Morning & After notes: Skipped. Rewriting would drop images".to_string(),
+            "Plate: Skipped. Rewriting would drop images".to_string(),
+            "Aside: Skipped. Rewriting would drop footnotes".to_string(),
+        ]
+    );
+    assert_eq!(
+        replace::updated_message(report.written.len(), &report.skipped),
+        "Updated 1 files. Morning & After notes: Skipped. Rewriting would drop images. Plate: Skipped. Rewriting would drop images. Aside: Skipped. Rewriting would drop footnotes"
+    );
+    assert!(report.written.iter().any(|id| id.uuid() == SCENE));
+    assert!(report.written.iter().all(|id| id.uuid() != plate));
+}
+
+#[test]
+fn only_a_lossy_match_does_not_rewrite_or_backup() {
+    let (copy, project, plate, _aside) = lossy_project("pict-only");
+    let backups = copy.0.parent().unwrap().join("backups");
+    let plate_before = bytes(&project, &plate, "content.rtf");
+    let query = literal("zircon", "quartz");
+    let preview = replace::preview(&project, &query).unwrap();
+    let mut project = project;
+    let outcome = replace::apply(&mut project, &backups, 2, &preview, &preview.ids()).unwrap();
+    assert_eq!(bytes(&project, &plate, "content.rtf"), plate_before);
+    assert_eq!(zip_count(&backups), 0);
+    let ApplyOutcome::SkippedOnly(skipped) = outcome else {
+        panic!("the only match is the plate, got {outcome:?}");
+    };
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].title(), "Plate");
+    assert_eq!(skipped[0].id().uuid(), plate);
+    assert_eq!(skipped[0].label(), "Skipped. Rewriting would drop images");
+    assert_eq!(
+        replace::skipped_lines(&skipped),
+        "Plate: Skipped. Rewriting would drop images"
     );
 }
 

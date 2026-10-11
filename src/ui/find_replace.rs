@@ -80,6 +80,11 @@ pub fn present(win: &Rc<Win>) {
                 win.toast("Click in the document first");
                 return;
             };
+            let lossy = editor.lossy();
+            if !lossy.is_empty() {
+                win.toast(&replace::skip_label(&lossy));
+                return;
+            }
             let query = match parsed(&find, &replace_with, opts()) {
                 Ok(query) => query,
                 Err(message) => {
@@ -121,15 +126,25 @@ pub fn present(win: &Rc<Win>) {
                     return;
                 }
             };
-            let plan = replace::plan_all(&editor.text(), &query);
-            let count = plan.edits().len();
-            if editor.apply_edits(&plan).is_none() {
-                find.add_css_class("error");
-                win.toast("No matches");
-                return;
+            match replace::plan_document(&editor.lossy(), &editor.text(), &query) {
+                Ok(plan) => {
+                    let count = plan.edits().len();
+                    if editor.apply_edits(&plan).is_none() {
+                        find.add_css_class("error");
+                        win.toast("No matches");
+                        return;
+                    }
+                    find.remove_css_class("error");
+                    win.toast(&format!("Replaced {count}"));
+                }
+                Err(replace::ReplaceBlock::Lossy(reason)) => {
+                    win.toast(&replace::skip_label(&reason));
+                }
+                Err(replace::ReplaceBlock::NoMatch) => {
+                    find.add_css_class("error");
+                    win.toast("No matches");
+                }
             }
-            find.remove_css_class("error");
-            win.toast(&format!("Replaced {count}"));
         });
     }
     {
@@ -167,9 +182,14 @@ pub fn present(win: &Rc<Win>) {
             };
             fill_list(&list, &preview, &listed);
             let count: usize = preview.groups().iter().map(|g| g.rows().len()).sum();
-            status.set_text(&format!("{count} matches"));
-            replace_checked.set_sensitive(count > 0);
-            if count == 0 {
+            let held = preview.skipped().len();
+            status.set_text(&match (count, held) {
+                (n, 0) => format!("{n} matches"),
+                (0, s) => format!("Skipped {s}"),
+                (n, s) => format!("{n} matches. Skipped {s}"),
+            });
+            replace_checked.set_sensitive(count > 0 || held > 0);
+            if count == 0 && held == 0 {
                 find.add_css_class("error");
                 win.toast("No matches");
             } else {
@@ -214,10 +234,14 @@ pub fn present(win: &Rc<Win>) {
             };
             match outcome {
                 Ok(ApplyOutcome::NothingToDo) => win.toast("Nothing to replace"),
+                Ok(ApplyOutcome::SkippedOnly(skipped)) => {
+                    win.toast(&replace::skipped_lines(&skipped));
+                }
                 Ok(ApplyOutcome::Done(report)) => {
                     let n = report.written.len();
+                    let message = replace::updated_message(n, &report.skipped);
                     reload(&win, &report);
-                    win.toast(&format!("Updated {n} files"));
+                    win.toast(&message);
                 }
                 Err(e) => win.toast(&e.to_string()),
             }
@@ -332,6 +356,41 @@ fn select_range(editor: &Editor, range: replace::CharRange) {
     editor.view.grab_focus();
 }
 
+fn place_detail(path: &str, in_trash: bool, extra: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if !path.is_empty() {
+        parts.push(path.to_string());
+    }
+    if in_trash {
+        parts.push("Trash".to_string());
+    }
+    if let Some(extra) = extra {
+        parts.push(extra.to_string());
+    }
+    parts.join(". ")
+}
+
+fn append_heading(list: &gtk::ListBox, text: &str) {
+    list.append(
+        &gtk::Label::builder()
+            .label(text)
+            .halign(gtk::Align::Start)
+            .css_classes(["heading"])
+            .margin_top(12)
+            .build(),
+    );
+}
+
+fn append_detail(list: &gtk::ListBox, text: &str) {
+    list.append(
+        &gtk::Label::builder()
+            .label(text)
+            .halign(gtk::Align::Start)
+            .css_classes(["dim-label"])
+            .build(),
+    );
+}
+
 fn fill_list(
     list: &gtk::ListBox,
     preview: &replace::Preview,
@@ -341,42 +400,42 @@ fn fill_list(
         list.remove(&child);
     }
     let mut checks = Vec::new();
-    for group in preview.groups() {
-        let heading = match group.id().field() {
-            Field::Body => group.title().to_string(),
-            Field::Notes => format!("{} notes", group.title()),
-        };
-        let mut detail = group.path_label().to_string();
-        if group.in_trash() {
-            detail = if detail.is_empty() {
-                "Trash".to_string()
-            } else {
-                format!("{detail}. Trash")
-            };
-        }
-        if !group.lossy().is_empty() {
-            let names = group.lossy().join(", ");
-            detail = if detail.is_empty() {
-                format!("Rewriting drops {names}")
-            } else {
-                format!("{detail}. Rewriting drops {names}")
-            };
-        }
-        let title = gtk::Label::builder()
-            .label(heading)
-            .halign(gtk::Align::Start)
-            .css_classes(["heading"])
-            .margin_top(12)
-            .build();
-        list.append(&title);
+    for skip in preview.skipped() {
+        append_heading(list, &replace::field_title(skip.id().field(), skip.title()));
+        let detail = place_detail(skip.path_label(), skip.in_trash(), Some(&skip.label()));
         if !detail.is_empty() {
-            list.append(
+            append_detail(list, &detail);
+        }
+        for row in skip.rows() {
+            let snippet = row.snippet();
+            let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            box_.append(
                 &gtk::Label::builder()
-                    .label(detail)
+                    .label(format!("{} to {}", snippet.matched, snippet.replacement))
+                    .halign(gtk::Align::Start)
+                    .build(),
+            );
+            box_.append(
+                &gtk::Label::builder()
+                    .label(format!(
+                        "{}{}{}",
+                        snippet.before, snippet.matched, snippet.after
+                    ))
                     .halign(gtk::Align::Start)
                     .css_classes(["dim-label"])
                     .build(),
             );
+            list.append(&box_);
+        }
+    }
+    for group in preview.groups() {
+        append_heading(
+            list,
+            &replace::field_title(group.id().field(), group.title()),
+        );
+        let detail = place_detail(group.path_label(), group.in_trash(), None);
+        if !detail.is_empty() {
+            append_detail(list, &detail);
         }
         for row in group.rows() {
             let snippet = row.snippet();

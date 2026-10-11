@@ -385,7 +385,6 @@ pub struct Group {
     title: String,
     path_label: String,
     in_trash: bool,
-    lossy: Vec<&'static str>,
     rows: Vec<Row>,
 }
 
@@ -406,23 +405,103 @@ impl Group {
         self.in_trash
     }
 
-    pub fn lossy(&self) -> &[&'static str] {
-        &self.lossy
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+}
+
+/// A matched document a rewrite would damage. The rows are the matches
+/// the preview shows. They are not choices, and [`apply`] does not write them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skipped {
+    id: DocId,
+    title: String,
+    path_label: String,
+    in_trash: bool,
+    reason: Vec<&'static str>,
+    rows: Vec<Row>,
+}
+
+impl Skipped {
+    pub fn id(&self) -> &DocId {
+        &self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn path_label(&self) -> &str {
+        &self.path_label
+    }
+
+    pub fn in_trash(&self) -> bool {
+        self.in_trash
+    }
+
+    pub fn reason(&self) -> &[&'static str] {
+        &self.reason
     }
 
     pub fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    pub fn label(&self) -> String {
+        skip_label(&self.reason)
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "{}: {}",
+            field_title(self.id.field, &self.title),
+            self.label()
+        )
+    }
+}
+
+/// Names what a rewrite would drop, in the words the preview and the result use.
+pub fn skip_label(reason: &[&str]) -> String {
+    format!("Skipped. Rewriting would drop {}", reason.join(", "))
+}
+
+pub fn field_title(field: Field, title: &str) -> String {
+    match field {
+        Field::Body => title.to_string(),
+        Field::Notes => format!("{title} notes"),
+    }
+}
+
+pub fn skipped_lines(skipped: &[Skipped]) -> String {
+    skipped
+        .iter()
+        .map(Skipped::line)
+        .collect::<Vec<_>>()
+        .join(". ")
+}
+
+pub fn updated_message(written: usize, skipped: &[Skipped]) -> String {
+    let updated = format!("Updated {written} files");
+    if skipped.is_empty() {
+        updated
+    } else {
+        format!("{updated}. {}", skipped_lines(skipped))
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preview {
     groups: Vec<Group>,
+    skipped: Vec<Skipped>,
 }
 
 impl Preview {
     pub fn groups(&self) -> &[Group] {
         &self.groups
+    }
+
+    pub fn skipped(&self) -> &[Skipped] {
+        &self.skipped
     }
 
     pub fn ids(&self) -> Vec<MatchId> {
@@ -433,30 +512,62 @@ impl Preview {
     }
 }
 
+/// Why a single-document replace did not change the buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplaceBlock {
+    Lossy(Vec<&'static str>),
+    NoMatch,
+}
+
+/// Plans every replacement in one document. A non-empty `reason` is content
+/// the reader dropped, and the plan is refused.
+pub fn plan_document(
+    reason: &[&'static str],
+    text: &RichText,
+    query: &Query,
+) -> Result<EditPlan, ReplaceBlock> {
+    if !reason.is_empty() {
+        return Err(ReplaceBlock::Lossy(reason.to_vec()));
+    }
+    let plan = plan_all(text, query);
+    if plan.is_empty() {
+        Err(ReplaceBlock::NoMatch)
+    } else {
+        Ok(plan)
+    }
+}
+
 pub fn preview(project: &Project, query: &Query) -> Result<Preview, project::Error> {
     let mut groups = Vec::new();
+    let mut skipped = Vec::new();
     let mut next = 0u32;
     let items = project.items();
     let mut scan = Scan {
         project,
         query,
         groups: &mut groups,
+        skipped: &mut skipped,
         next: &mut next,
     };
     walk(&mut scan, &items, "", false)?;
-    Ok(Preview { groups })
+    Ok(Preview { groups, skipped })
 }
 
 #[derive(Debug)]
 pub struct Report {
     pub backup: PathBuf,
     pub written: Vec<DocId>,
-    pub skipped: usize,
+    /// Chosen matches whose text no longer matched the file.
+    pub missed: usize,
+    /// Documents left unchanged because a rewrite would drop named content.
+    pub skipped: Vec<Skipped>,
 }
 
 #[derive(Debug)]
 pub enum ApplyOutcome {
     NothingToDo,
+    /// Nothing was written, so there is no backup.
+    SkippedOnly(Vec<Skipped>),
     Done(Report),
 }
 
@@ -489,7 +600,7 @@ pub fn apply(
 ) -> Result<ApplyOutcome, ApplyError> {
     let chosen: HashSet<MatchId> = chosen.iter().copied().collect();
     let mut pending = Vec::new();
-    let mut skipped = 0usize;
+    let mut missed = 0usize;
     for group in &preview.groups {
         let current = read_field(project, group.id()).map_err(ApplyError::Read)?;
         let plain = current.plain_text();
@@ -500,15 +611,19 @@ pub fn apply(
             }
             match plain_slice(&plain, row.edit().range()) {
                 Some(slice) if slice == row.edit().matched() => edits.push(row.edit().clone()),
-                _ => skipped += 1,
+                _ => missed += 1,
             }
         }
         if let Some(next) = render(&current, &EditPlan { edits }) {
             pending.push((group.id().clone(), next));
         }
     }
+    let skipped = preview.skipped().to_vec();
     if pending.is_empty() {
-        return Ok(ApplyOutcome::NothingToDo);
+        if skipped.is_empty() {
+            return Ok(ApplyOutcome::NothingToDo);
+        }
+        return Ok(ApplyOutcome::SkippedOnly(skipped));
     }
     let backup = project
         .backup(backup_dir, keep.max(1))
@@ -531,6 +646,7 @@ pub fn apply(
     Ok(ApplyOutcome::Done(Report {
         backup,
         written,
+        missed,
         skipped,
     }))
 }
@@ -895,6 +1011,7 @@ struct Scan<'a> {
     project: &'a Project,
     query: &'a Query,
     groups: &'a mut Vec<Group>,
+    skipped: &'a mut Vec<Skipped>,
     next: &'a mut u32,
 }
 
@@ -950,17 +1067,30 @@ fn push_group(
     if rows.is_empty() {
         return;
     }
-    scan.groups.push(Group {
-        id: DocId {
-            uuid: item.uuid.clone(),
-            field,
-        },
-        title: item.title.clone(),
-        path_label: path.to_string(),
-        in_trash,
-        lossy: text.lossy.clone(),
-        rows,
-    });
+    let id = DocId {
+        uuid: item.uuid.clone(),
+        field,
+    };
+    let title = item.title.clone();
+    let path_label = path.to_string();
+    if text.lossy.is_empty() {
+        scan.groups.push(Group {
+            id,
+            title,
+            path_label,
+            in_trash,
+            rows,
+        });
+    } else {
+        scan.skipped.push(Skipped {
+            id,
+            title,
+            path_label,
+            in_trash,
+            reason: text.lossy.clone(),
+            rows,
+        });
+    }
 }
 
 fn snippet_of(plain: &str, range: CharRange, replacement: &str) -> Snippet {
@@ -1252,6 +1382,21 @@ mod tests {
         assert_eq!(next.paragraphs[0].style.align, Align::Center);
         assert_eq!(next.paragraphs[1].style.align, Align::Center);
         assert_eq!(next.plain_text(), "Hello there\nfriend");
+    }
+
+    #[test]
+    fn plan_document_refuses_an_image_and_replaces_plain_text() {
+        let image = crate::rtf::parse(br"{\rtf1\ansi\pard alpha {\pict\pngblip deadbeef} beta}");
+        assert_eq!(image.lossy, ["images"]);
+        let query = literal("alpha", "omega", Word::Any, Case::Sensitive);
+        let blocked = plan_document(&image.lossy, &image, &query);
+        assert!(
+            matches!(blocked, Err(ReplaceBlock::Lossy(ref reason)) if reason.as_slice() == ["images"]),
+            "{blocked:?}"
+        );
+        let plain = RichText::from_plain("alpha beta");
+        let plan = plan_document(&[], &plain, &query).unwrap();
+        assert_eq!(render(&plain, &plan).unwrap().plain_text(), "omega beta");
     }
 
     #[test]

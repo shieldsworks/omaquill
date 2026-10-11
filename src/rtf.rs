@@ -6,7 +6,8 @@
 //! alignment, indents, spacing and line height. Lists come through as their
 //! marker text (Cocoa writes it in `\listtext`), and table cells become
 //! tab-separated paragraphs. Anything dropped on the way in is named in
-//! [`RichText::lossy`], so the app can warn before rewriting such a file.
+//! [`RichText::lossy`]. A project replace skips that file. The editor
+//! names the same list and does not replace.
 
 use std::fmt::Write as _;
 
