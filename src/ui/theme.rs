@@ -136,6 +136,7 @@ impl Theme {
                     _ => adw::ColorScheme::Default,
                 });
                 provider.load_from_string(&css(&colors));
+                super::spell::set_squiggle_color(colors.get("red").map(String::as_str));
             }
         };
         reload();

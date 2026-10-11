@@ -78,6 +78,7 @@ pub fn shortcuts() -> adw::Dialog {
                 ("<Ctrl>z", "Undo"),
                 ("<Ctrl><Shift>z", "Redo"),
                 ("F11", "Composition mode"),
+                ("F7", "Turn spelling marks on or off"),
                 ("<Ctrl>plus <Ctrl>minus", "Zoom in / out"),
                 ("<Ctrl>0", "Reset zoom"),
             ],
@@ -213,6 +214,35 @@ impl Win {
         writing.add(&author);
         page.add(&writing);
 
+        let spelling = adw::PreferencesGroup::builder()
+            .title("Spelling")
+            .description("Leave Language blank to follow the system. A tag such as en_GB picks that dictionary.")
+            .build();
+        let spell_on = adw::SwitchRow::builder()
+            .title("Check Spelling")
+            .subtitle("Red marks under misspelled words. F7 turns this off.")
+            .active(s.spellcheck)
+            .build();
+        spelling.add(&spell_on);
+        let in_compose = adw::SwitchRow::builder()
+            .title("Show Marks in Composition Mode")
+            .subtitle("Off while composing, so the page stays quiet.")
+            .active(s.spell_in_compose)
+            .build();
+        spelling.add(&in_compose);
+        let wait = adw::SwitchRow::builder()
+            .title("Wait to Mark the Word Being Typed")
+            .subtitle("The mark appears when the cursor leaves the word.")
+            .active(s.spell_hide_current)
+            .build();
+        spelling.add(&wait);
+        let language = adw::EntryRow::builder()
+            .title("Language")
+            .text(&s.spell_language)
+            .build();
+        spelling.add(&language);
+        page.add(&spelling);
+
         let backups = adw::PreferencesGroup::builder()
             .title("Backups")
             .description("omaquill zips the whole project each time it opens it.")
@@ -238,13 +268,28 @@ impl Win {
         dialog.add(&page);
         let apply = {
             let weak = Rc::downgrade(self);
-            let (zoom, own_fonts, font_button, target, author, keep) = (
+            let (
+                zoom,
+                own_fonts,
+                font_button,
+                target,
+                author,
+                keep,
+                spell_on,
+                in_compose,
+                wait,
+                language,
+            ) = (
                 zoom.clone(),
                 own_fonts.clone(),
                 font_button.clone(),
                 target.clone(),
                 author.clone(),
                 keep.clone(),
+                spell_on.clone(),
+                in_compose.clone(),
+                wait.clone(),
+                language.clone(),
             );
             let font_row = font_row.clone();
             Rc::new(move || {
@@ -263,7 +308,20 @@ impl Win {
                     s.daily_target = target.value() as u32;
                     s.author = author.text().to_string();
                     s.backups = keep.value() as usize;
+                    s.spellcheck = spell_on.is_active();
+                    s.spell_in_compose = in_compose.is_active();
+                    s.spell_hide_current = wait.is_active();
+                    s.spell_language = language.text().trim().to_string();
                     let _ = s.save();
+                }
+                win.spell
+                    .apply_settings(&win.settings.borrow(), win.composing.get());
+                if let Some(action) = win
+                    .window
+                    .lookup_action("spellcheck")
+                    .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
+                {
+                    action.set_state(&spell_on.is_active().to_variant());
                 }
                 win.apply_look();
                 win.update_totals();
@@ -281,6 +339,14 @@ impl Win {
         author.connect_changed(move |_| a());
         let a = apply.clone();
         keep.connect_value_notify(move |_| a());
+        let a = apply.clone();
+        spell_on.connect_active_notify(move |_| a());
+        let a = apply.clone();
+        in_compose.connect_active_notify(move |_| a());
+        let a = apply.clone();
+        wait.connect_active_notify(move |_| a());
+        let a = apply.clone();
+        language.connect_changed(move |_| a());
         dialog.present(Some(&self.window));
     }
 

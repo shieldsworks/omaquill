@@ -12,6 +12,7 @@ mod dialogs;
 mod editor;
 mod inspector;
 pub mod rich;
+mod spell;
 mod theme;
 
 use adw::prelude::*;
@@ -66,6 +67,7 @@ pub struct Win {
     banner: adw::Banner,
     editor: Rc<Editor>,
     notes: Rc<Editor>,
+    spell: Rc<spell::Session>,
     format_bar: gtk::Box,
     bold: gtk::ToggleButton,
     italic: gtk::ToggleButton,
@@ -214,6 +216,7 @@ fn set_accels(app: &adw::Application) {
         ("win.view-corkboard", &["<Ctrl>2"]),
         ("win.view-outliner", &["<Ctrl>3"]),
         ("win.compose", &["F11"]),
+        ("win.spellcheck", &["F7"]),
         ("win.toggle-binder", &["<Ctrl><Alt>b"]),
         ("win.toggle-inspector", &["<Ctrl><Alt>i"]),
         ("win.zoom-in", &["<Ctrl>plus", "<Ctrl>equal"]),
@@ -320,6 +323,7 @@ fn primary_menu() -> gio::Menu {
     project.append(Some("Empty Trash…"), Some("win.empty-trash"));
     menu.append_section(None, &project);
     let app = gio::Menu::new();
+    app.append(Some("Check Spelling"), Some("win.spellcheck"));
     app.append(Some("Preferences"), Some("win.preferences"));
     app.append(Some("Keyboard Shortcuts"), Some("win.show-help-overlay"));
     app.append(Some("About omaquill"), Some("win.about"));
@@ -530,6 +534,8 @@ impl Win {
         bp.add_setter(&outer, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(bp);
 
+        let spell = spell::Session::new(&editor, &settings);
+
         let label_css = gtk::CssProvider::new();
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -564,6 +570,7 @@ impl Win {
             banner,
             editor,
             notes,
+            spell,
             format_bar,
             bold,
             italic,
@@ -613,6 +620,13 @@ impl Win {
                 w.dirty_text.set(true);
                 w.update_doc_words();
                 w.schedule_save();
+                w.spell.refresh_cursor();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.editor.connect_cursor(move || {
+            if let Some(w) = weak.upgrade() {
+                w.spell.refresh_cursor();
             }
         });
         let weak = Rc::downgrade(self);
@@ -691,6 +705,7 @@ impl Win {
             ("<Ctrl>comma", "win.preferences"),
             ("<Ctrl>question", "win.show-help-overlay"),
             ("<Ctrl><Shift>e", "win.compile"),
+            ("F7", "win.spellcheck"),
         ] {
             early.add_shortcut(gtk::Shortcut::new(
                 gtk::ShortcutTrigger::parse_string(trigger),
@@ -770,6 +785,32 @@ impl Win {
         });
         simple("view-outliner", |w| w.set_folder_view(FolderView::Outliner));
         simple("compose", |w| w.set_composing(!w.composing.get()));
+        let spellcheck = gio::SimpleAction::new_stateful(
+            "spellcheck",
+            None,
+            &self.settings.borrow().spellcheck.to_variant(),
+        );
+        {
+            let weak = Rc::downgrade(self);
+            spellcheck.connect_change_state(move |action, state| {
+                let Some(state) = state else { return };
+                let Some(on) = state.get::<bool>() else {
+                    return;
+                };
+                action.set_state(&on.to_variant());
+                let Some(win) = weak.upgrade() else { return };
+                {
+                    let mut settings = win.settings.borrow_mut();
+                    settings.spellcheck = on;
+                    let _ = settings.save();
+                }
+                win.spell.set_enabled(on);
+                if on && !win.spell.has_dictionary() {
+                    win.toast("Spelling needs the enchant library and a dictionary");
+                }
+            });
+        }
+        self.window.add_action(&spellcheck);
         simple("toggle-binder", |w| {
             w.outer.set_show_sidebar(!w.outer.shows_sidebar())
         });
@@ -972,7 +1013,9 @@ impl Win {
         );
         today.save();
         *self.today.borrow_mut() = Some(today);
+        let spell_path = project.path.clone();
         *self.project.borrow_mut() = Some(project);
+        self.spell.set_project(&spell_path);
 
         self.outer.set_show_sidebar(true);
         self.inner.set_show_sidebar(true);
@@ -1197,6 +1240,7 @@ impl Win {
                     self.banner.set_revealed(true);
                 }
                 self.editor.load(&text);
+                self.spell.rescan();
                 self.dirty_text.set(false);
                 *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
                 self.format_bar.set_visible(true);
@@ -1510,6 +1554,7 @@ impl Win {
             self.window.unfullscreen();
             self.editor.clamp.set_maximum_size(760);
         }
+        self.spell.set_composing(on);
     }
 }
 
@@ -1566,4 +1611,6 @@ fn gtk_checks() {
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::empty_paragraphs_keep_their_style_and_lines_align_alone();
+    editor::tests::a_spelling_mark_is_not_saved();
+    spell::tests::keystroke_on_a_long_buffer();
 }

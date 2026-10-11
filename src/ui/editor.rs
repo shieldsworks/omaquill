@@ -37,6 +37,7 @@ pub struct Editor {
     inserting: Cell<bool>,
     changed: RefCell<Vec<Box<dyn Fn()>>>,
     formatting: RefCell<Vec<FormattingCallback>>,
+    cursor: RefCell<Vec<Box<dyn Fn()>>>,
 }
 
 impl Editor {
@@ -99,6 +100,7 @@ impl Editor {
             inserting: Cell::new(false),
             changed: RefCell::new(Vec::new()),
             formatting: RefCell::new(Vec::new()),
+            cursor: RefCell::new(Vec::new()),
         });
         ed.wire();
         ed
@@ -157,6 +159,11 @@ impl Editor {
             {
                 ed.pending.borrow_mut().clear();
                 ed.report();
+                if !ed.loading.get() {
+                    for f in ed.cursor.borrow().iter() {
+                        f();
+                    }
+                }
             }
         });
         let weak = Rc::downgrade(self);
@@ -199,6 +206,11 @@ impl Editor {
     /// Called with the formatting at the cursor whenever it moves.
     pub fn connect_formatting(&self, f: impl Fn(Formatting) + 'static) {
         self.formatting.borrow_mut().push(Box::new(f));
+    }
+
+    /// Called when the cursor moves and the buffer is not loading.
+    pub fn connect_cursor(&self, f: impl Fn() + 'static) {
+        self.cursor.borrow_mut().push(Box::new(f));
     }
 
     pub fn load(&self, text: &RichText) {
@@ -597,5 +609,20 @@ next}";
             .apply_tag(&rich::tag(&ed.buffer, "c:size=40"), &s0, &s1);
         let names = rich::tag_names(&ed.buffer.iter_at_offset(0));
         assert_eq!(names.iter().filter(|n| n.starts_with("c:size=")).count(), 1);
+    }
+
+    /// A spelling underline is a tag the file does not store.
+    pub(crate) fn a_spelling_mark_is_not_saved() {
+        let ed = Editor::new(true);
+        ed.load(&rtf::parse(br"{\rtf1 hello helo}"));
+        let before = ed.text();
+        let tag = gtk::TextTag::new(Some("spell"));
+        tag.set_underline(gtk::pango::Underline::Error);
+        ed.buffer.tag_table().add(&tag);
+        let start = ed.buffer.iter_at_offset(6);
+        let end = ed.buffer.iter_at_offset(10);
+        ed.buffer.apply_tag(&tag, &start, &end);
+        assert_eq!(ed.text(), before);
+        assert_eq!(ed.plain_text(), "hello helo");
     }
 }
