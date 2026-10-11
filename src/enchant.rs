@@ -198,6 +198,10 @@ mod tests {
     #[test]
     fn enchant_accepts_a_real_word_and_rejects_a_fake_one() {
         let Some(broker) = Broker::open("en_US") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI installs libenchant-2-2 and hunspell-en-us"
+            );
             eprintln!("enchant dictionary unavailable; skipping");
             return;
         };
