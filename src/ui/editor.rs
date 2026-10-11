@@ -252,6 +252,56 @@ impl Editor {
         omaquill::rtf::word_count(&self.plain_text())
     }
 
+    pub fn apply_edits(
+        &self,
+        plan: &omaquill::replace::EditPlan,
+    ) -> Option<omaquill::replace::Cursor> {
+        if plan.is_empty() {
+            return None;
+        }
+        self.pending.borrow_mut().clear();
+        self.buffer.begin_user_action();
+        self.inserting.set(true);
+        let edits = plan.edits();
+        let mut caret = 0usize;
+        for (i, edit) in edits.iter().enumerate().rev() {
+            let start = edit.range().start();
+            let end = edit.range().end();
+            let mut from = self.buffer.iter_at_offset(text_offset(start));
+            let mut to = self.buffer.iter_at_offset(text_offset(end));
+            self.buffer.delete(&mut from, &mut to);
+            let tags = tags_for(&self.buffer, edit.char_style());
+            let mut at = self.buffer.iter_at_offset(text_offset(start));
+            let origin = at.offset();
+            for (part_ix, part) in edit.replacement().split('\n').enumerate() {
+                let refs: Vec<&gtk::TextTag> = tags.iter().collect();
+                if part_ix > 0 {
+                    self.buffer.insert_with_tags(&mut at, "\n", &refs);
+                }
+                if !part.is_empty() {
+                    let refs: Vec<&gtk::TextTag> = tags.iter().collect();
+                    self.buffer.insert_with_tags(&mut at, part, &refs);
+                }
+            }
+            paint_new_lines(&self.buffer, origin, at.offset(), edit.para_style());
+            let written = edit.replacement().chars().count();
+            if i + 1 == edits.len() {
+                caret = start + written;
+            } else {
+                let delta = text_len(written) - text_len(end - start);
+                caret = usize::try_from(text_len(caret) + delta)
+                    .expect("the caret stays inside the document");
+            }
+        }
+        self.inserting.set(false);
+        self.buffer.end_user_action();
+        let mut caret_iter = self.buffer.iter_at_offset(text_offset(caret));
+        self.buffer.place_cursor(&caret_iter);
+        self.view
+            .scroll_to_iter(&mut caret_iter, 0.1, false, 0.0, 0.0);
+        Some(omaquill::replace::Cursor::new(caret))
+    }
+
     /// Tags new text should carry, from the text it was typed next to.
     fn source_tags(&self, start: &gtk::TextIter, end: &gtk::TextIter) -> Vec<String> {
         // Character formatting: at the start of a paragraph, from the text
@@ -507,6 +557,59 @@ impl Editor {
     }
 }
 
+fn text_offset(n: usize) -> i32 {
+    i32::try_from(n).expect("a text offset fits in i32")
+}
+
+fn text_len(n: usize) -> isize {
+    isize::try_from(n).expect("a text length fits in isize")
+}
+
+fn tags_for(buffer: &gtk::TextBuffer, style: &omaquill::rtf::CharStyle) -> Vec<gtk::TextTag> {
+    rich::char_tags(style)
+        .iter()
+        .map(|name| rich::tag(buffer, name))
+        .collect()
+}
+
+fn paint_new_lines(
+    buffer: &gtk::TextBuffer,
+    origin: i32,
+    end: i32,
+    style: &omaquill::rtf::ParaStyle,
+) {
+    if origin >= end {
+        return;
+    }
+    let mut line = buffer.iter_at_offset(origin);
+    if !line.starts_line() && !line.forward_line() {
+        return;
+    }
+    while line.offset() < end {
+        let start = line;
+        let mut next = line;
+        if !next.forward_line() {
+            next = buffer.end_iter();
+        }
+        let mut drop = Vec::new();
+        buffer.tag_table().foreach(|tag| {
+            if tag.name().is_some_and(|name| name.starts_with("p:")) {
+                drop.push(tag.clone());
+            }
+        });
+        for tag in drop {
+            buffer.remove_tag(&tag, &start, &next);
+        }
+        for name in rich::para_tags(style) {
+            buffer.apply_tag(&rich::tag(buffer, &name), &start, &next);
+        }
+        if next.is_end() {
+            break;
+        }
+        line = next;
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -624,5 +727,40 @@ next}";
         ed.buffer.apply_tag(&tag, &start, &end);
         assert_eq!(ed.text(), before);
         assert_eq!(ed.plain_text(), "hello helo");
+    }
+
+    pub(crate) fn replace_all_is_one_undo_and_keeps_the_run_style() {
+        let ed = Editor::new(true);
+        let src =
+            r"{\rtf1\ansi{\fonttbl\f0 Palatino-Roman;}\pard\f0\fs24 Say hello and {\i hello}.}";
+        ed.load(&rtf::parse(src.as_bytes()));
+        let query = omaquill::replace::query(
+            "hello",
+            "hi",
+            omaquill::replace::Options {
+                case: omaquill::replace::Case::Sensitive,
+                word: omaquill::replace::Word::Any,
+                mode: omaquill::replace::Mode::Literal,
+            },
+        )
+        .unwrap();
+        let plan = omaquill::replace::plan_all(&ed.text(), &query);
+        ed.apply_edits(&plan);
+        let text = ed.text();
+        let plain = text.plain_text();
+        assert_eq!(plain, "Say hi and hi.");
+        let styled: Vec<bool> = text.paragraphs[0]
+            .runs
+            .iter()
+            .flat_map(|run| run.text.chars().map(|_| run.style.italic))
+            .collect();
+        let first = plain.find("hi").unwrap();
+        let second = plain.rfind("hi").unwrap();
+        assert!(styled[first..first + 2].iter().all(|italic| !italic));
+        assert!(styled[second..second + 2].iter().all(|italic| *italic));
+        assert!(ed.buffer.can_undo());
+        ed.buffer.undo();
+        assert_eq!(ed.plain_text(), "Say hello and hello.");
+        assert!(!ed.buffer.can_undo());
     }
 }

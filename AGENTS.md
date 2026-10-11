@@ -267,10 +267,13 @@ documented in `src/state.rs`. Do not send them through `write_inside`.
 
 `project::backup` zips one project into `state::backup_dir`. The folder name
 includes a hash of the project's full path, so two projects do not share or
-prune each other's zips. The zip is written to `*.zip.part` and then
-renamed. The window starts that backup on open, on another thread, when the
-backup count in settings is above zero. `omaquill check` does not back up
-and does not write the project.
+prune each other's zips. The zip is written to
+`.backup.<pid>-<n>.omaquill-tmp` in that folder, synced, then hard-linked
+to `<date>.zip` (or `<date> N.zip` when that second already has a backup).
+The link fails if the name is already there, so two backups never share a
+partial file or replace each other. The window starts that backup on open,
+on another thread, when the backup count in settings is above zero.
+`omaquill check` does not back up and does not write the project.
 
 The editor saves text for `editor_uuid` only, and not for the binder
 selection in `current`. A failed load must not write one document's words

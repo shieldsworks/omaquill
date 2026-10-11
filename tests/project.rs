@@ -333,6 +333,173 @@ fn backups_never_prune_another_projects() {
 }
 
 #[test]
+fn a_pruned_same_second_name_is_not_reused() {
+    let c = copy_fixture("prune-name");
+    let dir = c.0.parent().unwrap().join("backups");
+    let now = "2026-01-02 03:04:05 -0700";
+    let stamp = "2026-01-02 03-04-05";
+    let expected = [
+        format!("{stamp}.zip"),
+        format!("{stamp} 2.zip"),
+        format!("{stamp} 3.zip"),
+    ];
+    let mut made = Vec::new();
+    for name in &expected {
+        let path = omaquill::project::backup_at(&c.0, &dir, 100, now).unwrap();
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), *name);
+        made.push((path.clone(), std::fs::read(&path).unwrap()));
+    }
+    let names: std::collections::HashSet<_> = made.iter().map(|(path, _)| path.clone()).collect();
+    assert_eq!(names.len(), 3);
+    for (path, bytes) in &made {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+    std::fs::remove_file(&made[0].0).unwrap();
+    let fourth = omaquill::project::backup_at(&c.0, &dir, 100, now).unwrap();
+    assert_eq!(
+        fourth.file_name().unwrap().to_string_lossy(),
+        format!("{stamp} 4.zip")
+    );
+    assert!(!made[0].0.exists());
+    for (path, bytes) in &made[1..] {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn leftover_temp_does_not_block_the_next_backup() {
+    if std::env::var_os("OMAQUILL_STALE_TEMP").is_some() {
+        leftover_temp_child();
+        return;
+    }
+    let c = copy_fixture("stale");
+    let parent = c.0.parent().unwrap().join("backups");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "leftover_temp_does_not_block_the_next_backup"])
+        .env("OMAQUILL_STALE_TEMP", "1")
+        .env("OMAQUILL_STALE_PROJECT", &c.0)
+        .env("OMAQUILL_STALE_DIR", &parent)
+        .status()
+        .unwrap();
+    assert!(status.success(), "stale temp still blocked the backup");
+}
+
+fn leftover_temp_child() {
+    let project = PathBuf::from(std::env::var("OMAQUILL_STALE_PROJECT").unwrap());
+    let parent = PathBuf::from(std::env::var("OMAQUILL_STALE_DIR").unwrap());
+    let full = std::fs::canonicalize(&project).unwrap();
+    let name = project.file_stem().unwrap().to_string_lossy();
+    let id = &sha1::hex(full.to_string_lossy().as_bytes())[..8];
+    let dir = parent.join(format!("{name}-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stale = dir.join(format!(".backup.{}-0.omaquill-tmp", std::process::id()));
+    std::fs::write(&stale, b"not a zip").unwrap();
+    let before = file_bytes(&project);
+    let zip = omaquill::project::backup(&project, &parent, 5).unwrap();
+    assert_eq!(file_bytes(&unzip_stored(&zip)), before);
+    assert!(!stale.exists(), "leftover temp was published");
+}
+
+#[test]
+fn concurrent_backups_in_one_second_each_restore_the_project() {
+    let c = copy_fixture("race");
+    let pad = vec![0xA5u8; 2 * 1024 * 1024];
+    std::fs::write(c.0.join("pad.bin"), &pad).unwrap();
+    let before = file_bytes(&c.0);
+    let dir = c.0.parent().unwrap().join("backups");
+    for round in 0..3 {
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = c.0.clone();
+            let dir = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                omaquill::project::backup(&path, &dir, 100).unwrap()
+            }));
+        }
+        let zips: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut names = std::collections::HashSet::new();
+        for zip in &zips {
+            assert!(
+                names.insert(zip.clone()),
+                "round {round} reused {}",
+                zip.display()
+            );
+            let restored = unzip_stored(zip);
+            let got = file_bytes(&restored);
+            assert_eq!(
+                got,
+                before,
+                "round {round} {} restored {} files, snapshot has {}",
+                zip.display(),
+                got.len(),
+                before.len()
+            );
+        }
+    }
+}
+
+fn file_bytes(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let ft = entry.file_type().unwrap();
+            if ft.is_dir() {
+                walk(root, &path, out);
+            } else if ft.is_file() {
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn unzip_stored(zip_path: &Path) -> PathBuf {
+    let dest = zip_path.with_extension("restored");
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).unwrap();
+    let data = std::fs::read(zip_path).unwrap();
+    let mut i = 0usize;
+    while i + 30 <= data.len() {
+        let sig = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        if sig != 0x04034b50 {
+            break;
+        }
+        let method = u16::from_le_bytes(data[i + 8..i + 10].try_into().unwrap());
+        assert_eq!(method, 0, "{} is not a stored zip", zip_path.display());
+        let size = u32::from_le_bytes(data[i + 18..i + 22].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(data[i + 26..i + 28].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(data[i + 28..i + 30].try_into().unwrap()) as usize;
+        let name_at = i + 30;
+        assert!(
+            name_at + name_len + extra_len + size <= data.len(),
+            "{} ends inside an entry",
+            zip_path.display()
+        );
+        let name = std::str::from_utf8(&data[name_at..name_at + name_len]).unwrap();
+        let start = name_at + name_len + extra_len;
+        let out = dest.join(name);
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&out, &data[start..start + size]).unwrap();
+        i = start + size;
+    }
+    dest.join("Lighthouse.scriv")
+}
+
+#[test]
 fn trash_without_an_id_does_not_delete_files() {
     let c = copy_fixture("trash-id");
     let x = scrivx(&c.0).replace(

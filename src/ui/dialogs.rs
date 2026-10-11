@@ -75,6 +75,7 @@ pub fn shortcuts() -> adw::Dialog {
                 ("<Ctrl>i", "Italic"),
                 ("<Ctrl>u", "Underline"),
                 ("<Ctrl>f", "Find in document"),
+                ("<Ctrl>h", "Find and replace"),
                 ("<Ctrl>z", "Undo"),
                 ("<Ctrl><Shift>z", "Redo"),
                 ("F11", "Composition mode"),

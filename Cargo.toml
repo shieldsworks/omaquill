@@ -18,6 +18,8 @@ pango = { version = "0.22", features = ["v1_44"] }
 pangocairo = "0.22"
 # SIGTERM at logout: close windows so pending text saves.
 glib-unix = "0.22"
+# Find and replace, including capture groups.
+regex = "1"
 
 [profile.release]
 debug = "line-tables-only"
