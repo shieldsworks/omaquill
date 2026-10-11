@@ -982,7 +982,7 @@ impl Win {
         self.view_buttons.set_visible(false);
     }
 
-    fn join_backup(&self) {
+    fn join_backup_reader(&self) {
         if let Some(job) = self.backup_job.borrow_mut().take() {
             let _ = job.join();
         }
@@ -1007,7 +1007,7 @@ impl Win {
         // A backup before anything is touched, off the main thread.
         let keep = self.settings.borrow().backups;
         if keep > 0 {
-            self.join_backup();
+            self.join_backup_reader();
             let path = project.path.clone();
             let job = std::thread::spawn(move || {
                 if let Err(e) =

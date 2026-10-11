@@ -333,6 +333,45 @@ fn backups_never_prune_another_projects() {
 }
 
 #[test]
+fn a_pruned_same_second_name_is_not_reused() {
+    let c = copy_fixture("prune-name");
+    let dir = c.0.parent().unwrap().join("backups");
+    let stamp_of = |path: &Path| {
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .chars()
+            .take(19)
+            .collect::<String>()
+    };
+    let count_of = |path: &Path| {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let stem = name.strip_suffix(".zip").unwrap_or(&name).to_string();
+        stem.get(20..)
+            .and_then(|rest| rest.parse().ok())
+            .unwrap_or(1)
+    };
+    for _ in 0..5 {
+        let first = omaquill::project::backup(&c.0, &dir, 10).unwrap();
+        let second = omaquill::project::backup(&c.0, &dir, 10).unwrap();
+        if stamp_of(&first) != stamp_of(&second) {
+            continue;
+        }
+        std::fs::remove_file(&first).unwrap();
+        let third = omaquill::project::backup(&c.0, &dir, 10).unwrap();
+        assert!(
+            count_of(&third) > count_of(&second),
+            "pruned {} came back as {}",
+            first.display(),
+            third.display()
+        );
+        assert!(second.is_file());
+        return;
+    }
+    panic!("five tries never placed two backups in one second");
+}
+
+#[test]
 fn leftover_temp_does_not_block_the_next_backup() {
     if std::env::var_os("OMAQUILL_STALE_TEMP").is_some() {
         leftover_temp_child();

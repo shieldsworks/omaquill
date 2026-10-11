@@ -972,8 +972,6 @@ pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let stamp = timestamp().replace(':', "-");
     let stamp = stamp.split(' ').take(2).collect::<Vec<_>>().join(" ");
-    // A shared partial name lets two backups in one second truncate each
-    // other. Each attempt has its own temp file.
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = dir.join(format!(
         ".backup.{}-{}.omaquill-tmp",
@@ -994,12 +992,9 @@ pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
                     .is_some_and(is_backup_name)
         })
         .collect();
-    // Oldest first: by stamp, then " 2", " 3" within the same second.
     old.sort_by_key(|p| {
         let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let stem = n.strip_suffix(".zip").unwrap_or(n);
-        let count: u32 = stem.get(20..).and_then(|c| c.parse().ok()).unwrap_or(1);
-        (stem.get(..19).unwrap_or("").to_string(), count)
+        backup_order(n).expect("filtered to backup names")
     });
     while old.len() + 1 > keep.max(1) && !old.is_empty() {
         let _ = std::fs::remove_file(old.remove(0));
@@ -1075,8 +1070,6 @@ fn write_backup(path: &Path, tmp: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Hard-links `tmp` to the next free name for `stamp`.
-/// `rename` would replace a zip another backup already published.
 fn publish_backup(dir: &Path, stamp: &str, tmp: &Path) -> Result<PathBuf> {
     let linked = (|| {
         for _ in 0..10_000 {
@@ -1100,19 +1093,25 @@ fn publish_backup(dir: &Path, stamp: &str, tmp: &Path) -> Result<PathBuf> {
     linked
 }
 
+fn backup_order(name: &str) -> Option<(String, u32)> {
+    if !is_backup_name(name) {
+        return None;
+    }
+    let stem = name.strip_suffix(".zip")?;
+    let stamp = stem.get(..19)?.to_string();
+    let count = stem
+        .get(20..)
+        .and_then(|rest| rest.parse().ok())
+        .unwrap_or(1);
+    Some((stamp, count))
+}
+
 fn next_backup_path(dir: &Path, stamp: &str) -> Result<PathBuf> {
-    // Numbered past any backup already made this second, so names keep
-    // sorting oldest first even after pruning frees a lower number.
     let same_second = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|n| is_backup_name(n) && n.starts_with(stamp))
-        .map(|n| {
-            n[stamp.len()..]
-                .trim_end_matches(".zip")
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(1)
-        })
+        .filter_map(|n| backup_order(&n))
+        .filter(|(got, _)| *got == stamp)
+        .map(|(_, count)| count)
         .max();
     Ok(match same_second {
         None => dir.join(format!("{stamp}.zip")),
@@ -1124,9 +1123,6 @@ fn already_exists(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(libc::EEXIST)
 }
 
-/// Opens `tmp` with `create_new`. A crashed backup can leave this name
-/// behind. This process just claimed the counter, and a live process has
-/// another pid, so the leftover is not being written.
 fn open_backup_temp(tmp: &Path) -> Result<std::fs::File> {
     let open = || {
         std::fs::OpenOptions::new()

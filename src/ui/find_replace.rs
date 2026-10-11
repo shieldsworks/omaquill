@@ -197,9 +197,7 @@ pub fn present(win: &Rc<Win>) {
             if !win.save_now() {
                 return;
             }
-            // The backup started at open is still reading this project on
-            // another thread. Wait for it before writing a second zip.
-            win.join_backup();
+            win.join_backup_reader();
             let keep = win.settings.borrow().backups;
             let outcome = {
                 let mut guard = win.project.borrow_mut();
