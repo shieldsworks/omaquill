@@ -138,7 +138,7 @@ passes today's lints and has a test. Old code may predate the rules.
 
 ## Allowed unsafe
 
-Three blocks, in two functions. Do not add another unless std and the crates
+Nine blocks, in eight functions. Do not add another unless std and the crates
 already in `Cargo.toml` have no safe function for the job. A new block needs
 a `// SAFETY:` comment that says why it is sound, and the change names the
 site.
@@ -149,6 +149,28 @@ site.
 - `main` in `src/main.rs` calls `libc::signal` with `SIGPIPE` and `SIG_DFL`
   before any other thread starts. `omaquill check` piped to `head` then
   stops without aborting on `SIGPIPE`.
+- `Library::open` in `src/enchant.rs` loads `libenchant-2.so.2` with
+  `dlopen` and `RTLD_NOW`, then resolves seven Enchant 2 entry points. The
+  soname and the symbol names are NUL-terminated literals. A null `dlopen`
+  or `dlsym` returns `None`. Each function pointer is transmuted to the
+  prototype quoted on its alias. The handle stays in the `Library` that
+  owns those pointers. Enchant is not a crate in `Cargo.toml`, and omaquill
+  does not link it, so a build without the library still compiles.
+- `Drop` for `Handle` in `src/enchant.rs` is the one `dlclose` for that
+  `dlopen`. `Handle` is not `Clone` or `Copy`. Enchant calls through the
+  pointers return before the handle drops.
+- `Broker::open` in `src/enchant.rs` calls `enchant_broker_init` and
+  `enchant_broker_request_dict`. Each tag is a NUL-terminated string that
+  outlives the request. A null broker, or no dictionary, returns `None`.
+  A broker with no dictionary is freed once on that path.
+- `Broker::check` in `src/enchant.rs` calls `enchant_dict_check` with the
+  dictionary `open` stored and one NUL-terminated UTF-8 word. `Broker` is
+  neither `Send` nor `Sync`, so the call stays on the thread that opened it.
+- `Broker::suggest` in `src/enchant.rs` calls `enchant_dict_suggest`, copies
+  at most 32 UTF-8 strings, and frees that list once with the same
+  dictionary.
+- `Drop` for `Broker` in `src/enchant.rs` frees the dictionary, then the
+  broker. The library closes after those calls return.
 
 ## Review
 
@@ -170,7 +192,7 @@ Change `Cargo.lock` only in a change about dependencies.
 
 The direct dependencies are these, and no others.
 
-- `libc`, for `localtime_r` and for signal numbers.
+- `libc`, for `localtime_r`, for signal numbers, and for `dlopen` of Enchant.
 - `gtk`, package `gtk4`, feature `v4_12`.
 - `adw`, package `libadwaita`, feature `v1_5`.
 - `cairo-rs`, features `pdf` and `v1_16`. The crate name in code is `cairo`.
