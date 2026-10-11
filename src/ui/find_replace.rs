@@ -415,17 +415,19 @@ fn reload(win: &Win, report: &replace::Report) {
             return;
         };
         for id in &report.written {
-            if id.field() == Field::Body && win.editor_uuid.borrow().as_deref() == Some(id.uuid()) {
-                if let Ok(text) = project.text(id.uuid()) {
-                    win.editor.load(&text);
-                    win.dirty_text.set(false);
-                }
+            if id.field() == Field::Body
+                && win.editor_uuid.borrow().as_deref() == Some(id.uuid())
+                && let Ok(text) = project.text(id.uuid())
+            {
+                win.editor.load(&text);
+                win.dirty_text.set(false);
             }
-            if id.field() == Field::Notes && win.inspector.uuid().as_deref() == Some(id.uuid()) {
-                if let Ok(notes) = project.notes(id.uuid()) {
-                    win.notes.load(&notes);
-                    win.dirty_notes.set(false);
-                }
+            if id.field() == Field::Notes
+                && win.inspector.uuid().as_deref() == Some(id.uuid())
+                && let Ok(notes) = project.notes(id.uuid())
+            {
+                win.notes.load(&notes);
+                win.dirty_notes.set(false);
             }
         }
         win.index_project(project);

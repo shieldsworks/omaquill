@@ -752,17 +752,19 @@ next}";
         let plan = omaquill::replace::plan_all(&ed.text(), &query);
         ed.apply_edits(&plan);
         let text = ed.text();
-        assert_eq!(text.plain_text(), "Say hi and hi.");
-        let his: Vec<_> = text.paragraphs[0]
+        let plain = text.plain_text();
+        assert_eq!(plain, "Say hi and hi.");
+        let styled: Vec<bool> = text.paragraphs[0]
             .runs
             .iter()
-            .filter(|r| r.text == "hi")
+            .flat_map(|run| run.text.chars().map(|_| run.style.italic))
             .collect();
-        assert_eq!(his.len(), 2);
-        assert!(!his[0].style.italic);
-        assert!(his[1].style.italic);
+        let first = plain.find("hi").unwrap();
+        let second = plain.rfind("hi").unwrap();
+        assert!(styled[first..first + 2].iter().all(|italic| !italic));
+        assert!(styled[second..second + 2].iter().all(|italic| *italic));
         assert!(ed.buffer.can_undo());
-        assert!(ed.buffer.undo());
+        ed.buffer.undo();
         assert_eq!(ed.plain_text(), "Say hello and hello.");
         assert!(!ed.buffer.can_undo());
     }

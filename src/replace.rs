@@ -156,7 +156,7 @@ impl CharRange {
         self.end
     }
 
-    pub fn len(self) -> usize {
+    fn len(self) -> usize {
         self.end - self.start
     }
 }
@@ -308,12 +308,6 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
     let mut edit_ix = 0;
     while i < total {
         if let Some(edit) = plan.edits.get(edit_ix)
-            && (edit.range.start < i || edit.range.end > total)
-        {
-            edit_ix += 1;
-            continue;
-        }
-        if let Some(edit) = plan.edits.get(edit_ix)
             && edit.range.start == i
         {
             emit_replacement(&mut paras, edit);
@@ -327,9 +321,6 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
             .map(|e| e.range.start)
             .unwrap_or(total);
         emit_source(&mut paras, &atoms, i, limit);
-        if limit <= i {
-            break;
-        }
         i = limit;
     }
     Some(RichText {
@@ -856,7 +847,7 @@ fn emit_replacement(paras: &mut Vec<Paragraph>, edit: &Edit) {
     }
 }
 
-fn push_chars(paras: &mut Vec<Paragraph>, text: &str, style: &CharStyle) {
+fn push_chars(paras: &mut [Paragraph], text: &str, style: &CharStyle) {
     if text.is_empty() {
         return;
     }
@@ -1169,10 +1160,14 @@ mod tests {
 
     #[test]
     fn paragraph_break_keeps_the_start_paragraph_style() {
-        let mut center = ParaStyle::default();
-        center.align = Align::Center;
-        let mut left = ParaStyle::default();
-        left.align = Align::Left;
+        let center = ParaStyle {
+            align: Align::Center,
+            ..ParaStyle::default()
+        };
+        let left = ParaStyle {
+            align: Align::Left,
+            ..ParaStyle::default()
+        };
         let italic = CharStyle {
             italic: true,
             ..CharStyle::default()
@@ -1228,7 +1223,7 @@ mod tests {
     fn zero_width_match_is_dropped() {
         let text = RichText::from_plain("banana");
         let q = query(
-            "(?=a)",
+            "^",
             "x",
             Options {
                 mode: Mode::Regex,
@@ -1237,12 +1232,22 @@ mod tests {
         )
         .unwrap();
         assert!(plan_all(&text, &q).is_empty());
+        let look = Options {
+            mode: Mode::Regex,
+            ..Options::default()
+        };
+        assert!(matches!(
+            query("(?=a)", "x", look),
+            Err(QueryError::Pattern(_))
+        ));
     }
 
     #[test]
     fn newline_in_the_replacement_copies_the_start_paragraph_style() {
-        let mut center = ParaStyle::default();
-        center.align = Align::Center;
+        let center = ParaStyle {
+            align: Align::Center,
+            ..ParaStyle::default()
+        };
         let text = RichText {
             paragraphs: vec![Paragraph {
                 style: center,

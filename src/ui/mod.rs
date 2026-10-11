@@ -785,7 +785,7 @@ impl Win {
                 w.editor.show_find();
             }
         });
-        simple("replace", |w| find_replace::present(w));
+        simple("replace", find_replace::present);
         simple("project-search", |w| {
             w.outer.set_show_sidebar(true);
             w.binder.search.grab_focus();
