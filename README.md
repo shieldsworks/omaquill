@@ -134,6 +134,7 @@ you switch documents or close.
 | Ctrl+F | Find in the document |
 | Ctrl+Shift+F | Search the whole project |
 | F11 | Composition mode: full screen, just the text (Esc leaves) |
+| F7 | Turn spelling marks on or off |
 | Ctrl+1 / 2 / 3 | Text / corkboard / outliner |
 | Ctrl+Alt+K / J | Move the item up / down |
 | Ctrl+Alt+L / H | Indent / outdent (into the item above / out of its folder) |
