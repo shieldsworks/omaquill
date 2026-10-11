@@ -570,34 +570,40 @@ fn read_only_document_stays_byte_for_byte() {
 #[test]
 fn disk_full_backup_leaves_the_project() {
     if std::env::var_os("OMAQUILL_FULL_READY").is_none() {
-        let status = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "--"])
-            .arg(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("disk_full_backup_leaves_the_project")
-            .arg("--test-threads=1")
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "disk_full_backup_leaves_the_project",
+                "--test-threads=1",
+            ])
             .env("OMAQUILL_FULL_READY", "1")
             .status()
             .unwrap();
         assert!(status.success());
         return;
     }
-    let mount = PathBuf::from("/tmp/omaquill-full");
-    let _ = std::fs::remove_dir_all(&mount);
-    std::fs::create_dir_all(&mount).unwrap();
-    let mounted = std::process::Command::new("mount")
-        .args(["-t", "tmpfs", "-o", "size=4k", "tmpfs"])
-        .arg(&mount)
-        .status()
-        .unwrap();
-    assert!(mounted.success());
     let copy = copy_fixture("full");
+    std::fs::write(copy.0.join("pad.bin"), vec![0xA5u8; 64 * 1024]).unwrap();
     let before = file_bytes(&copy.0);
+    // The limit is process-wide, so this runs in the child above. Past the
+    // limit the kernel raises SIGXFSZ, whose default action kills the
+    // process. Ignoring it makes the zip write return EFBIG.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+    }
+    let limit = libc::rlimit {
+        rlim_cur: 4096,
+        rlim_max: 4096,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) };
+    assert_eq!(rc, 0);
+    let backups = copy.0.parent().unwrap().join("backups");
     let mut project = Project::open(&copy.0).unwrap();
     let query = literal("Mara", "Marian");
     let preview = replace::preview(&project, &query).unwrap();
-    let err = replace::apply(&mut project, &mount, 2, &preview, &preview.ids()).unwrap_err();
+    let err = replace::apply(&mut project, &backups, 2, &preview, &preview.ids()).unwrap_err();
     assert!(matches!(err, ApplyError::Backup(_)), "{err}");
+    assert!(err.to_string().contains("File too large"), "{err}");
     assert_eq!(file_bytes(&copy.0), before);
     assert!(
         std::fs::read(project.data_dir(SCENE).join("content.rtf"))
