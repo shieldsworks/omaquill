@@ -56,23 +56,65 @@ fn read_kv(path: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// `Ok(None)` means there is nothing to merge: the file is missing, not
-/// text, empty, or has no keys. The save writes every in-memory key.
-/// Any other read error is returned. An empty map here would drop every
-/// key this save does not change, including after a failed read.
-fn disk_map(path: &Path) -> std::io::Result<Option<BTreeMap<String, String>>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
+enum Disk {
+    Missing,
+    Empty,
+    NotUtf8,
+    NoKeys,
+    Keys(BTreeMap<String, String>),
+}
+
+fn read_disk(path: &Path) -> std::io::Result<Disk> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Disk::Missing),
         Err(e) => return Err(e),
     };
-    let parsed = parse_kv(&text);
-    if parsed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(parsed))
+    if bytes.is_empty() {
+        return Ok(Disk::Empty);
     }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(Disk::NotUtf8);
+    };
+    let parsed = parse_kv(text);
+    if parsed.is_empty() {
+        Ok(Disk::NoKeys)
+    } else {
+        Ok(Disk::Keys(parsed))
+    }
+}
+
+/// `rename` replaces an existing name. A link fails instead, so a backup
+/// already on disk stays.
+fn park_unparsed(path: &Path) -> std::io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "settings path includes a file name",
+        )
+    })?;
+    let name = name.to_string_lossy();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for n in 0..10_000u32 {
+        let backup = if n == 0 {
+            format!("{name}.bad-{stamp}")
+        } else {
+            format!("{name}.bad-{stamp}-{n}")
+        };
+        let dest = path.with_file_name(&backup);
+        match std::fs::hard_link(path, &dest) {
+            Ok(()) => return std::fs::remove_file(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "settings backup name is taken",
+    ))
 }
 
 fn write_kv(path: &Path, header: &str, kv: &BTreeMap<String, String>) -> std::io::Result<()> {
@@ -218,18 +260,22 @@ impl Settings {
     }
 
     /// Re-reads a loaded file and writes keys that differ from that load.
-    /// A value built in memory, or a file with nothing to merge, writes every key.
+    /// A missing or empty file, or a value built in memory, writes every key.
+    /// Invalid UTF-8, or a non-empty file with no keys, is moved to
+    /// `<name>.bad-<timestamp>` and then replaced. A name already there
+    /// gets `-<n>` after the timestamp.
     /// A busy lock or a file this process cannot read returns an error and
     /// leaves the file as it was.
     pub fn save_to(&mut self, path: &Path) -> std::io::Result<()> {
         let _lock = settings_lock(path)?;
         let mine = self.to_kv();
-        let (kv, next) = match &self.origin {
-            Origin::Loaded(loaded) => match disk_map(path)? {
-                Some(disk) => overlay_changes(&disk, loaded, &mine),
-                None => (mine.clone(), mine.clone()),
-            },
-            Origin::Fresh => (mine.clone(), mine),
+        let disk = read_disk(path)?;
+        if matches!(disk, Disk::NotUtf8 | Disk::NoKeys) {
+            park_unparsed(path)?;
+        }
+        let (kv, next) = match (&self.origin, &disk) {
+            (Origin::Loaded(loaded), Disk::Keys(map)) => overlay_changes(map, loaded, &mine),
+            _ => (mine.clone(), mine),
         };
         write_kv(path, SETTINGS_HEADER, &kv)?;
         self.origin = Origin::Loaded(next);
@@ -856,6 +902,58 @@ mod tests {
         let backup = backup_with(dir.as_path(), b"future_layout");
         assert_eq!(std::fs::read(&backup).unwrap(), original);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_file_is_replaced_with_no_backup() {
+        let dir = temp_dir("empty-file");
+        let path = dir.join("settings.conf");
+        std::fs::write(&path, b"").unwrap();
+        let mut settings = Settings::load_from(&path);
+        settings.zoom = 2.0;
+        settings.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path).zoom, 2.0);
+        let names = dir_names(&dir);
+        assert!(names.iter().all(|n| !n.contains(".bad-")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_unparsed_save_does_not_replace_the_first_backup() {
+        let dir = temp_dir("two-bad");
+        let path = dir.join("settings.conf");
+        let first = b"future_layout columns\n";
+        std::fs::write(&path, first).unwrap();
+        let mut settings = Settings::load_from(&path);
+        settings.spellcheck = false;
+        settings.save_to(&path).unwrap();
+        let second = b"\xfffuture_layout still here";
+        std::fs::write(&path, second).unwrap();
+        settings.author = "Casey".into();
+        settings.save_to(&path).unwrap();
+        let names = dir_names(&dir);
+        let backups: Vec<_> = names.iter().filter(|n| n.contains(".bad-")).collect();
+        assert_eq!(backups.len(), 2, "{names:?}");
+        let bodies: Vec<Vec<u8>> = backups
+            .iter()
+            .map(|n| std::fs::read(dir.join(n)).unwrap())
+            .collect();
+        assert!(bodies.contains(&first.to_vec()), "{names:?}");
+        assert!(bodies.contains(&second.to_vec()), "{names:?}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("author = Casey"), "{text}");
+        assert!(text.contains("spellcheck = false"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     fn backup_with(dir: &Path, needle: &[u8]) -> PathBuf {
