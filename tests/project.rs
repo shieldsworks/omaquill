@@ -336,42 +336,34 @@ fn backups_never_prune_another_projects() {
 fn a_pruned_same_second_name_is_not_reused() {
     let c = copy_fixture("prune-name");
     let dir = c.0.parent().unwrap().join("backups");
-    let stamp_of = |path: &Path| {
-        path.file_name()
-            .unwrap()
-            .to_string_lossy()
-            .chars()
-            .take(19)
-            .collect::<String>()
-    };
-    let count_of = |path: &Path| {
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let stem = name.strip_suffix(".zip").unwrap_or(&name).to_string();
-        stem.get(20..)
-            .and_then(|rest| rest.parse().ok())
-            .unwrap_or(1)
-    };
-    for _ in 0..30 {
-        let first = omaquill::project::backup(&c.0, &dir, 100).unwrap();
-        let second = omaquill::project::backup(&c.0, &dir, 100).unwrap();
-        if stamp_of(&first) != stamp_of(&second) {
-            continue;
-        }
-        std::fs::remove_file(&first).unwrap();
-        let third = omaquill::project::backup(&c.0, &dir, 100).unwrap();
-        if stamp_of(&third) != stamp_of(&second) {
-            continue;
-        }
-        assert!(
-            count_of(&third) > count_of(&second),
-            "pruned {} came back as {}",
-            first.display(),
-            third.display()
-        );
-        assert!(second.is_file());
-        return;
+    let now = "2026-01-02 03:04:05 -0700";
+    let stamp = "2026-01-02 03-04-05";
+    let expected = [
+        format!("{stamp}.zip"),
+        format!("{stamp} 2.zip"),
+        format!("{stamp} 3.zip"),
+    ];
+    let mut made = Vec::new();
+    for name in &expected {
+        let path = omaquill::project::backup_at(&c.0, &dir, 100, now).unwrap();
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), *name);
+        made.push((path.clone(), std::fs::read(&path).unwrap()));
     }
-    panic!("thirty tries never placed three backups in one second");
+    let names: std::collections::HashSet<_> = made.iter().map(|(path, _)| path.clone()).collect();
+    assert_eq!(names.len(), 3);
+    for (path, bytes) in &made {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+    std::fs::remove_file(&made[0].0).unwrap();
+    let fourth = omaquill::project::backup_at(&c.0, &dir, 100, now).unwrap();
+    assert_eq!(
+        fourth.file_name().unwrap().to_string_lossy(),
+        format!("{stamp} 4.zip")
+    );
+    assert!(!made[0].0.exists());
+    for (path, bytes) in &made[1..] {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
 }
 
 #[test]

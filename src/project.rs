@@ -962,6 +962,12 @@ impl Project {
 /// newest `keep` there. A free function so it can run on another thread
 /// while the project is open.
 pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
+    backup_at(path, dir, keep, &timestamp())
+}
+
+/// [`backup`] with `now` in place of the clock. `now` has the shape
+/// [`timestamp`] returns.
+pub fn backup_at(path: &Path, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -970,8 +976,7 @@ pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
     let id = &sha1::hex(full.to_string_lossy().as_bytes())[..8];
     let dir = dir.join(format!("{name}-{id}"));
     std::fs::create_dir_all(&dir)?;
-    let stamp = timestamp().replace(':', "-");
-    let stamp = stamp.split(' ').take(2).collect::<Vec<_>>().join(" ");
+    let stamp = backup_stamp(now);
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = dir.join(format!(
         ".backup.{}-{}.omaquill-tmp",
@@ -1091,6 +1096,11 @@ fn publish_backup(dir: &Path, stamp: &str, tmp: &Path) -> Result<PathBuf> {
         let _ = d.sync_all();
     }
     linked
+}
+
+fn backup_stamp(now: &str) -> String {
+    let dashed = now.replace(':', "-");
+    dashed.split(' ').take(2).collect::<Vec<_>>().join(" ")
 }
 
 fn backup_order(name: &str) -> Option<(String, u32)> {
