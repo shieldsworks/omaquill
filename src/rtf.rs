@@ -219,6 +219,7 @@ struct State {
     face_italic: bool,
     /// `\tqr` and friends: the kind of the next `\tx`.
     tab_kind: char,
+    after_star: bool,
 }
 
 struct Reader<'a> {
@@ -262,6 +263,7 @@ pub fn parse(src: &[u8]) -> RichText {
             face_bold: false,
             face_italic: false,
             tab_kind: 'l',
+            after_star: false,
         },
         fonts: Vec::new(),
         font_names: std::collections::HashMap::new(),
@@ -281,6 +283,142 @@ pub fn parse(src: &[u8]) -> RichText {
     };
     r.run();
     r.out
+}
+
+enum Effect {
+    Keep,
+    SkipQuiet,
+    Skip(&'static str),
+    Name(&'static str),
+    Unknown,
+}
+
+fn effect(word: &str) -> Effect {
+    if kept(word) {
+        return Effect::Keep;
+    }
+    match word {
+        "expandedcolortbl" => Effect::SkipQuiet,
+        "footnote" => Effect::Skip("footnotes"),
+        "endnote" => Effect::Skip("endnotes"),
+        "annotation" | "atnid" | "atnauthor" | "comment" => Effect::Skip("comments"),
+        "pict" | "NeXTGraphic" | "object" | "shp" | "shppict" | "nonshppict" => {
+            Effect::Skip("images")
+        }
+        "listtable" | "list" | "listoverridetable" => Effect::Skip("lists"),
+        "ls" => Effect::Name("lists"),
+        "trowd" | "intbl" => Effect::Name("tables"),
+        "stylesheet" => Effect::Skip("paragraph styles"),
+        "s" => Effect::Name("paragraph styles"),
+        "bkmkstart" | "bkmkend" => Effect::Skip("bookmarks"),
+        "header" | "headerl" | "headerr" | "headerf" => Effect::Skip("headers"),
+        "footer" | "footerl" | "footerr" | "footerf" => Effect::Skip("footers"),
+        "xe" => Effect::Skip("index entries"),
+        "tc" => Effect::Skip("contents entries"),
+        "Scrv" | "Scrvannot" => Effect::Name("inline annotations"),
+        "deleted" => Effect::Name("revisions"),
+        "info" => Effect::Skip("document properties"),
+        "revtbl" | "xmlnstbl" | "themedata" | "colorschememapping" | "latentstyles"
+        | "datastore" => Effect::Skip("other markup"),
+        _ => Effect::Unknown,
+    }
+}
+
+fn kept(word: &str) -> bool {
+    matches!(
+        word,
+        "rtf"
+            | "ansi"
+            | "ansicpg"
+            | "mac"
+            | "cocoartf"
+            | "cocoatextscaling"
+            | "cocoaplatform"
+            | "fonttbl"
+            | "f"
+            | "fnil"
+            | "fcharset"
+            | "froman"
+            | "fswiss"
+            | "fmodern"
+            | "fscript"
+            | "fdecor"
+            | "fbidi"
+            | "fprq"
+            | "colortbl"
+            | "red"
+            | "green"
+            | "blue"
+            | "field"
+            | "fldinst"
+            | "fldrslt"
+            | "listtext"
+            | "pard"
+            | "pardirnatural"
+            | "partightenfactor"
+            | "tqr"
+            | "tqc"
+            | "tqdec"
+            | "tx"
+            | "ql"
+            | "qc"
+            | "qr"
+            | "qj"
+            | "qnatural"
+            | "fi"
+            | "li"
+            | "ri"
+            | "sb"
+            | "sa"
+            | "sl"
+            | "slmult"
+            | "plain"
+            | "fs"
+            | "fsmilli"
+            | "b"
+            | "i"
+            | "ul"
+            | "uld"
+            | "uldb"
+            | "ulw"
+            | "ulth"
+            | "ulnone"
+            | "ulc"
+            | "strike"
+            | "striked"
+            | "strikec"
+            | "cf"
+            | "cb"
+            | "highlight"
+            | "chcbpat"
+            | "super"
+            | "sub"
+            | "nosupersub"
+            | "up"
+            | "dn"
+            | "uc"
+            | "u"
+            | "par"
+            | "line"
+            | "tab"
+            | "cell"
+            | "row"
+            | "page"
+            | "sect"
+            | "emdash"
+            | "endash"
+            | "emspace"
+            | "enspace"
+            | "bullet"
+            | "lquote"
+            | "rquote"
+            | "ldblquote"
+            | "rdblquote"
+            | "ilvl"
+            | "itap"
+            | "cellx"
+            | "lastrow"
+    )
 }
 
 impl Reader<'_> {
@@ -467,7 +605,7 @@ impl Reader<'_> {
                 }
                 b'*' => {
                     self.flush();
-                    self.st.dest = Dest::Skip;
+                    self.st.after_star = true;
                 }
                 b'~' => self.char('\u{a0}'),
                 b'_' => self.char('\u{2011}'),
@@ -543,55 +681,47 @@ impl Reader<'_> {
                 }
                 return;
             }
-            Dest::Skip => {
-                // Images and notes hide in \* groups too (\shppict).
-                match word {
-                    "pict" | "NeXTGraphic" | "object" | "shp" => self.lossy("images"),
-                    "annotation" => self.lossy("comments"),
-                    "listtable" | "list" => self.lossy("lists"),
-                    "fldinst" => {
-                        self.fldinst.clear();
-                        self.st.dest = Dest::FldInst;
-                    }
-                    _ => {}
+            Dest::Skip => return,
+            Dest::Text | Dest::ListText => {}
+        }
+        let after_star = std::mem::replace(&mut self.st.after_star, false);
+        match effect(word) {
+            Effect::Keep => {}
+            Effect::SkipQuiet => {
+                self.flush();
+                self.st.dest = Dest::Skip;
+                return;
+            }
+            Effect::Skip(name) => {
+                self.flush();
+                self.lossy(name);
+                self.st.dest = Dest::Skip;
+                return;
+            }
+            Effect::Name(name) => {
+                self.lossy(name);
+                return;
+            }
+            Effect::Unknown => {
+                self.lossy("other markup");
+                // `\*` means an unknown destination is skipped. A bare
+                // unknown control loses the control and keeps the words.
+                if after_star {
+                    self.flush();
+                    self.st.dest = Dest::Skip;
                 }
                 return;
             }
-            Dest::Text | Dest::ListText => {}
         }
         match word {
-            // Header and destinations.
             "ansicpg" => self.codepage = n as u32,
             "mac" => self.codepage = 10000,
             "fonttbl" => self.st.dest = Dest::FontTable,
             "colortbl" => self.st.dest = Dest::ColorTable,
-            "stylesheet" | "info" | "header" | "headerl" | "headerr" | "headerf" | "footer"
-            | "footerl" | "footerr" | "footerf" | "listtable" | "listoverridetable" | "revtbl"
-            | "xmlnstbl" | "themedata" | "colorschememapping" | "latentstyles" | "datastore" => {
-                self.flush();
-                self.st.dest = Dest::Skip;
-            }
-            "pict" | "NeXTGraphic" | "object" | "shp" | "nonshppict" => {
-                self.flush();
-                self.lossy("images");
-                self.st.dest = Dest::Skip;
-            }
-            "footnote" => {
-                self.flush();
-                self.lossy("footnotes");
-                self.st.dest = Dest::Skip;
-            }
-            "annotation" | "atnid" | "atnauthor" => {
-                self.flush();
-                self.lossy("comments");
-                self.st.dest = Dest::Skip;
-            }
             "listtext" => {
                 self.flush();
                 self.st.dest = Dest::ListText;
             }
-            "trowd" => self.lossy("tables"),
-            "ls" => self.lossy("lists"),
             "fldinst" => {
                 self.flush();
                 self.fldinst.clear();
@@ -601,7 +731,6 @@ impl Reader<'_> {
                 self.flush();
                 self.st.ch.link = self.field_link.take();
             }
-            "Scrv" | "Scrvannot" => self.lossy("inline annotations"),
             // Unicode.
             "uc" => self.st.uc = n.max(0) as usize,
             "u" => {
@@ -1479,8 +1608,8 @@ mod tests {
 
     #[test]
     fn starred_table_row_keeps_the_cells_and_names_the_table() {
-        let t = parse(br"{\rtf1 before{\*\trowd\cellx4320 inside\cell}\row after}");
-        assert_eq!(t.plain_text(), "before inside\n after");
+        let t = parse(br"{\rtf1 before {\*\trowd\cellx4320 inside\cell}\row after}");
+        assert_eq!(t.plain_text(), "before inside\nafter");
         assert_eq!(t.lossy, vec!["tables"]);
     }
 
