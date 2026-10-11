@@ -351,14 +351,17 @@ fn a_pruned_same_second_name_is_not_reused() {
             .and_then(|rest| rest.parse().ok())
             .unwrap_or(1)
     };
-    for _ in 0..5 {
-        let first = omaquill::project::backup(&c.0, &dir, 10).unwrap();
-        let second = omaquill::project::backup(&c.0, &dir, 10).unwrap();
+    for _ in 0..30 {
+        let first = omaquill::project::backup(&c.0, &dir, 100).unwrap();
+        let second = omaquill::project::backup(&c.0, &dir, 100).unwrap();
         if stamp_of(&first) != stamp_of(&second) {
             continue;
         }
         std::fs::remove_file(&first).unwrap();
-        let third = omaquill::project::backup(&c.0, &dir, 10).unwrap();
+        let third = omaquill::project::backup(&c.0, &dir, 100).unwrap();
+        if stamp_of(&third) != stamp_of(&second) {
+            continue;
+        }
         assert!(
             count_of(&third) > count_of(&second),
             "pruned {} came back as {}",
@@ -368,7 +371,7 @@ fn a_pruned_same_second_name_is_not_reused() {
         assert!(second.is_file());
         return;
     }
-    panic!("five tries never placed two backups in one second");
+    panic!("thirty tries never placed three backups in one second");
 }
 
 #[test]
