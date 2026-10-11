@@ -1,14 +1,5 @@
-//! Enchant 2, loaded at runtime with `dlopen`.
-//!
-//! The library is `libenchant-2.so.2`. omaquill does not link it, so a
-//! build machine without Enchant still compiles, and a missing library
-//! turns spelling off. The calls used here only look words up. Adding a
-//! word to the author's dictionary is omaquill's own file, not
+//! Adding a word to the author's dictionary is omaquill's own file, not
 //! `enchant_dict_add`, which would write Enchant's personal list.
-//!
-//! Every Enchant `unsafe` block is in this file. `Broker` is the only public
-//! item and its fields are private, so no code outside this file can reach
-//! an Enchant pointer.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::mem::transmute;
@@ -16,19 +7,16 @@ use std::ptr::NonNull;
 
 use crate::spell;
 
-/// Enchant's `EnchantBroker`. Only ever behind a pointer.
 #[repr(C)]
 struct EnchantBroker {
     _opaque: [u8; 0],
 }
 
-/// Enchant's `EnchantDict`. Only ever behind a pointer.
 #[repr(C)]
 struct EnchantDict {
     _opaque: [u8; 0],
 }
 
-// Each doc line is the declaration in Enchant 2's `enchant.h`.
 /// `EnchantBroker *enchant_broker_init (void);`
 type InitFn = unsafe extern "C" fn() -> *mut EnchantBroker;
 /// `void enchant_broker_free (EnchantBroker *broker);`
@@ -45,10 +33,8 @@ type SuggestFn =
 /// `void enchant_dict_free_string_list (EnchantDict *dict, char **string_list);`
 type FreeStringListFn = unsafe extern "C" fn(*mut EnchantDict, *mut *mut c_char);
 
-/// Suggestions copied out of one `enchant_dict_suggest` list.
 const MAX_SUGGESTIONS: usize = 32;
 
-/// One successful `dlopen` of Enchant. Dropping it is the matching `dlclose`.
 struct Handle(NonNull<c_void>);
 
 impl Drop for Handle {
@@ -66,7 +52,6 @@ impl Drop for Handle {
     }
 }
 
-/// The Enchant 2 entry points omaquill calls, resolved from `handle`.
 struct Library {
     init: InitFn,
     free_broker: FreeBrokerFn,
@@ -83,7 +68,6 @@ struct Library {
 }
 
 impl Library {
-    /// `None` when the library or one of its symbols is missing.
     fn open() -> Option<Library> {
         // SAFETY: The soname and every symbol name are `c""` literals, so
         // each is NUL-terminated. `dlopen` returns null when Enchant 2 is not
@@ -131,16 +115,12 @@ impl Library {
     }
 }
 
-/// A word in the form Enchant's `const char *word, ssize_t len` takes.
 struct Word {
-    /// UTF-8, because it is built from a `&str`. No interior NUL.
     text: CString,
-    /// Byte length of `text` without the trailing NUL.
     len: isize,
 }
 
 impl Word {
-    /// `None` for an interior NUL, or a length past `isize::MAX`.
     fn new(word: &str) -> Option<Word> {
         let text = CString::new(word).ok()?;
         let len = isize::try_from(text.as_bytes().len()).ok()?;
