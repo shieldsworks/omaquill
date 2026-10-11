@@ -1688,6 +1688,7 @@ fn gtk_checks() {
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();
+    editor::tests::replace_all_refuses_a_loaded_image();
     editor::tests::empty_paragraphs_keep_their_style_and_lines_align_alone();
     editor::tests::a_spelling_mark_is_not_saved();
     spell::tests::keystroke_on_a_long_buffer();

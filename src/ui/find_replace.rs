@@ -214,6 +214,9 @@ pub fn present(win: &Rc<Win>) {
             };
             match outcome {
                 Ok(ApplyOutcome::NothingToDo) => win.toast("Nothing to replace"),
+                Ok(ApplyOutcome::SkippedOnly(skipped)) => {
+                    win.toast(&replace::skipped_lines(&skipped));
+                }
                 Ok(ApplyOutcome::Done(report)) => {
                     let n = report.written.len();
                     reload(&win, &report);

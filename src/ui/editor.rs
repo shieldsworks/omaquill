@@ -35,6 +35,8 @@ pub struct Editor {
     default_tags: RefCell<Vec<String>>,
     loading: Cell<bool>,
     inserting: Cell<bool>,
+    /// Features the file on disk would lose if this buffer were written back.
+    lossy: RefCell<Vec<&'static str>>,
     changed: RefCell<Vec<Box<dyn Fn()>>>,
     formatting: RefCell<Vec<FormattingCallback>>,
     cursor: RefCell<Vec<Box<dyn Fn()>>>,
@@ -98,6 +100,7 @@ impl Editor {
             default_tags: RefCell::new(Vec::new()),
             loading: Cell::new(false),
             inserting: Cell::new(false),
+            lossy: RefCell::new(Vec::new()),
             changed: RefCell::new(Vec::new()),
             formatting: RefCell::new(Vec::new()),
             cursor: RefCell::new(Vec::new()),
@@ -214,6 +217,7 @@ impl Editor {
     }
 
     pub fn load(&self, text: &RichText) {
+        *self.lossy.borrow_mut() = text.lossy.clone();
         self.loading.set(true);
         rich::load(&self.buffer, text);
         self.loading.set(false);
@@ -241,6 +245,11 @@ impl Editor {
 
     pub fn text(&self) -> RichText {
         rich::save(&self.buffer)
+    }
+
+    /// Content the loaded file had that this buffer does not.
+    pub fn lossy(&self) -> Vec<&'static str> {
+        self.lossy.borrow().clone()
     }
 
     pub fn plain_text(&self) -> String {
@@ -762,5 +771,37 @@ next}";
         ed.buffer.undo();
         assert_eq!(ed.plain_text(), "Say hello and hello.");
         assert!(!ed.buffer.can_undo());
+    }
+
+    pub(crate) fn replace_all_refuses_a_loaded_image() {
+        let ed = Editor::new(true);
+        let image = rtf::parse(br"{\rtf1\ansi\pard alpha {\pict\pngblip deadbeef} beta}");
+        ed.load(&image);
+        assert_eq!(ed.lossy(), ["images"]);
+        let query = omaquill::replace::query(
+            "alpha",
+            "omega",
+            omaquill::replace::Options {
+                case: omaquill::replace::Case::Sensitive,
+                word: omaquill::replace::Word::Any,
+                mode: omaquill::replace::Mode::Literal,
+            },
+        )
+        .unwrap();
+        let blocked = omaquill::replace::plan_document(&ed.lossy(), &ed.text(), &query);
+        assert!(
+            matches!(
+                blocked,
+                Err(omaquill::replace::ReplaceBlock::Lossy(ref reason))
+                    if reason.as_slice() == ["images"]
+            ),
+            "{blocked:?}"
+        );
+        assert!(ed.plain_text().contains("alpha"));
+        ed.load(&rtf::parse(br"{\rtf1\ansi\pard alpha beta}"));
+        assert!(ed.lossy().is_empty());
+        let plan = omaquill::replace::plan_document(&ed.lossy(), &ed.text(), &query).unwrap();
+        ed.apply_edits(&plan).unwrap();
+        assert_eq!(ed.plain_text(), "omega beta");
     }
 }
