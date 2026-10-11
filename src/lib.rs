@@ -8,6 +8,7 @@ pub mod pdf;
 pub mod project;
 pub mod rtf;
 pub mod sha1;
+pub mod spell;
 pub mod state;
 pub mod xml;
 pub mod zip;

@@ -533,3 +533,64 @@ fn media_extensions_are_plain_and_openable_types_are_few() {
         assert!(!is_openable(Path::new(no)), "{no}");
     }
 }
+
+fn tree_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let path = e.path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                out.push((rel, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    walk(dir, dir, &mut out);
+    out
+}
+
+#[test]
+fn checking_spelling_does_not_change_the_project() {
+    let c = copy_fixture("spell");
+    let before = tree_bytes(&c.0);
+    let project = Project::open(&c.0).unwrap();
+    let scene = project.text(SCENE).unwrap();
+    let plain = scene
+        .paragraphs
+        .iter()
+        .map(|p| p.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let policy = omaquill::spell::Policy {
+        hide_word_at_cursor: false,
+        ..omaquill::spell::Policy::default()
+    };
+    let _ =
+        omaquill::spell::bad_ranges(&plain, 0, plain.len(), None, &policy, &mut |w| w.len() > 1);
+    let _ = omaquill::spell::keystroke_marks(&plain, plain.len(), &policy, &mut |w| w.len() > 1);
+    let ignore = omaquill::state::ignore_path(&c.0);
+    let dictionary = omaquill::state::dictionary_path();
+    assert!(
+        !ignore.starts_with(&c.0),
+        "ignore list {} is inside the project",
+        ignore.display()
+    );
+    assert!(
+        !dictionary.starts_with(&c.0),
+        "dictionary {} is inside the project",
+        dictionary.display()
+    );
+    drop(project);
+    assert_eq!(before, tree_bytes(&c.0));
+}
