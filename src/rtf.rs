@@ -1392,4 +1392,163 @@ mod tests {
         );
         assert_eq!(word_count("  "), 0);
     }
+
+    #[test]
+    fn starred_footnote_is_named() {
+        let t = parse(br"{\rtf1 a{\*\footnote the note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["footnotes"]);
+    }
+
+    #[test]
+    fn starred_endnote_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\endnote the note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["endnotes"]);
+    }
+
+    #[test]
+    fn bare_endnote_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\endnote the note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["endnotes"]);
+    }
+
+    #[test]
+    fn starred_inline_annotation_is_named() {
+        let t = parse(br"{\rtf1 a{\*\Scrvannot note}b}");
+        assert_eq!(t.plain_text(), "anoteb");
+        assert_eq!(t.lossy, vec!["inline annotations"]);
+    }
+
+    #[test]
+    fn starred_comment_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\comment a note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["comments"]);
+    }
+
+    #[test]
+    fn starred_shppict_without_a_picture_is_named() {
+        let t = parse(br"{\rtf1 a{\*\shppict }b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["images"]);
+    }
+
+    #[test]
+    fn nonshppict_fallback_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\nonshppict fallback words}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["images"]);
+    }
+
+    #[test]
+    fn stylesheet_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\stylesheet{\s1 Heading;}}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["paragraph styles"]);
+    }
+
+    #[test]
+    fn paragraph_style_index_is_named() {
+        let t = parse(br"{\rtf1\s2 styled}");
+        assert_eq!(t.plain_text(), "styled");
+        assert_eq!(t.lossy, vec!["paragraph styles"]);
+    }
+
+    #[test]
+    fn bookmark_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\bkmkstart Chapter}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["bookmarks"]);
+    }
+
+    #[test]
+    fn header_text_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\header secret}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["headers"]);
+    }
+
+    #[test]
+    fn footer_text_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\footer secret}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["footers"]);
+    }
+
+    #[test]
+    fn starred_table_row_keeps_the_cells_and_names_the_table() {
+        let t = parse(br"{\rtf1 before{\*\trowd\cellx4320 inside\cell}\row after}");
+        assert_eq!(t.plain_text(), "before inside\n after");
+        assert_eq!(t.lossy, vec!["tables"]);
+    }
+
+    #[test]
+    fn intbl_without_a_row_is_named() {
+        let t = parse(br"{\rtf1\intbl cell}");
+        assert_eq!(t.plain_text(), "cell");
+        assert_eq!(t.lossy, vec!["tables"]);
+    }
+
+    #[test]
+    fn index_entry_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 before {\xe secret} after}");
+        assert_eq!(t.plain_text(), "before  after");
+        assert_eq!(t.lossy, vec!["index entries"]);
+    }
+
+    #[test]
+    fn contents_entry_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 before {\tc secret} after}");
+        assert_eq!(t.plain_text(), "before  after");
+        assert_eq!(t.lossy, vec!["contents entries"]);
+    }
+
+    #[test]
+    fn deleted_revision_is_named_and_the_words_stay() {
+        let t = parse(br"{\rtf1 before {\deleted gone} after}");
+        assert_eq!(t.plain_text(), "before gone after");
+        assert_eq!(t.lossy, vec!["revisions"]);
+    }
+
+    #[test]
+    fn unknown_starred_group_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\mystery secret}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["other markup"]);
+    }
+
+    #[test]
+    fn lighthouse_files_and_a_plain_scene_lose_nothing() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/Lighthouse.scriv");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rtf") {
+                    files.push(path);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        assert!(!files.is_empty());
+        for path in &files {
+            let text = parse(&std::fs::read(path).unwrap());
+            assert_eq!(text.lossy, Vec::<&str>::new(), "{}", path.display());
+        }
+        let scene = "{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n\
+\\cocoatextscaling0\\cocoaplatform0{\\fonttbl\\f0\\froman\\fcharset0 Palatino-Roman;}\n\
+{\\colortbl;\\red255\\green255\\blue255;}\n\
+{\\*\\expandedcolortbl;;}\n\
+\\pard\\tx720\\fi720\\sl360\\slmult1\\pardirnatural\\partightenfactor0\n\
+\n\
+\\f0\\fs24 \\cf0 The lamp stayed lit.}";
+        assert_eq!(parse(scene.as_bytes()).lossy, Vec::<&str>::new());
+        let written = parse(write(&RichText::from_plain("The lamp stayed lit.")).as_bytes());
+        assert_eq!(written.lossy, Vec::<&str>::new());
+    }
 }
