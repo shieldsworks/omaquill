@@ -7,9 +7,10 @@ pkgdesc='A free writing studio for authors and writers on Linux and Omarchy'
 arch=('x86_64' 'aarch64')
 url='https://github.com/shieldsworks/omaquill'
 license=('MIT')
-depends=('gtk4' 'libadwaita')
+depends=('gtk4' 'libadwaita' 'enchant')
 makedepends=('cargo' 'git')
-optdepends=('tex-gyre-fonts: close stand-ins for Palatino, Times and other Mac fonts')
+optdepends=('hunspell-en_us: English spelling dictionary'
+            'tex-gyre-fonts: close stand-ins for Palatino, Times and other Mac fonts')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 source=("git+$url.git")
