@@ -6,11 +6,13 @@
 //! ~/.config/omaquill/settings.conf          key = value
 //! ~/.local/state/omaquill/recent            one project path per line
 //! ~/.local/state/omaquill/projects/<id>     open item, expanded folders
+//! ~/.local/state/omaquill/projects/<id>.ignore
+//! ~/.local/state/omaquill/dictionary        words added from the editor
 //! ~/.local/state/omaquill/today.json        read by the bar widget
 //! ~/.local/share/omaquill/backups/          zipped projects
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn home() -> PathBuf {
@@ -73,6 +75,14 @@ pub struct Settings {
     pub backups: usize,
     /// The name Compile puts on title pages.
     pub author: String,
+    /// Red marks under misspelled words. F7 flips this and it is remembered.
+    pub spellcheck: bool,
+    /// Composition mode hides marks unless this is on.
+    pub spell_in_compose: bool,
+    /// Leave the word at the cursor unmarked until the cursor leaves it.
+    pub spell_hide_current: bool,
+    /// Empty follows the system locale. Otherwise an Enchant tag such as `en_GB`.
+    pub spell_language: String,
 }
 
 impl Default for Settings {
@@ -83,13 +93,44 @@ impl Default for Settings {
             daily_target: 0,
             backups: 10,
             author: String::new(),
+            spellcheck: true,
+            spell_in_compose: false,
+            spell_hide_current: true,
+            spell_language: String::new(),
         }
+    }
+}
+
+fn flag(kv: &BTreeMap<String, String>, key: &str, default: bool) -> bool {
+    match kv.get(key).map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => default,
     }
 }
 
 impl Settings {
     pub fn load() -> Settings {
-        let kv = read_kv(&config_dir().join("settings.conf"));
+        Self::load_from(&config_dir().join("settings.conf"))
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(&config_dir().join("settings.conf"))
+    }
+
+    pub fn load_from(path: &Path) -> Settings {
+        Settings::from_kv(&read_kv(path))
+    }
+
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        write_kv(
+            path,
+            "# omaquill settings; the Preferences window writes this file.\n",
+            &self.to_kv(),
+        )
+    }
+
+    fn from_kv(kv: &BTreeMap<String, String>) -> Settings {
         let d = Settings::default();
         Settings {
             zoom: kv
@@ -107,10 +148,14 @@ impl Settings {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.backups),
             author: kv.get("author").cloned().unwrap_or_default(),
+            spellcheck: flag(kv, "spellcheck", d.spellcheck),
+            spell_in_compose: flag(kv, "spell_in_compose", d.spell_in_compose),
+            spell_hide_current: flag(kv, "spell_hide_current", d.spell_hide_current),
+            spell_language: kv.get("spell_language").cloned().unwrap_or_default(),
         }
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
+    fn to_kv(&self) -> BTreeMap<String, String> {
         let mut kv = BTreeMap::new();
         kv.insert("zoom".into(), format!("{:.2}", self.zoom));
         kv.insert(
@@ -120,11 +165,22 @@ impl Settings {
         kv.insert("daily_target".into(), self.daily_target.to_string());
         kv.insert("backups".into(), self.backups.to_string());
         kv.insert("author".into(), self.author.clone());
-        write_kv(
-            &config_dir().join("settings.conf"),
-            "# omaquill settings; the Preferences window writes this file.\n",
-            &kv,
-        )
+        kv.insert("spellcheck".into(), bool_word(self.spellcheck));
+        kv.insert("spell_in_compose".into(), bool_word(self.spell_in_compose));
+        kv.insert(
+            "spell_hide_current".into(),
+            bool_word(self.spell_hide_current),
+        );
+        kv.insert("spell_language".into(), self.spell_language.clone());
+        kv
+    }
+}
+
+fn bool_word(on: bool) -> String {
+    if on {
+        "true".to_string()
+    } else {
+        "false".to_string()
     }
 }
 
@@ -156,9 +212,46 @@ pub struct ProjectView {
     pub expanded: Vec<String>,
 }
 
-fn project_file(project: &Path) -> PathBuf {
+fn project_id(project: &Path) -> String {
     let id = crate::sha1::hex(project.to_string_lossy().as_bytes());
-    state_dir().join("projects").join(&id[..16])
+    id[..16].to_string()
+}
+
+fn project_file(project: &Path) -> PathBuf {
+    state_dir().join("projects").join(project_id(project))
+}
+
+/// Words the author added from the editor. Outside every project.
+pub fn dictionary_path() -> PathBuf {
+    state_dir().join("dictionary")
+}
+
+/// Per-project words to skip. The file sits next to view state, not in the `.scriv`.
+pub fn ignore_path(project: &Path) -> PathBuf {
+    state_dir()
+        .join("projects")
+        .join(format!("{}.ignore", project_id(project)))
+}
+
+pub fn load_words(path: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+pub fn save_words(path: &Path, words: &BTreeSet<String>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut out = String::new();
+    for w in words {
+        out.push_str(w);
+        out.push('\n');
+    }
+    crate::project::write_atomic(path, out.as_bytes())
 }
 
 impl ProjectView {
@@ -341,5 +434,60 @@ mod tests {
         assert_eq!(json_field(&json, "manuscript").unwrap(), "450");
         assert_eq!(json_field(&json, "open").unwrap(), "true");
         assert_eq!(t.words(), 350);
+    }
+
+    #[test]
+    fn spellcheck_choices_survive_a_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "omaquill-settings-{}-{}.conf",
+            std::process::id(),
+            "spell"
+        ));
+        let fresh = Settings::load_from(&path);
+        assert!(fresh.spellcheck);
+        assert!(!fresh.spell_in_compose);
+        assert!(fresh.spell_hide_current);
+        assert!(fresh.spell_language.is_empty());
+        let saved = Settings {
+            spellcheck: false,
+            spell_in_compose: true,
+            spell_hide_current: false,
+            spell_language: "en_GB".into(),
+            ..Settings::default()
+        };
+        saved.save_to(&path).unwrap();
+        let back = Settings::load_from(&path);
+        assert!(!back.spellcheck);
+        assert!(back.spell_in_compose);
+        assert!(!back.spell_hide_current);
+        assert_eq!(back.spell_language, "en_GB");
+        assert_eq!(back.zoom, Settings::default().zoom);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_ignore_list_is_words_outside_the_project() {
+        let dir = std::env::temp_dir().join(format!("omaquill-words-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("project.ignore");
+        std::fs::write(&path, "Mara\n# note\n\nXYZ\n").unwrap();
+        let loaded = load_words(&path);
+        assert!(loaded.contains("mara"));
+        assert!(loaded.contains("xyz"));
+        assert!(!loaded.contains("note"));
+        let mut words = loaded;
+        words.insert("helo".into());
+        save_words(&path, &words).unwrap();
+        let again = load_words(&path);
+        assert!(again.contains("helo") && again.contains("mara"));
+        let project = dir.join("Book.scriv");
+        std::fs::create_dir_all(&project).unwrap();
+        let ignore = ignore_path(&project);
+        let dictionary = dictionary_path();
+        assert!(!ignore.starts_with(&project));
+        assert!(!dictionary.starts_with(&project));
+        assert_eq!(ignore.extension().and_then(|e| e.to_str()), Some("ignore"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
