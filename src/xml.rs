@@ -360,46 +360,91 @@ pub fn escape(s: &str) -> String {
 }
 
 pub fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let Some(end) = rest.find(';') else { break };
-        let entity = &rest[1..end];
-        let c = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            _ => {
-                let num = if let Some(hex) = entity.strip_prefix("#x") {
-                    u32::from_str_radix(hex, 16).ok()
-                } else if let Some(dec) = entity.strip_prefix('#') {
-                    dec.parse().ok()
-                } else {
-                    None
-                };
-                num.and_then(char::from_u32)
-            }
-        };
-        match c {
-            Some(c) => {
-                out.push(c);
-                rest = &rest[end + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
+    unescape_scanned(s).0
+}
+
+fn entity_char(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let num = if let Some(hex) = entity.strip_prefix("#x") {
+                u32::from_str_radix(hex, 16).ok()
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse().ok()
+            } else {
+                None
+            };
+            num.and_then(char::from_u32)
         }
     }
-    out.push_str(rest);
-    out
+}
+
+fn count_bytes(n: usize, scanned: &mut u64) {
+    *scanned += u64::try_from(n).expect("a byte length fits in u64");
+}
+
+fn semicolon_from(
+    bytes: &[u8],
+    from: usize,
+    cached: &mut Option<(usize, usize)>,
+    scanned: &mut u64,
+) -> Option<usize> {
+    if let Some((start, at)) = *cached
+        && from >= start
+        && from <= at
+    {
+        return (at < bytes.len()).then_some(at);
+    }
+    let (at, read) = match bytes[from..].iter().position(|&b| b == b';') {
+        Some(rel) => (from + rel, rel + 1),
+        None => (bytes.len(), bytes.len() - from),
+    };
+    count_bytes(read, scanned);
+    *cached = Some((from, at));
+    (at < bytes.len()).then_some(at)
+}
+
+fn unescape_scanned(s: &str) -> (String, u64) {
+    let bytes = s.as_bytes();
+    if !bytes.contains(&b'&') {
+        return (
+            s.to_string(),
+            u64::try_from(bytes.len()).expect("a byte length fits in u64"),
+        );
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut scanned = 0u64;
+    let mut i = 0usize;
+    let mut cached: Option<(usize, usize)> = None;
+    while i < bytes.len() {
+        let copied = match bytes[i..].iter().position(|&b| b == b'&') {
+            Some(rel) => i + rel,
+            None => bytes.len(),
+        };
+        if copied > i {
+            count_bytes(copied - i, &mut scanned);
+            out.push_str(&s[i..copied]);
+        }
+        if copied == bytes.len() {
+            break;
+        }
+        let Some(end) = semicolon_from(bytes, copied, &mut cached, &mut scanned) else {
+            out.push_str(&s[copied..]);
+            break;
+        };
+        if let Some(ch) = entity_char(&s[copied + 1..end]) {
+            out.push(ch);
+            i = end + 1;
+        } else {
+            out.push('&');
+            i = copied + 1;
+        }
+    }
+    (out, scanned)
 }
 
 impl Element {
@@ -703,6 +748,67 @@ mod tests {
     #[test]
     fn unescapes_numeric_entities() {
         assert_eq!(unescape("&#233;t&#xE9; &bogus; &"), "été &bogus; &");
+    }
+
+    #[test]
+    fn decodes_named_decimal_and_hex_entities() {
+        let cases = [
+            ("Fish &amp; Chips", "Fish & Chips"),
+            ("&lt;&gt;&quot;&apos;", "<>\"'"),
+            ("&#233;", "é"),
+            ("&#00065;", "A"),
+            ("&#xE9;", "é"),
+            ("&#xe9;", "é"),
+            ("&#x4A;", "J"),
+            ("&#x000041;", "A"),
+            ("&#X4A;", "&#X4A;"),
+            ("&#x10FFFF;", "\u{10FFFF}"),
+            ("&#x110000;", "&#x110000;"),
+            ("&#xD800;", "&#xD800;"),
+            ("&#x0;", "\0"),
+            ("&#0;", "\0"),
+            ("&#4294967296;", "&#4294967296;"),
+            ("&#4294967295;", "&#4294967295;"),
+            ("&;", "&;"),
+            ("&#x;", "&#x;"),
+            ("&#;", "&#;"),
+            ("&bogus;", "&bogus;"),
+            ("&amp", "&amp"),
+            ("&", "&"),
+            ("&&amp;", "&&"),
+            ("&&&&&amp;", "&&&&&"),
+            ("&bogus&amp;", "&bogus&"),
+            ("&amp&amp;", "&amp&"),
+            ("&#38;amp;", "&amp;"),
+            ("&#x26;lt;", "&lt;"),
+            ("&#233;t&#xE9; &bogus; &", "été &bogus; &"),
+            ("plain", "plain"),
+            ("a &amp; b &lt; c", "a & b < c"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(unescape(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn ampersand_run_before_one_semicolon_reads_linearly() {
+        let title = format!("{};", "&".repeat(200_000));
+        let (text, bytes_read) = unescape_scanned(&title);
+        assert_eq!(text, title);
+        let len = u64::try_from(title.len()).unwrap();
+        assert!(bytes_read >= len, "read {bytes_read} of {len}");
+        let limit = len * 3;
+        assert!(
+            bytes_read <= limit,
+            "read {bytes_read} bytes of a {len}-byte title, limit {limit}"
+        );
+
+        let xml = format!("<BinderItem Type=\"Text\"><Title>{title}</Title></BinderItem>");
+        let doc = parse(&xml).unwrap();
+        assert_eq!(
+            doc.root.child_text("Title").as_deref(),
+            Some(title.as_str())
+        );
     }
 
     #[test]
