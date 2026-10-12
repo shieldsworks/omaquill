@@ -389,52 +389,67 @@ fn count_bytes(n: usize, scanned: &mut u64) {
     *scanned += u64::try_from(n).expect("a byte length fits in u64");
 }
 
-/// Bytes a forward search reads, including the matched byte. A miss reads
-/// the whole haystack.
-fn find_counted(s: &str, byte: u8, scanned: &mut u64) -> Option<usize> {
-    match s.as_bytes().iter().position(|&b| b == byte) {
-        Some(i) => {
-            count_bytes(i + 1, scanned);
-            Some(i)
-        }
-        None => {
-            count_bytes(s.len(), scanned);
-            None
-        }
+/// The `;` at or after `from`. A failed entity resumes one byte later and
+/// still ends at this same semicolon, so a later index in the scanned span
+/// does not search again.
+fn semicolon_from(
+    bytes: &[u8],
+    from: usize,
+    cached: &mut Option<(usize, usize)>,
+    scanned: &mut u64,
+) -> Option<usize> {
+    if let Some((start, at)) = *cached
+        && from >= start
+        && from <= at
+    {
+        return (at < bytes.len()).then_some(at);
     }
+    let (at, read) = match bytes[from..].iter().position(|&b| b == b';') {
+        Some(rel) => (from + rel, rel + 1),
+        None => (bytes.len(), bytes.len() - from),
+    };
+    count_bytes(read, scanned);
+    *cached = Some((from, at));
+    (at < bytes.len()).then_some(at)
 }
 
-/// Decodes entities and reports how many bytes the `&` and `;` searches read.
-/// An unknown or unterminated entity stays literal. The search continues at
-/// the byte after `&`, so `&&amp;` is still `&&`.
+/// Returns the decoded text and how many bytes the copy and the `;` search read.
 fn unescape_scanned(s: &str) -> (String, u64) {
-    if !s.contains('&') {
+    let bytes = s.as_bytes();
+    if !bytes.contains(&b'&') {
         return (
             s.to_string(),
-            u64::try_from(s.len()).expect("a byte length fits in u64"),
+            u64::try_from(bytes.len()).expect("a byte length fits in u64"),
         );
     }
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
     let mut scanned = 0u64;
-    while let Some(i) = find_counted(rest, b'&', &mut scanned) {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let Some(end) = find_counted(rest, b';', &mut scanned) else {
+    let mut i = 0usize;
+    let mut cached: Option<(usize, usize)> = None;
+    while i < bytes.len() {
+        let copied = match bytes[i..].iter().position(|&b| b == b'&') {
+            Some(rel) => i + rel,
+            None => bytes.len(),
+        };
+        if copied > i {
+            count_bytes(copied - i, &mut scanned);
+            out.push_str(&s[i..copied]);
+        }
+        if copied == bytes.len() {
+            break;
+        }
+        let Some(end) = semicolon_from(bytes, copied, &mut cached, &mut scanned) else {
+            out.push_str(&s[copied..]);
             break;
         };
-        match entity_char(&rest[1..end]) {
-            Some(c) => {
-                out.push(c);
-                rest = &rest[end + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
+        if let Some(ch) = entity_char(&s[copied + 1..end]) {
+            out.push(ch);
+            i = end + 1;
+        } else {
+            out.push('&');
+            i = copied + 1;
         }
     }
-    out.push_str(rest);
     (out, scanned)
 }
 
@@ -768,6 +783,8 @@ mod tests {
             ("&", "&"),
             ("&&amp;", "&&"),
             ("&&&&&amp;", "&&&&&"),
+            ("&bogus&amp;", "&bogus&"),
+            ("&amp&amp;", "&amp&"),
             ("&#38;amp;", "&amp;"),
             ("&#x26;lt;", "&lt;"),
             ("&#233;t&#xE9; &bogus; &", "été &bogus; &"),
