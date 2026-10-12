@@ -5,9 +5,13 @@
 //! bold, italic, underline, strikethrough, color, highlight, super/subscript,
 //! alignment, indents, spacing and line height. Lists come through as their
 //! marker text (Cocoa writes it in `\listtext`), and table cells become
-//! tab-separated paragraphs. Anything dropped on the way in is named in
-//! [`RichText::lossy`]. A project replace skips that file. The editor
-//! names the same list and does not replace.
+//! tab-separated paragraphs. Visible author content or formatting that a
+//! save would drop is named in [`RichText::lossy`]. Version tokens, page
+//! geometry, charset and codepage words, and zero-valued defaults are not
+//! losses. A stylesheet is not a loss when the paragraph's own font and
+//! size remain. A non-default tab interval is a loss only when the document
+//! contains a tab. A project replace skips a lossy file. The editor names
+//! the same list and does not replace.
 
 use std::fmt::Write as _;
 
@@ -188,6 +192,8 @@ pub fn word_count(text: &str) -> usize {
 const MAX_DEPTH: usize = 256;
 /// Tab stops kept per paragraph.
 const MAX_TABS: usize = 64;
+/// RTF's default tab interval, in twips. Scrivener writes it as `\deftab720`.
+const DEFAULT_TAB: i32 = 720;
 /// Characters kept of a font name or a link target.
 const MAX_FONT_NAME: usize = 128;
 const MAX_LINK: usize = 2048;
@@ -219,6 +225,7 @@ struct State {
     face_italic: bool,
     /// `\tqr` and friends: the kind of the next `\tx`.
     tab_kind: char,
+    after_star: bool,
 }
 
 struct Reader<'a> {
@@ -246,6 +253,10 @@ struct Reader<'a> {
     field_link: Option<String>,
     /// Open groups beyond MAX_DEPTH, being skipped.
     too_deep: usize,
+    /// A `\tab`, or a tab byte in the manuscript.
+    saw_tab: bool,
+    /// `\deftab` or `\pardeftab` set to something other than [`DEFAULT_TAB`].
+    nondefault_tab: bool,
 }
 
 pub fn parse(src: &[u8]) -> RichText {
@@ -262,6 +273,7 @@ pub fn parse(src: &[u8]) -> RichText {
             face_bold: false,
             face_italic: false,
             tab_kind: 'l',
+            after_star: false,
         },
         fonts: Vec::new(),
         font_names: std::collections::HashMap::new(),
@@ -278,9 +290,169 @@ pub fn parse(src: &[u8]) -> RichText {
         fldinst: String::new(),
         field_link: None,
         too_deep: 0,
+        saw_tab: false,
+        nondefault_tab: false,
     };
     r.run();
     r.out
+}
+
+enum Effect {
+    Keep,
+    SkipQuiet,
+    Skip(&'static str),
+    Name(&'static str),
+    Unknown,
+}
+
+fn effect(word: &str, param: Option<i32>) -> Effect {
+    if kept(word) || document_control(word, param) {
+        return Effect::Keep;
+    }
+    match word {
+        "expandedcolortbl" => Effect::SkipQuiet,
+        "footnote" => Effect::Skip("footnotes"),
+        "endnote" => Effect::Skip("endnotes"),
+        "annotation" | "atnid" | "atnauthor" | "comment" => Effect::Skip("comments"),
+        "pict" | "NeXTGraphic" | "object" | "shp" | "shppict" | "nonshppict" => {
+            Effect::Skip("images")
+        }
+        "listtable" | "list" | "listoverridetable" => Effect::Skip("lists"),
+        "ls" => Effect::Name("lists"),
+        "trowd" | "intbl" | "trgaph" | "trleft" | "trautofit" | "taflags" | "trbrdrt"
+        | "trbrdrl" | "trbrdrr" | "trbrdrb" | "clbrdrt" | "clbrdrl" | "clbrdrb" | "clbrdrr"
+        | "clshdrawnil" | "clvertalt" | "clvertalc" | "clpadl" | "clpadr" | "clcbpat" | "clmgf"
+        | "clmrg" | "clheight" | "brdrnil" | "brdrs" | "brdrw" | "brdrcf" | "gaph" => {
+            Effect::Name("tables")
+        }
+        // The style names live in the group. The paragraph's own `\f` and
+        // `\fs` are what the manuscript shows.
+        "stylesheet" => Effect::SkipQuiet,
+        "s" => Effect::Name("paragraph styles"),
+        "bkmkstart" | "bkmkend" => Effect::Skip("bookmarks"),
+        "header" | "headerl" | "headerr" | "headerf" => Effect::Skip("headers"),
+        "footer" | "footerl" | "footerr" | "footerf" => Effect::Skip("footers"),
+        "xe" => Effect::Skip("index entries"),
+        "tc" => Effect::Skip("contents entries"),
+        "Scrv" | "Scrvannot" => Effect::Name("inline annotations"),
+        "deleted" => Effect::Name("revisions"),
+        "info" => Effect::Skip("document properties"),
+        "revtbl" | "xmlnstbl" | "themedata" | "colorschememapping" | "latentstyles"
+        | "datastore" => Effect::Skip("other markup"),
+        _ => Effect::Unknown,
+    }
+}
+
+/// Document controls that sit in the same group as the manuscript.
+/// Skipping that group would drop the text. None of them is author
+/// content, and the writer does not need them to reproduce the words
+/// or the formatting it keeps. `\expnd`, `\expndtw`, and `\kerning` are
+/// in this set only at zero, which is the default.
+fn document_control(word: &str, param: Option<i32>) -> bool {
+    match word {
+        "cocoasubrtf" | "deff" | "paperw" | "paperh" | "margl" | "margr" | "margt" | "margb"
+        | "loch" | "hich" | "dbch" | "ltrch" | "rtlch" | "af" | "fet" | "ftnbj" | "aenddoc"
+        | "pgnrestart" | "pgnstarts" | "deftab" | "pardeftab" => true,
+        "expnd" | "expndtw" | "kerning" => param == Some(0),
+        _ => false,
+    }
+}
+
+fn kept(word: &str) -> bool {
+    matches!(
+        word,
+        "rtf"
+            | "ansi"
+            | "ansicpg"
+            | "mac"
+            | "cocoartf"
+            | "cocoatextscaling"
+            | "cocoaplatform"
+            | "fonttbl"
+            | "f"
+            | "fnil"
+            | "fcharset"
+            | "froman"
+            | "fswiss"
+            | "fmodern"
+            | "fscript"
+            | "fdecor"
+            | "fbidi"
+            | "fprq"
+            | "colortbl"
+            | "red"
+            | "green"
+            | "blue"
+            | "field"
+            | "fldinst"
+            | "fldrslt"
+            | "listtext"
+            | "pard"
+            | "pardirnatural"
+            | "partightenfactor"
+            | "tqr"
+            | "tqc"
+            | "tqdec"
+            | "tx"
+            | "ql"
+            | "qc"
+            | "qr"
+            | "qj"
+            | "qnatural"
+            | "fi"
+            | "li"
+            | "ri"
+            | "sb"
+            | "sa"
+            | "sl"
+            | "slmult"
+            | "plain"
+            | "fs"
+            | "fsmilli"
+            | "b"
+            | "i"
+            | "ul"
+            | "uld"
+            | "uldb"
+            | "ulw"
+            | "ulth"
+            | "ulnone"
+            | "ulc"
+            | "strike"
+            | "striked"
+            | "strikec"
+            | "cf"
+            | "cb"
+            | "highlight"
+            | "chcbpat"
+            | "super"
+            | "sub"
+            | "nosupersub"
+            | "up"
+            | "dn"
+            | "uc"
+            | "u"
+            | "par"
+            | "line"
+            | "tab"
+            | "cell"
+            | "row"
+            | "page"
+            | "sect"
+            | "emdash"
+            | "endash"
+            | "emspace"
+            | "enspace"
+            | "bullet"
+            | "lquote"
+            | "rquote"
+            | "ldblquote"
+            | "rdblquote"
+            | "ilvl"
+            | "itap"
+            | "cellx"
+            | "lastrow"
+    )
 }
 
 impl Reader<'_> {
@@ -428,6 +600,12 @@ impl Reader<'_> {
                         }
                     }
                 }
+                b'\t' => {
+                    if matches!(self.st.dest, Dest::Text | Dest::ListText) {
+                        self.saw_tab = true;
+                    }
+                    self.char('\t');
+                }
                 _ => self.char(b as char),
             }
         }
@@ -439,6 +617,9 @@ impl Reader<'_> {
             .unwrap_or_else(|| self.st.para.clone());
         let p = std::mem::take(&mut self.current);
         self.out.paragraphs.push(p);
+        if self.saw_tab && self.nondefault_tab {
+            self.lossy("tab intervals");
+        }
     }
 
     fn control(&mut self) {
@@ -467,13 +648,18 @@ impl Reader<'_> {
                 }
                 b'*' => {
                     self.flush();
-                    self.st.dest = Dest::Skip;
+                    self.st.after_star = true;
                 }
                 b'~' => self.char('\u{a0}'),
                 b'_' => self.char('\u{2011}'),
                 b'-' => {} // optional hyphen
                 b'\\' | b'{' | b'}' => self.char(c as char),
-                b'\t' => self.char('\t'),
+                b'\t' => {
+                    if matches!(self.st.dest, Dest::Text | Dest::ListText) {
+                        self.saw_tab = true;
+                    }
+                    self.char('\t');
+                }
                 _ => {}
             }
             return;
@@ -543,55 +729,47 @@ impl Reader<'_> {
                 }
                 return;
             }
-            Dest::Skip => {
-                // Images and notes hide in \* groups too (\shppict).
-                match word {
-                    "pict" | "NeXTGraphic" | "object" | "shp" => self.lossy("images"),
-                    "annotation" => self.lossy("comments"),
-                    "listtable" | "list" => self.lossy("lists"),
-                    "fldinst" => {
-                        self.fldinst.clear();
-                        self.st.dest = Dest::FldInst;
-                    }
-                    _ => {}
+            Dest::Skip => return,
+            Dest::Text | Dest::ListText => {}
+        }
+        let after_star = std::mem::replace(&mut self.st.after_star, false);
+        match effect(word, param) {
+            Effect::Keep => {}
+            Effect::SkipQuiet => {
+                self.flush();
+                self.st.dest = Dest::Skip;
+                return;
+            }
+            Effect::Skip(name) => {
+                self.flush();
+                self.lossy(name);
+                self.st.dest = Dest::Skip;
+                return;
+            }
+            Effect::Name(name) => {
+                self.lossy(name);
+                return;
+            }
+            Effect::Unknown => {
+                self.lossy("other markup");
+                // `\*` means an unknown destination is skipped. A bare
+                // unknown control loses the control and keeps the words.
+                if after_star {
+                    self.flush();
+                    self.st.dest = Dest::Skip;
                 }
                 return;
             }
-            Dest::Text | Dest::ListText => {}
         }
         match word {
-            // Header and destinations.
             "ansicpg" => self.codepage = n as u32,
             "mac" => self.codepage = 10000,
             "fonttbl" => self.st.dest = Dest::FontTable,
             "colortbl" => self.st.dest = Dest::ColorTable,
-            "stylesheet" | "info" | "header" | "headerl" | "headerr" | "headerf" | "footer"
-            | "footerl" | "footerr" | "footerf" | "listtable" | "listoverridetable" | "revtbl"
-            | "xmlnstbl" | "themedata" | "colorschememapping" | "latentstyles" | "datastore" => {
-                self.flush();
-                self.st.dest = Dest::Skip;
-            }
-            "pict" | "NeXTGraphic" | "object" | "shp" | "nonshppict" => {
-                self.flush();
-                self.lossy("images");
-                self.st.dest = Dest::Skip;
-            }
-            "footnote" => {
-                self.flush();
-                self.lossy("footnotes");
-                self.st.dest = Dest::Skip;
-            }
-            "annotation" | "atnid" | "atnauthor" => {
-                self.flush();
-                self.lossy("comments");
-                self.st.dest = Dest::Skip;
-            }
             "listtext" => {
                 self.flush();
                 self.st.dest = Dest::ListText;
             }
-            "trowd" => self.lossy("tables"),
-            "ls" => self.lossy("lists"),
             "fldinst" => {
                 self.flush();
                 self.fldinst.clear();
@@ -601,7 +779,6 @@ impl Reader<'_> {
                 self.flush();
                 self.st.ch.link = self.field_link.take();
             }
-            "Scrv" | "Scrvannot" => self.lossy("inline annotations"),
             // Unicode.
             "uc" => self.st.uc = n.max(0) as usize,
             "u" => {
@@ -631,7 +808,15 @@ impl Reader<'_> {
                 }
             }
             "line" => self.char('\u{2028}'),
-            "tab" => self.char('\t'),
+            "tab" => {
+                self.saw_tab = true;
+                self.char('\t');
+            }
+            "deftab" | "pardeftab" => {
+                if param.unwrap_or(DEFAULT_TAB) != DEFAULT_TAB {
+                    self.nondefault_tab = true;
+                }
+            }
             "cell" => self.char('\t'),
             "row" => {
                 // Drop the tab the last \cell left, then end the row.
@@ -1391,5 +1576,267 @@ mod tests {
             6
         );
         assert_eq!(word_count("  "), 0);
+    }
+
+    #[test]
+    fn starred_footnote_is_named() {
+        let t = parse(br"{\rtf1 a{\*\footnote the note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["footnotes"]);
+    }
+
+    #[test]
+    fn starred_endnote_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\endnote the note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["endnotes"]);
+    }
+
+    #[test]
+    fn bare_endnote_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\endnote the note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["endnotes"]);
+    }
+
+    #[test]
+    fn starred_inline_annotation_is_named() {
+        let t = parse(br"{\rtf1 a{\*\Scrvannot note}b}");
+        assert_eq!(t.plain_text(), "anoteb");
+        assert_eq!(t.lossy, vec!["inline annotations"]);
+    }
+
+    #[test]
+    fn starred_comment_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\comment a note}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["comments"]);
+    }
+
+    #[test]
+    fn starred_shppict_without_a_picture_is_named() {
+        let t = parse(br"{\rtf1 a{\*\shppict }b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["images"]);
+    }
+
+    #[test]
+    fn nonshppict_fallback_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\nonshppict fallback words}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["images"]);
+    }
+
+    #[test]
+    fn stylesheet_stays_out_of_the_body_and_is_not_lossy() {
+        let t = parse(br"{\rtf1{\stylesheet{\s1 Heading;}}\f0\fs24 body}");
+        assert_eq!(t.plain_text(), "body");
+        assert!(t.lossy.is_empty());
+    }
+
+    #[test]
+    fn paragraph_style_index_is_named() {
+        let t = parse(br"{\rtf1\s2 styled}");
+        assert_eq!(t.plain_text(), "styled");
+        assert_eq!(t.lossy, vec!["paragraph styles"]);
+    }
+
+    #[test]
+    fn bookmark_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\bkmkstart Chapter}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["bookmarks"]);
+    }
+
+    #[test]
+    fn header_text_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\header secret}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["headers"]);
+    }
+
+    #[test]
+    fn footer_text_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1{\footer secret}body}");
+        assert_eq!(t.plain_text(), "body");
+        assert_eq!(t.lossy, vec!["footers"]);
+    }
+
+    #[test]
+    fn starred_table_row_keeps_the_cells_and_names_the_table() {
+        let t = parse(br"{\rtf1 before {\*\trowd\cellx4320 inside\cell}\row after}");
+        assert_eq!(t.plain_text(), "before inside\nafter");
+        assert_eq!(t.lossy, vec!["tables"]);
+    }
+
+    #[test]
+    fn intbl_without_a_row_is_named() {
+        let t = parse(br"{\rtf1\intbl cell}");
+        assert_eq!(t.plain_text(), "cell");
+        assert_eq!(t.lossy, vec!["tables"]);
+    }
+
+    #[test]
+    fn index_entry_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 before {\xe secret} after}");
+        assert_eq!(t.plain_text(), "before  after");
+        assert_eq!(t.lossy, vec!["index entries"]);
+    }
+
+    #[test]
+    fn contents_entry_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 before {\tc secret} after}");
+        assert_eq!(t.plain_text(), "before  after");
+        assert_eq!(t.lossy, vec!["contents entries"]);
+    }
+
+    #[test]
+    fn deleted_revision_is_named_and_the_words_stay() {
+        let t = parse(br"{\rtf1 before {\deleted gone} after}");
+        assert_eq!(t.plain_text(), "before gone after");
+        assert_eq!(t.lossy, vec!["revisions"]);
+    }
+
+    #[test]
+    fn unknown_starred_group_is_named_and_stays_out_of_the_body() {
+        let t = parse(br"{\rtf1 a{\*\mystery secret}b}");
+        assert_eq!(t.plain_text(), "ab");
+        assert_eq!(t.lossy, vec!["other markup"]);
+    }
+
+    #[test]
+    fn lighthouse_files_and_a_plain_scene_lose_nothing() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/Lighthouse.scriv");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rtf") {
+                    files.push(path);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        assert!(!files.is_empty());
+        for path in &files {
+            let text = parse(&std::fs::read(path).unwrap());
+            assert_eq!(text.lossy, Vec::<&str>::new(), "{}", path.display());
+        }
+        let scene = "{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n\
+\\cocoatextscaling0\\cocoaplatform0{\\fonttbl\\f0\\froman\\fcharset0 Palatino-Roman;}\n\
+{\\colortbl;\\red255\\green255\\blue255;}\n\
+{\\*\\expandedcolortbl;;}\n\
+\\pard\\tx720\\fi720\\sl360\\slmult1\\pardirnatural\\partightenfactor0\n\
+\n\
+\\f0\\fs24 \\cf0 The lamp stayed lit.}";
+        assert_eq!(parse(scene.as_bytes()).lossy, Vec::<&str>::new());
+        let written = parse(write(&RichText::from_plain("The lamp stayed lit.")).as_bytes());
+        assert_eq!(written.lossy, Vec::<&str>::new());
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rtf")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_default_tab_interval_is_not_lossy() {
+        let t = parse(br"{\rtf1\deftab720\pard\pardeftab720 a\tab b}");
+        assert_eq!(t.plain_text(), "a\tb");
+        assert!(t.lossy.is_empty());
+    }
+
+    #[test]
+    fn a_nondefault_tab_interval_without_a_tab_is_not_lossy() {
+        let t = parse(br"{\rtf1\deftab580\pard\pardeftab580 no tab here}");
+        assert_eq!(t.plain_text(), "no tab here");
+        assert!(t.lossy.is_empty());
+    }
+
+    #[test]
+    fn a_nondefault_tab_interval_with_a_tab_is_lossy() {
+        let t = parse(br"{\rtf1\pard\pardeftab580 a\tab b}");
+        assert_eq!(t.plain_text(), "a\tb");
+        assert_eq!(t.lossy, vec!["tab intervals"]);
+    }
+
+    #[test]
+    fn zero_expansion_and_kerning_are_not_lossy() {
+        let t = parse(br"{\rtf1\expnd0\expndtw0\kerning0 Still here}");
+        assert_eq!(t.plain_text(), "Still here");
+        assert!(t.lossy.is_empty());
+        let wide = parse(br"{\rtf1\expnd4 Spaced}");
+        assert_eq!(wide.plain_text(), "Spaced");
+        assert_eq!(wide.lossy, vec!["other markup"]);
+    }
+
+    #[test]
+    fn real_scrivener_scenes_without_a_real_loss_are_not_lossy() {
+        for name in [
+            "win-3.1.6-zooms.rtf",
+            "win-3.1.6-outliner-rows.rtf",
+            "win-3.1.6-zero-kerning.rtf",
+            "mac-cocoa-containers.rtf",
+            "ios-main-interface.rtf",
+            "ios-text-editing.rtf",
+            "win-1.9-sirius.rtf",
+        ] {
+            let text = parse(&fixture(name));
+            assert!(text.lossy.is_empty(), "{name} is lossy: {:?}", text.lossy);
+        }
+        let zooms = parse(&fixture("win-3.1.6-zooms.rtf"));
+        assert_eq!(zooms.plain_text(), "Zooms the PDF to its native scale.");
+        let mac = parse(&fixture("mac-cocoa-containers.rtf"));
+        assert!(
+            mac.plain_text()
+                .contains("Treat all documents with subdocuments as folders")
+        );
+        let ios = parse(&fixture("ios-main-interface.rtf"));
+        assert!(ios.plain_text().contains("The Main Interface"));
+        let editing = parse(&fixture("ios-text-editing.rtf"));
+        assert!(editing.plain_text().contains("Footnotes"));
+        let note = editing
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.runs)
+            .find(|r| r.text.contains("Footnotes"))
+            .unwrap();
+        assert_eq!(
+            note.style.link.as_deref(),
+            Some("scrivcmt://35B50A30-C33D-4779-A191-D05B4FA4AA33")
+        );
+        let comments = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rtf/ios-text-editing.comments"),
+        )
+        .unwrap();
+        assert!(comments.contains("Footnote=\"Yes\""));
+        assert!(comments.contains("This is a footnote."));
+    }
+
+    #[test]
+    fn a_real_scene_with_a_wider_tab_interval_is_lossy() {
+        let t = parse(&fixture("win-3.1.6-tab-interval.rtf"));
+        assert!(t.plain_text().contains("both the Mac and Windows editions"));
+        assert_eq!(t.lossy, vec!["tab intervals"]);
+    }
+
+    #[test]
+    fn a_footnote_in_the_zooms_scene_is_lossy() {
+        let mut src = fixture("win-3.1.6-zooms.rtf");
+        assert!(src.ends_with(b"}"));
+        src.pop();
+        src.extend_from_slice(br"{\*\footnote The note stays out.}");
+        src.push(b'}');
+        let t = parse(&src);
+        assert_eq!(t.plain_text(), "Zooms the PDF to its native scale.");
+        assert_eq!(t.lossy, vec!["footnotes"]);
     }
 }
