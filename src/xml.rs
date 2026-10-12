@@ -363,8 +363,6 @@ pub fn unescape(s: &str) -> String {
     unescape_scanned(s).0
 }
 
-/// Named entities, then `&#` decimal and `&#x` hex. Anything else is not a
-/// character, including an empty name, a surrogate, and a value past Unicode.
 fn entity_char(entity: &str) -> Option<char> {
     match entity {
         "amp" => Some('&'),
@@ -389,9 +387,6 @@ fn count_bytes(n: usize, scanned: &mut u64) {
     *scanned += u64::try_from(n).expect("a byte length fits in u64");
 }
 
-/// The `;` at or after `from`. A failed entity resumes one byte later and
-/// still ends at this same semicolon, so a later index in the scanned span
-/// does not search again.
 fn semicolon_from(
     bytes: &[u8],
     from: usize,
@@ -413,7 +408,6 @@ fn semicolon_from(
     (at < bytes.len()).then_some(at)
 }
 
-/// Returns the decoded text and how many bytes the copy and the `;` search read.
 fn unescape_scanned(s: &str) -> (String, u64) {
     let bytes = s.as_bytes();
     if !bytes.contains(&b'&') {
