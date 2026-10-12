@@ -44,8 +44,10 @@ program built from source, and the **bar widget**, an Omarchy shell plugin
 opens the app when clicked, so install both.
 
 **Needs:** GTK 4.12+ and libadwaita 1.5+ (already on Omarchy), and Rust
-to build. Spellcheck needs libenchant-2 at runtime. Without that library,
-the app still runs and spelling marks stay off.
+to build. Spellcheck needs libenchant-2 at runtime. On Arch, that library
+is the `enchant` package. A dictionary is needed too, such as
+`hunspell-en_us`. Without the library or a dictionary, the app still
+runs and spelling marks stay off.
 With [mise](https://mise.jdx.dev) (on Omarchy already) the install
 script fetches the exact Rust version this repository pins; otherwise
 install `rustup`. The build downloads its Rust crates (the GTK bindings)
@@ -247,9 +249,10 @@ current as you type.
 The app is written in Rust, with GTK 4 and libadwaita. The Scrivener
 reader and writer, the RTF engine, and the DOCX and EPUB writers are
 omaquill's own. The system libraries it links are GTK and libadwaita, plus GTK's
-own Pango and Cairo for PDF layout. Spellcheck loads libenchant-2 at runtime
-and stays off when that library is missing. The Omarchy theme colors the window
-and follows theme changes live.
+own Pango and Cairo for PDF layout. Spellcheck loads libenchant-2 at runtime.
+On Arch, libenchant-2 comes from the `enchant` package. A dictionary is
+needed. Marks stay off when either is missing. The Omarchy theme colors the
+window and follows theme changes live.
 
 ```sh
 mise install       # the Rust toolchain
