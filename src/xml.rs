@@ -360,34 +360,70 @@ pub fn escape(s: &str) -> String {
 }
 
 pub fn unescape(s: &str) -> String {
+    unescape_scanned(s).0
+}
+
+/// Named entities, then `&#` decimal and `&#x` hex. Anything else is not a
+/// character, including an empty name, a surrogate, and a value past Unicode.
+fn entity_char(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let num = if let Some(hex) = entity.strip_prefix("#x") {
+                u32::from_str_radix(hex, 16).ok()
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse().ok()
+            } else {
+                None
+            };
+            num.and_then(char::from_u32)
+        }
+    }
+}
+
+fn count_bytes(n: usize, scanned: &mut u64) {
+    *scanned += u64::try_from(n).expect("a byte length fits in u64");
+}
+
+/// Bytes a forward search reads, including the matched byte. A miss reads
+/// the whole haystack.
+fn find_counted(s: &str, byte: u8, scanned: &mut u64) -> Option<usize> {
+    match s.as_bytes().iter().position(|&b| b == byte) {
+        Some(i) => {
+            count_bytes(i + 1, scanned);
+            Some(i)
+        }
+        None => {
+            count_bytes(s.len(), scanned);
+            None
+        }
+    }
+}
+
+/// Decodes entities and reports how many bytes the `&` and `;` searches read.
+/// An unknown or unterminated entity stays literal. The search continues at
+/// the byte after `&`, so `&&amp;` is still `&&`.
+fn unescape_scanned(s: &str) -> (String, u64) {
     if !s.contains('&') {
-        return s.to_string();
+        return (
+            s.to_string(),
+            u64::try_from(s.len()).expect("a byte length fits in u64"),
+        );
     }
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(i) = rest.find('&') {
+    let mut scanned = 0u64;
+    while let Some(i) = find_counted(rest, b'&', &mut scanned) {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(end) = rest.find(';') else { break };
-        let entity = &rest[1..end];
-        let c = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            _ => {
-                let num = if let Some(hex) = entity.strip_prefix("#x") {
-                    u32::from_str_radix(hex, 16).ok()
-                } else if let Some(dec) = entity.strip_prefix('#') {
-                    dec.parse().ok()
-                } else {
-                    None
-                };
-                num.and_then(char::from_u32)
-            }
+        let Some(end) = find_counted(rest, b';', &mut scanned) else {
+            break;
         };
-        match c {
+        match entity_char(&rest[1..end]) {
             Some(c) => {
                 out.push(c);
                 rest = &rest[end + 1..];
@@ -399,7 +435,7 @@ pub fn unescape(s: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    (out, scanned)
 }
 
 impl Element {
@@ -703,6 +739,65 @@ mod tests {
     #[test]
     fn unescapes_numeric_entities() {
         assert_eq!(unescape("&#233;t&#xE9; &bogus; &"), "été &bogus; &");
+    }
+
+    #[test]
+    fn decodes_named_decimal_and_hex_entities() {
+        let cases = [
+            ("Fish &amp; Chips", "Fish & Chips"),
+            ("&lt;&gt;&quot;&apos;", "<>\"'"),
+            ("&#233;", "é"),
+            ("&#00065;", "A"),
+            ("&#xE9;", "é"),
+            ("&#xe9;", "é"),
+            ("&#x4A;", "J"),
+            ("&#x000041;", "A"),
+            ("&#X4A;", "&#X4A;"),
+            ("&#x10FFFF;", "\u{10FFFF}"),
+            ("&#x110000;", "&#x110000;"),
+            ("&#xD800;", "&#xD800;"),
+            ("&#x0;", "\0"),
+            ("&#0;", "\0"),
+            ("&#4294967296;", "&#4294967296;"),
+            ("&#4294967295;", "&#4294967295;"),
+            ("&;", "&;"),
+            ("&#x;", "&#x;"),
+            ("&#;", "&#;"),
+            ("&bogus;", "&bogus;"),
+            ("&amp", "&amp"),
+            ("&", "&"),
+            ("&&amp;", "&&"),
+            ("&&&&&amp;", "&&&&&"),
+            ("&#38;amp;", "&amp;"),
+            ("&#x26;lt;", "&lt;"),
+            ("&#233;t&#xE9; &bogus; &", "été &bogus; &"),
+            ("plain", "plain"),
+            ("a &amp; b &lt; c", "a & b < c"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(unescape(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn ampersand_run_before_one_semicolon_reads_linearly() {
+        let title = format!("{};", "&".repeat(200_000));
+        let (text, bytes_read) = unescape_scanned(&title);
+        assert_eq!(text, title);
+        let len = u64::try_from(title.len()).unwrap();
+        assert!(bytes_read >= len, "read {bytes_read} of {len}");
+        let limit = len * 3;
+        assert!(
+            bytes_read <= limit,
+            "read {bytes_read} bytes of a {len}-byte title, limit {limit}"
+        );
+
+        let xml = format!("<BinderItem Type=\"Text\"><Title>{title}</Title></BinderItem>");
+        let doc = parse(&xml).unwrap();
+        assert_eq!(
+            doc.root.child_text("Title").as_deref(),
+            Some(title.as_str())
+        );
     }
 
     #[test]
