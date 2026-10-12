@@ -229,9 +229,10 @@ loses any Scrivener-only formatting listed above.
 
 ## Safety
 
-- Every time omaquill opens a project, it zips the whole thing into
-  `~/.local/share/omaquill/backups/` before changing anything. It keeps the
-  last 10 per project; Preferences changes that.
+- When omaquill opens a project, it zips the whole project into
+  `~/.local/share/omaquill/backups/` only when Backups to Keep is above
+  zero. 0 turns backups off. It keeps the last 10 per project; Preferences
+  changes that.
 - Files are written to a temporary name and renamed into place, so a crash
   or power cut never leaves half a chapter.
 - Logging out or shutting down closes the window cleanly and saves.
