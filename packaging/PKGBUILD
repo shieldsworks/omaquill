@@ -1,15 +1,16 @@
 # Maintainer: Casey Shields <casey@shieldsworks.com>
 pkgname=omaquill-git
 _pkgname=omaquill
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='A free writing studio for authors and writers on Linux and Omarchy'
 arch=('x86_64' 'aarch64')
 url='https://github.com/shieldsworks/omaquill'
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'enchant')
+depends=('gtk4' 'libadwaita')
 makedepends=('cargo' 'git')
-optdepends=('hunspell-en_us: English spelling dictionary'
+optdepends=('enchant: spellcheck through libenchant-2'
+            'hunspell-en_us: English dictionary for spellcheck'
             'tex-gyre-fonts: close stand-ins for Palatino, Times and other Mac fonts')
 provides=("$_pkgname")
 conflicts=("$_pkgname")

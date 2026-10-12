@@ -13,11 +13,12 @@ Your work is saved in Scrivener's own `.scriv` format, so you're never
 locked in. Open a project you started on a Mac, hand your manuscript to a
 co-writer who uses Scrivener, or move on later with everything intact.
 
-**Safe to try.** omaquill backs up your whole project every time it opens
-it, never rewrites a document you haven't touched, and can read a project
-without changing anything: `omaquill check "Novel.scriv"`.
+**Safe to try.** omaquill backs up your whole project on open when
+Backups to Keep is above zero, which is the default. It never rewrites a
+document you haven't touched, and it can read a project without changing
+anything: `omaquill check "Novel.scriv"`.
 
-**Status: v0.1.** It's ready for writing. Most of Scrivener's Compile
+**Status: v0.2.0.** It's ready for writing. Most of Scrivener's Compile
 options, snapshots, and comment and footnote text aren't here yet. See
 [What carries over](#what-carries-over).
 
@@ -44,7 +45,11 @@ program built from source, and the **bar widget**, an Omarchy shell plugin
 opens the app when clicked, so install both.
 
 **Needs:** GTK 4.12+ and libadwaita 1.5+ (already on Omarchy), and Rust
-to build. With [mise](https://mise.jdx.dev) (on Omarchy already) the install
+to build. Spellcheck needs libenchant-2 at runtime. On Arch, that library
+is the `enchant` package. A dictionary is needed too, such as
+`hunspell-en_us`. Without the library or a dictionary, the app still
+runs and spelling marks stay off.
+With [mise](https://mise.jdx.dev) (on Omarchy already) the install
 script fetches the exact Rust version this repository pins; otherwise
 install `rustup`. The build downloads its Rust crates (the GTK bindings)
 from crates.io once. Nothing else runs as root, and nothing is fetched
@@ -225,9 +230,10 @@ loses any Scrivener-only formatting listed above.
 
 ## Safety
 
-- Every time omaquill opens a project, it zips the whole thing into
-  `~/.local/share/omaquill/backups/` before changing anything. It keeps the
-  last 10 per project; Preferences changes that.
+- When omaquill opens a project, it zips the whole project into
+  `~/.local/share/omaquill/backups/` only when Backups to Keep is above
+  zero. 0 turns backups off. It keeps the last 10 per project; Preferences
+  changes that.
 - Files are written to a temporary name and renamed into place, so a crash
   or power cut never leaves half a chapter.
 - Logging out or shutting down closes the window cleanly and saves.
@@ -244,9 +250,11 @@ current as you type.
 
 The app is written in Rust, with GTK 4 and libadwaita. The Scrivener
 reader and writer, the RTF engine, and the DOCX and EPUB writers are
-omaquill's own. The only dependencies are GTK and libadwaita, plus GTK's
-own Pango and Cairo for PDF layout. The Omarchy theme colors the window
-and follows theme changes live.
+omaquill's own. The system libraries it links are GTK and libadwaita, plus GTK's
+own Pango and Cairo for PDF layout. Spellcheck loads libenchant-2 at runtime.
+On Arch, libenchant-2 comes from the `enchant` package. A dictionary is
+needed. Marks stay off when either is missing. The Omarchy theme colors the
+window and follows theme changes live.
 
 ```sh
 mise install       # the Rust toolchain
