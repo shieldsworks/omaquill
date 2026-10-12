@@ -13,9 +13,10 @@ Your work is saved in Scrivener's own `.scriv` format, so you're never
 locked in. Open a project you started on a Mac, hand your manuscript to a
 co-writer who uses Scrivener, or move on later with everything intact.
 
-**Safe to try.** omaquill backs up your whole project every time it opens
-it, never rewrites a document you haven't touched, and can read a project
-without changing anything: `omaquill check "Novel.scriv"`.
+**Safe to try.** omaquill backs up your whole project on open when
+Backups to Keep is above zero, which is the default. It never rewrites a
+document you haven't touched, and it can read a project without changing
+anything: `omaquill check "Novel.scriv"`.
 
 **Status: v0.2.0.** It's ready for writing. Most of Scrivener's Compile
 options, snapshots, and comment and footnote text aren't here yet. See
