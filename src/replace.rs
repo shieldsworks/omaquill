@@ -1,8 +1,32 @@
 use crate::project::{self, Item, Kind, Project};
 use crate::rtf::{CharStyle, ParaStyle, Paragraph, RichText, Run};
 use regex::Regex;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    static STYLE_VISITS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_visits(n: usize) {
+    #[cfg(test)]
+    STYLE_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_style_visits() {
+    STYLE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn style_visits() -> u64 {
+    STYLE_VISITS.with(|visits| visits.get())
+}
 
 pub const MAX_PATTERN: usize = 1024;
 
@@ -696,6 +720,7 @@ fn find_in(text: &RichText, query: &Query) -> Vec<Found> {
             .map(|_| index)
             .expect("regex match lands on a character boundary")
     };
+    let mut styles = StyleWalk::new(text);
     let mut out = Vec::new();
     for caps in query.needle.captures_iter(&plain) {
         let whole = caps.get(0).expect("capture 0 is the whole match");
@@ -712,7 +737,7 @@ fn find_in(text: &RichText, query: &Query) -> Vec<Found> {
         };
         let matched: String = chars[start..end].iter().collect();
         let replacement = expand(&query.template, &caps);
-        let (char_style, para_style) = style_at(text, start);
+        let (char_style, para_style) = styles.at(start);
         out.push(Found {
             range,
             matched,
@@ -848,11 +873,120 @@ fn group_index(needle: &Regex, name: &str) -> Result<usize, QueryError> {
         .ok_or_else(|| QueryError::Replacement(format!("No group ${name}")))
 }
 
+/// Styles for match starts, in nondecreasing order. Each character and
+/// paragraph break is counted once.
+struct StyleWalk<'a> {
+    text: &'a RichText,
+    para_i: usize,
+    run_i: usize,
+    at: usize,
+    noted: usize,
+    run_chars: usize,
+    previous: CharStyle,
+    on_break: bool,
+    done: bool,
+    end_para: ParaStyle,
+}
+
+impl<'a> StyleWalk<'a> {
+    fn new(text: &'a RichText) -> Self {
+        Self {
+            text,
+            para_i: 0,
+            run_i: 0,
+            at: 0,
+            noted: 0,
+            run_chars: 0,
+            previous: CharStyle::default(),
+            on_break: false,
+            done: text.paragraphs.is_empty(),
+            end_para: text
+                .paragraphs
+                .last()
+                .map(|p| p.style.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn at(&mut self, index: usize) -> (CharStyle, ParaStyle) {
+        if self.done {
+            return (self.previous.clone(), self.end_para.clone());
+        }
+        loop {
+            if self.para_i >= self.text.paragraphs.len() {
+                self.done = true;
+                return (self.previous.clone(), self.end_para.clone());
+            }
+            if self.on_break {
+                if self.noted == 0 {
+                    note_visits(1);
+                    self.noted = 1;
+                }
+                let char_style = self.text.paragraphs[self.para_i]
+                    .runs
+                    .first()
+                    .map(|r| r.style.clone())
+                    .unwrap_or_else(|| self.previous.clone());
+                let para_style = self.text.paragraphs[self.para_i].style.clone();
+                if self.at == index {
+                    self.on_break = false;
+                    self.at += 1;
+                    self.run_i = 0;
+                    self.noted = 0;
+                    self.run_chars = 0;
+                    return (char_style, para_style);
+                }
+                self.on_break = false;
+                self.at += 1;
+                self.run_i = 0;
+                self.noted = 0;
+                self.run_chars = 0;
+                continue;
+            }
+            if self.run_i >= self.text.paragraphs[self.para_i].runs.len() {
+                self.para_i += 1;
+                self.run_i = 0;
+                self.noted = 0;
+                self.run_chars = 0;
+                self.on_break = self.para_i < self.text.paragraphs.len();
+                continue;
+            }
+            let n = if self.noted == 0 {
+                let n = self.text.paragraphs[self.para_i].runs[self.run_i]
+                    .text
+                    .chars()
+                    .count();
+                note_visits(n);
+                self.run_chars = n;
+                self.noted = n;
+                n
+            } else {
+                self.run_chars
+            };
+            let style = self.text.paragraphs[self.para_i].runs[self.run_i]
+                .style
+                .clone();
+            let para_style = self.text.paragraphs[self.para_i].style.clone();
+            if index < self.at + n {
+                return (style, para_style);
+            }
+            if n > 0 {
+                self.previous = style;
+            }
+            self.at += n;
+            self.run_i += 1;
+            self.noted = 0;
+            self.run_chars = 0;
+        }
+    }
+}
+
 fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
     let mut at = 0usize;
     let mut previous = CharStyle::default();
     for (pi, para) in text.paragraphs.iter().enumerate() {
         if pi > 0 {
+            note_visits(1);
             if at == index {
                 let char_style = para
                     .runs
@@ -865,6 +999,7 @@ fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
         }
         for run in &para.runs {
             let n = run.text.chars().count();
+            note_visits(n);
             if index < at + n {
                 return (run.style.clone(), para.style.clone());
             }
@@ -1424,5 +1559,100 @@ mod tests {
             query("", "a", Options::default()),
             Err(QueryError::Empty)
         ));
+    }
+
+    #[test]
+    fn find_in_walks_styles_once() {
+        let n = 4_000usize;
+        let runs: Vec<Run> = (0..n)
+            .map(|i| Run {
+                text: "x ".into(),
+                style: CharStyle {
+                    bold: i % 2 == 0,
+                    ..CharStyle::default()
+                },
+            })
+            .collect();
+        let text = RichText {
+            paragraphs: vec![Paragraph {
+                style: ParaStyle::default(),
+                runs,
+            }],
+            lossy: Vec::new(),
+        };
+        let query = literal("x", "y", Word::Any, Case::Sensitive);
+        reset_style_visits();
+        let started = std::time::Instant::now();
+        let plan = plan_all(&text, &query);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(plan.edits().len(), n);
+        assert!(plan.edits()[0].char_style().bold);
+        assert!(!plan.edits()[1].char_style().bold);
+        let visits = style_visits();
+        let chars = u64::try_from(text.plain_text().chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("find visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn style_walk_matches_style_at_across_breaks() {
+        let text = RichText {
+            paragraphs: vec![
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Left,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![
+                        Run {
+                            text: String::new(),
+                            style: CharStyle {
+                                bold: true,
+                                ..CharStyle::default()
+                            },
+                        },
+                        Run {
+                            text: "ab".into(),
+                            style: CharStyle {
+                                italic: true,
+                                ..CharStyle::default()
+                            },
+                        },
+                    ],
+                },
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Center,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![],
+                },
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Right,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![Run {
+                        text: "c".into(),
+                        style: CharStyle {
+                            underline: true,
+                            ..CharStyle::default()
+                        },
+                    }],
+                },
+            ],
+            lossy: Vec::new(),
+        };
+        let plain_len = text.plain_text().chars().count();
+        let mut walk = StyleWalk::new(&text);
+        for index in 0..=plain_len {
+            let from_walk = walk.at(index);
+            let from_at = style_at(&text, index);
+            assert_eq!(from_walk.0, from_at.0, "char style at {index}");
+            assert_eq!(from_walk.1, from_at.1, "para style at {index}");
+        }
     }
 }
