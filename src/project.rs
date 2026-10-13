@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 thread_local! {
     static CONTENT_WRITES: Cell<u64> = const { Cell::new(0) };
     static RETAINED_INDEX: Cell<usize> = const { Cell::new(0) };
+    static BINDER_WALKS: Cell<u64> = const { Cell::new(0) };
+    static INDEX_VISITS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -55,6 +57,34 @@ fn note_retained(docs: &HashMap<String, IndexedDoc>) {
 #[cfg(test)]
 fn retained_index() -> usize {
     RETAINED_INDEX.with(|kept| kept.get())
+}
+
+fn note_binder_walk() {
+    #[cfg(test)]
+    BINDER_WALKS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+fn note_index_visit(n: u64) {
+    #[cfg(test)]
+    INDEX_VISITS.with(|visits| visits.set(visits.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_index_scan() {
+    BINDER_WALKS.with(|n| n.set(0));
+    INDEX_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn binder_walks() -> u64 {
+    BINDER_WALKS.with(|n| n.get())
+}
+
+#[cfg(test)]
+fn index_visits() -> u64 {
+    INDEX_VISITS.with(|visits| visits.get())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +261,14 @@ struct IndexSlot {
     has_text: bool,
     /// Some row with this id had a text body, so the count stays.
     saw_text: bool,
+}
+
+fn index_rows(items: &[Item], rows: &mut HashMap<String, (String, bool)>) {
+    for item in items {
+        rows.entry(item.uuid.to_ascii_uppercase())
+            .or_insert_with(|| (item.title.clone(), item.kind.has_text()));
+        index_rows(&item.children, rows);
+    }
 }
 
 fn index_items(
@@ -421,6 +459,7 @@ impl Project {
 
     /// The whole binder as a tree.
     pub fn items(&self) -> Vec<Item> {
+        note_binder_walk();
         fn read(container: &Element) -> Vec<Item> {
             container
                 .elements()
@@ -1137,19 +1176,46 @@ impl Project {
             )?,
         };
         let uuids: Vec<String> = self.reindex.keys().cloned().collect();
+        let dirty: HashSet<String> = uuids.iter().map(|uuid| uuid.to_ascii_uppercase()).collect();
         let docs = doc
             .root
             .child_mut("Documents")
             .expect("the search index has a Documents element");
-        for uuid in uuids {
-            let pos = docs.elements().position(|e| {
-                e.attr("ID")
-                    .is_some_and(|id| id.eq_ignore_ascii_case(&uuid))
-            });
-            if let Some(pos) = pos {
-                docs.remove_element(pos);
+        let children = std::mem::take(&mut docs.children);
+        let mut kept = Vec::with_capacity(children.len());
+        let mut n = 0usize;
+        for node in children {
+            note_index_visit(1);
+            let drop_doc = match &node {
+                xml::Node::Element(el) if el.name == "Document" => el
+                    .attr("ID")
+                    .is_some_and(|id| dirty.contains(&id.to_ascii_uppercase())),
+                _ => false,
+            };
+            if drop_doc {
+                if let Some(xml::Node::Text(text)) = kept.last()
+                    && text.trim().is_empty()
+                {
+                    kept.pop();
+                }
+                continue;
             }
-            let Some(item) = self.item(&uuid) else {
+            if matches!(node, xml::Node::Element(_)) {
+                n += 1;
+            }
+            kept.push(node);
+        }
+        if !kept
+            .iter()
+            .any(|node| matches!(node, xml::Node::Element(_)))
+        {
+            kept.retain(|node| !matches!(node, xml::Node::Text(text) if text.trim().is_empty()));
+        }
+        docs.children = kept;
+        let mut rows = HashMap::new();
+        index_rows(&self.items(), &mut rows);
+        for uuid in uuids {
+            let Some((title, has_text)) = rows.get(&uuid.to_ascii_uppercase()) else {
                 continue; // deleted
             };
             let mut entry = Element::new("Document");
@@ -1161,15 +1227,15 @@ impl Project {
                     entry.children.push(xml::Node::Element(e));
                 }
             };
-            add("Title", &item.title);
+            add("Title", title);
             add("Synopsis", &self.synopsis(&uuid));
-            if item.kind.has_text() {
+            if *has_text {
                 add("Text", &self.text(&uuid)?.plain_text());
             }
             add("Notes", &self.notes(&uuid)?.plain_text());
             xml::pretty(&mut entry, "\n        ");
-            let n = docs.elements().count();
             docs.insert_element(n, entry, "\n    ");
+            n += 1;
         }
         write_inside(&self.root, &path, doc.to_xml().as_bytes())?;
         Ok(())
@@ -1716,6 +1782,47 @@ mod tests {
             extension: None,
             children,
         }
+    }
+
+    #[test]
+    fn save_search_index_walks_each_list_once() {
+        let (path, mut project) = temp_project("reindex");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let mut ids = Vec::new();
+        for n in 0..80 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain(&format!("words {n}")))
+                .unwrap();
+            ids.push(id);
+        }
+        project.save().unwrap();
+        reset_index_scan();
+        for id in &ids {
+            project
+                .set_text(id, &RichText::from_plain("updated lamp"))
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        project.save().unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let n = u64::try_from(ids.len()).unwrap();
+        let walks = binder_walks();
+        let visits = index_visits();
+        assert!(
+            walks <= 4,
+            "saving {n} documents walked the binder {walks} times"
+        );
+        assert!(
+            visits <= n.saturating_mul(8),
+            "visited {visits} index rows for {n} documents"
+        );
+        let index = std::fs::read_to_string(path.join("Files/search.indexes")).unwrap();
+        assert_eq!(index.matches("updated lamp").count(), ids.len());
+        eprintln!("reindex docs={n} walks={walks} visits={visits} ms={ms:.1}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

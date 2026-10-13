@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gtk::gio;
 use omaquill::project::Item;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -191,8 +192,38 @@ fn clear<W: IsA<gtk::Widget>>(container: &W, remove: impl Fn(&gtk::Widget)) {
     }
 }
 
+/// The plain text of `uuid`, loaded once for a folder of rows that share it.
+fn plain_once(
+    uuid: &str,
+    cache: &mut HashMap<String, String>,
+    load: impl FnOnce() -> String,
+) -> String {
+    let key = uuid.to_ascii_uppercase();
+    if let Some(text) = cache.get(&key) {
+        return text.clone();
+    }
+    let text = load();
+    cache.insert(key, text.clone());
+    text
+}
+
+/// Words in `item` and its descendants. A UUID counts once.
+fn folder_words(item: &Item, counts: &HashMap<String, usize>) -> usize {
+    fn add(item: &Item, counts: &HashMap<String, usize>, seen: &mut HashSet<String>) -> usize {
+        let mut total = 0;
+        if seen.insert(item.uuid.to_ascii_uppercase()) {
+            total += counts.get(&item.uuid).copied().unwrap_or(0);
+        }
+        for child in &item.children {
+            total += add(child, counts, seen);
+        }
+        total
+    }
+    add(item, counts, &mut HashSet::new())
+}
+
 /// A card's text: the synopsis, or failing that the start of the text.
-fn card_text(win: &Win, item: &Item) -> (String, bool) {
+fn card_text(win: &Win, item: &Item, bodies: &mut HashMap<String, String>) -> (String, bool) {
     let p = win.project.borrow();
     let Some(p) = p.as_ref() else {
         return (String::new(), false);
@@ -202,10 +233,11 @@ fn card_text(win: &Win, item: &Item) -> (String, bool) {
         return (synopsis, true);
     }
     if item.kind.has_text() {
-        let text = p
-            .text(&item.uuid)
-            .map(|t| t.plain_text())
-            .unwrap_or_default();
+        let text = plain_once(&item.uuid, bodies, || {
+            p.text(&item.uuid)
+                .map(|t| t.plain_text())
+                .unwrap_or_default()
+        });
         let snippet: String = text
             .split_whitespace()
             .take(60)
@@ -249,8 +281,9 @@ impl Win {
         let b = &self.board;
         clear(&b.flow, |c| b.flow.remove(c));
         let mut shown = Vec::new();
+        let mut bodies = HashMap::new();
         for child in &folder.children {
-            b.flow.append(&self.card(child));
+            b.flow.append(&self.card(child, &mut bodies));
             shown.push(child.uuid.clone());
         }
         *b.shown.borrow_mut() = shown;
@@ -264,8 +297,8 @@ impl Win {
         self.stack.set_visible_child_name("corkboard");
     }
 
-    fn card(&self, item: &Item) -> gtk::Widget {
-        let (text, is_synopsis) = card_text(self, item);
+    fn card(&self, item: &Item, bodies: &mut HashMap<String, String>) -> gtk::Widget {
+        let (text, is_synopsis) = card_text(self, item, bodies);
         let stripe = gtk::Box::builder().css_classes(["omaquill-stripe"]).build();
         if let Some(l) = item.label.filter(|&l| l >= 0) {
             stripe.add_css_class(&format!("omaquill-label-{l}"));
@@ -375,19 +408,21 @@ impl Win {
         ));
         let mut shown = Vec::new();
         let counts = self.counts.borrow().clone();
-        fn total(item: &Item, counts: &std::collections::HashMap<String, usize>) -> usize {
-            counts.get(&item.uuid).copied().unwrap_or(0)
-                + item
-                    .children
-                    .iter()
-                    .map(|c| total(c, counts))
-                    .sum::<usize>()
-        }
         // Depth-first, children indented under their folder.
         let mut stack: Vec<(&Item, usize)> = folder.children.iter().rev().map(|c| (c, 0)).collect();
         while let Some((item, depth)) = stack.pop() {
-            let (text, is_synopsis) = card_text(self, item);
-            let synopsis = if is_synopsis { text } else { String::new() };
+            let synopsis = {
+                let project = self.project.borrow();
+                project
+                    .as_ref()
+                    .map(|p| p.synopsis(&item.uuid))
+                    .unwrap_or_default()
+            };
+            let synopsis = synopsis
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .to_string();
             b.outline.append(&row(
                 [
                     if item.title.is_empty() {
@@ -395,14 +430,10 @@ impl Win {
                     } else {
                         item.title.clone()
                     },
-                    synopsis
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("")
-                        .to_string(),
+                    synopsis,
                     name(&labels, item.label),
                     name(&statuses, item.status),
-                    group(total(item, &counts)),
+                    group(folder_words(item, &counts)),
                 ],
                 depth,
                 false,
@@ -463,6 +494,58 @@ mod tests {
         chunk(&mut out, b"IDAT", &z);
         chunk(&mut out, b"IEND", &[]);
         out
+    }
+
+    fn text_item(uuid: &str, children: Vec<Item>) -> Item {
+        Item {
+            uuid: uuid.to_string(),
+            kind: omaquill::project::Kind::Text,
+            title: String::new(),
+            label: None,
+            status: None,
+            include_in_compile: true,
+            extension: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn a_shared_document_is_loaded_once_for_a_folder() {
+        let shared = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let mut cache = HashMap::new();
+        let mut loads = 0usize;
+        for _ in 0..200 {
+            let text = plain_once(shared, &mut cache, || {
+                loads += 1;
+                "lamp ".repeat(4_000)
+            });
+            assert!(text.starts_with("lamp "));
+        }
+        assert_eq!(loads, 1, "loaded the shared document {loads} times");
+        let other = plain_once("11111111-2222-3333-4444-555555555555", &mut cache, || {
+            loads += 1;
+            "other".to_string()
+        });
+        assert_eq!(other, "other");
+        assert_eq!(loads, 2);
+    }
+
+    #[test]
+    fn folder_words_count_a_shared_uuid_once() {
+        let shared = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let mut counts = HashMap::new();
+        counts.insert(shared.to_string(), 10);
+        let mut children = Vec::new();
+        for _ in 0..200 {
+            children.push(text_item(shared, Vec::new()));
+        }
+        children.push(text_item(
+            "11111111-2222-3333-4444-555555555555",
+            Vec::new(),
+        ));
+        counts.insert("11111111-2222-3333-4444-555555555555".to_string(), 4);
+        let folder = text_item(shared, children);
+        assert_eq!(folder_words(&folder, &counts), 14);
     }
 
     #[test]
