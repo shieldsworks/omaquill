@@ -450,19 +450,63 @@ pub(crate) fn style_tag_count(style: &CharStyle) -> usize {
 /// On-screen tagging of 1,000 alternating runs, about 2,500 tag applies on
 /// one line, took 159 ms and grew with the square of that count. A paragraph
 /// under this many applies is styled before the window returns to the main
-/// loop. The count is per paragraph: a long document of ordinary paragraphs
-/// does not wait on the heaviest line's budget.
+/// loop. Above it, applying the tags and laying the line out again froze the
+/// UI thread: 10,000 runs kept a visible editor busy for 560 s, and one main
+/// loop turn took 1.3 s. The editor then shows the words and does not tag.
 pub(crate) const SYNC_TAG_APPLIES: usize = 800;
 
+/// Tag applies in the paragraph that has the most, after adjacent runs with
+/// the same style have been merged. Paragraphs do not add together.
+pub(crate) fn heavy_applies(text: &RichText) -> usize {
+    let mut heavy = 0usize;
+    let n = text.paragraphs.len();
+    for (i, p) in text.paragraphs.iter().enumerate() {
+        let mut para_applies = 0usize;
+        let mut span: Option<&CharStyle> = None;
+        let mut span_chars = 0usize;
+        let close =
+            |span: &mut Option<&CharStyle>, span_chars: &mut usize, para_applies: &mut usize| {
+                if let Some(style) = span.take()
+                    && *span_chars > 0
+                {
+                    *para_applies += style_tag_count(style);
+                }
+                *span_chars = 0;
+            };
+        for run in &p.runs {
+            if run.text.is_empty() {
+                continue;
+            }
+            let same = span.is_some_and(|style| style == &run.style);
+            if !same {
+                close(&mut span, &mut span_chars, &mut para_applies);
+                span = Some(&run.style);
+            }
+            span_chars += run.text.chars().count();
+        }
+        let fallback = CharStyle::default();
+        if i + 1 < n {
+            let newline_style = p.runs.last().map(|run| &run.style).unwrap_or(&fallback);
+            let same = span.is_some_and(|style| style == newline_style);
+            if !same {
+                close(&mut span, &mut span_chars, &mut para_applies);
+                span = Some(newline_style);
+            }
+            span_chars += 1;
+        }
+        close(&mut span, &mut span_chars, &mut para_applies);
+        para_applies += para_tags(&p.style).len();
+        heavy = heavy.max(para_applies);
+    }
+    heavy
+}
+
 /// Tags still to apply after [`Paint::begin`] has inserted the characters.
-/// The editor applies a large document in idle slices so one paragraph of
-/// many runs does not block the UI thread.
+/// [`Paint::pump`] with an unlimited budget tags every range before the
+/// caller returns to the main loop.
 pub(crate) struct Paint {
     marks: Vec<(usize, usize, CharStyle)>,
     paras: Vec<(usize, usize, ParaStyle)>,
-    /// Tag applies in the paragraph that has the most. [`SYNC_TAG_APPLIES`]
-    /// compares against this, not against the document total.
-    heavy: usize,
     index: usize,
     pos: usize,
     place: gtk::TextMark,
@@ -474,10 +518,6 @@ pub(crate) struct Paint {
 }
 
 impl Paint {
-    pub(crate) fn heavy(&self) -> usize {
-        self.heavy
-    }
-
     /// Inserts `text` with one `set_text`. Adjacent runs that share a style
     /// become one range. The newline keeps the paragraph's last character
     /// formatting, so typing at the end of a line continues in that style.
@@ -567,10 +607,10 @@ impl Paint {
         let place = buffer.create_mark(None, &buffer.start_iter(), true);
         buffer.place_cursor(&buffer.start_iter());
         buffer.set_modified(false);
+        debug_assert_eq!(heavy, heavy_applies(text));
         Self {
             marks,
             paras,
-            heavy,
             index: 0,
             pos: 0,
             place,
@@ -669,12 +709,6 @@ impl Paint {
         self.close(buffer);
         buffer.set_modified(false);
         buffer.place_cursor(&buffer.start_iter());
-    }
-
-    /// Drops the unfinished tag pass. The characters stay; the caller is
-    /// about to replace the buffer or leave this document.
-    pub(crate) fn abandon(&mut self, buffer: &TextBuffer) {
-        self.close(buffer);
     }
 
     fn close(&mut self, buffer: &TextBuffer) {
@@ -788,6 +822,31 @@ pub(crate) mod tests {
                 out.push(p);
             }
         }
+    }
+
+    #[test]
+    fn heavy_applies_uses_the_worst_paragraph_and_merges_equal_runs() {
+        let alternating = toggled(4);
+        // Even runs are size, bold, and link. Odd runs are size and link.
+        assert_eq!(heavy_applies(&alternating), 2 * 3 + 2 * 2);
+        let mut two = alternating.clone();
+        two.paragraphs.push(alternating.paragraphs[0].clone());
+        assert_eq!(heavy_applies(&two), heavy_applies(&alternating));
+        let mut paragraph = Paragraph::default();
+        for _ in 0..10 {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: true,
+                    ..CharStyle::default()
+                },
+            });
+        }
+        let uniform = RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        assert_eq!(heavy_applies(&uniform), 2);
     }
 
     #[test]

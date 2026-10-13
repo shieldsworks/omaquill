@@ -29,9 +29,8 @@ use std::rc::Rc;
 
 pub const APP_ID: &str = "io.github.shieldsworks.Omaquill";
 
-/// Shown while idle slices tag a paragraph that is too heavy to style
-/// before the window returns to the main loop.
-const FORMATTING_NOTE: &str = "Formatting this document. It can't be edited until that's done.";
+/// Shown when a paragraph has too many style runs to tag on the UI thread.
+const FORMATTING_NOTE: &str = "This document has too much inline formatting to edit safely. The words are shown plain, and the file stays unchanged.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FolderView {
@@ -626,12 +625,6 @@ impl Win {
         self.wire_inspector();
 
         let weak = Rc::downgrade(self);
-        self.editor.connect_paint_done(move || {
-            if let Some(w) = weak.upgrade() {
-                w.sync_editor_chrome();
-            }
-        });
-        let weak = Rc::downgrade(self);
         self.editor.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
                 w.dirty_text.set(true);
@@ -1171,7 +1164,7 @@ impl Win {
             self.reselect_current();
             return;
         }
-        self.editor.cancel_paint();
+        self.editor.release_plain();
         // Everything is saved; the editor and inspector are free.
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
@@ -1228,14 +1221,13 @@ impl Win {
         }
     }
 
-    /// The format bar and the banner follow the editor. A tag pass hides
-    /// the bar and says why the document cannot be edited yet. When the
-    /// pass finishes, a lossy document gets its own note back.
+    /// The format bar and the banner follow the editor. A document with too
+    /// much inline formatting hides the bar and says why it cannot be edited.
     fn sync_editor_chrome(&self) {
         if self.editor_uuid.borrow().is_none() {
             return;
         }
-        if self.editor.is_painting() {
+        if self.editor.is_too_formatted() {
             self.banner.set_title(FORMATTING_NOTE);
             self.banner.set_revealed(true);
             self.format_bar.set_visible(false);
@@ -1315,7 +1307,7 @@ impl Win {
         if !self.save_now() {
             return;
         }
-        self.editor.cancel_paint();
+        self.editor.release_plain();
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
         self.banner.set_revealed(false);
@@ -1800,14 +1792,14 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
     let win = Win::new(&app);
     win.open_project(&path);
     win.show_item(&big);
-    assert!(win.editor.is_painting());
+    assert!(win.editor.is_too_formatted());
     assert!(!win.editor.view.is_editable());
     assert!(!win.dirty_text.get());
     assert_eq!(win.editor_uuid.borrow().as_deref(), Some(big.as_str()));
     assert!(win.banner.is_revealed());
     assert_eq!(
         win.banner.title().as_str(),
-        "Formatting this document. It can't be edited until that's done."
+        "This document has too much inline formatting to edit safely. The words are shown plain, and the file stays unchanged."
     );
     // `is_visible` stays false until the window is shown. The property is
     // the flag `sync_editor_chrome` sets.
@@ -1817,10 +1809,10 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
     for _ in 0..5 {
         context.iteration(true);
     }
-    assert!(win.editor.is_painting());
+    assert!(win.editor.is_too_formatted());
     assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
     win.show_item(&short);
-    assert!(!win.editor.is_painting());
+    assert!(!win.editor.is_too_formatted());
     assert!(win.editor.view.is_editable());
     assert_eq!(win.editor.plain_text(), "Hello");
     assert!(!win.banner.is_revealed());
@@ -1851,7 +1843,7 @@ fn gtk_checks() {
     rich::tests::load_inserts_the_text_once();
     editor::tests::find_matches_across_a_style_boundary();
     editor::tests::large_documents_open_in_the_window();
-    editor::tests::a_hostile_paragraph_paints_in_idle_slices();
+    editor::tests::a_hostile_paragraph_opens_plain_and_read_only();
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();
     editor::tests::many_plain_paragraphs_stay_editable();
