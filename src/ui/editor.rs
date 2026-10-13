@@ -1656,13 +1656,25 @@ next}";
     }
 
     /// A held unspaced line wraps on characters inside the column. The buffer
-    /// is the file text, and find matches that text.
+    /// is a window of the file text, and find matches that text.
+    ///
+    /// `present` maps the window on a later main-loop turn. On the aarch64
+    /// xvfb runner that turn was 171.2 ms when the line was already loaded
+    /// (`a4a463b`). A document opens into a window that is already on screen,
+    /// so the timed turns start after the map.
     pub(crate) fn a_held_long_line_wraps_on_characters() {
         let ed = Editor::new(true);
         let window = gtk::Window::new();
         window.set_default_size(800, 600);
         window.set_child(Some(&ed.root));
         window.present();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..20 {
+            if !context.pending() {
+                break;
+            }
+            context.iteration(false);
+        }
         let chars = 10_000usize;
         let body = "a".repeat(chars);
         let started = std::time::Instant::now();
@@ -1680,7 +1692,6 @@ next}";
             ed.buffer.text(&buf_start, &buf_end, false).chars().count(),
             HELD_WINDOW
         );
-        let context = gtk::glib::MainContext::default();
         let mut max_iter = 0.0f64;
         let mut shown = false;
         for _ in 0..40 {
@@ -1697,6 +1708,7 @@ next}";
             }
         }
         assert!(shown, "the line was not allocated");
+        eprintln!("gtk held wrap open_ms={open_ms:.1} max_iter_ms={max_iter:.1}");
         assert!(max_iter < 100.0, "main-loop turn blocked {max_iter:.1} ms");
         let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
         let mut last = ed.buffer.end_iter();
