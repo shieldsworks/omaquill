@@ -433,109 +433,266 @@ pub fn logical_plain(buffer: &TextBuffer) -> String {
     buffer.text(&start, &end, false).to_string()
 }
 
-/// Replaces the buffer's contents with `text`. Not undoable.
-///
-/// The characters go in with one `set_text`. Adjacent runs that share a
-/// style become one range, and each tag name is created once. The newline
-/// keeps the paragraph's last character formatting, so typing at the end of
-/// a line continues in that style.
-pub fn load(buffer: &TextBuffer, text: &RichText) {
-    buffer.begin_irreversible_action();
-    let mut links = HashMap::new();
-    let mut body = String::new();
-    let mut marks: Vec<(usize, usize, CharStyle)> = Vec::new();
-    let mut paras: Vec<(usize, usize, &ParaStyle)> = Vec::new();
-    let mut chars = 0usize;
-    let n = text.paragraphs.len();
-    for (i, p) in text.paragraphs.iter().enumerate() {
-        let para_start = chars;
-        let mut span_style: Option<CharStyle> = None;
-        let mut span_start = chars;
-        let close_span = |span_style: &mut Option<CharStyle>,
-                          span_start: usize,
-                          chars: usize,
-                          marks: &mut Vec<(usize, usize, CharStyle)>| {
-            if let Some(style) = span_style.take()
-                && span_start < chars
-            {
-                marks.push((span_start, chars, style));
-            }
-        };
-        for run in &p.runs {
-            if run.text.is_empty() {
-                continue;
-            }
-            let same = span_style.as_ref().is_some_and(|style| style == &run.style);
-            if !same {
-                close_span(&mut span_style, span_start, chars, &mut marks);
-                span_style = Some(run.style.clone());
-                span_start = chars;
-            }
-            body.push_str(&run.text);
-            chars += run.text.chars().count();
-        }
-        if i + 1 < n {
-            let newline_style = p
-                .runs
-                .last()
-                .map(|run| run.style.clone())
-                .unwrap_or_default();
-            let same = span_style
-                .as_ref()
-                .is_some_and(|style| style == &newline_style);
-            if !same {
-                close_span(&mut span_style, span_start, chars, &mut marks);
-                span_style = Some(newline_style);
-                span_start = chars;
-            }
-            body.push('\n');
-            chars += 1;
-        }
-        close_span(&mut span_style, span_start, chars, &mut marks);
-        paras.push((para_start, chars, &p.style));
+/// How many character-tag applies a document needs after adjacent runs with
+/// the same style have been merged. `c:size` is always one of them.
+pub(crate) fn style_tag_count(style: &CharStyle) -> usize {
+    1 + usize::from(style.font.is_some())
+        + usize::from(style.bold)
+        + usize::from(style.italic)
+        + usize::from(style.underline)
+        + usize::from(style.strike)
+        + usize::from(style.script != Script::Normal)
+        + usize::from(style.color.is_some())
+        + usize::from(style.highlight.is_some())
+        + usize::from(style.link.is_some())
+}
+
+/// On-screen tagging of 1,000 alternating runs, about 2,500 tag applies on
+/// one line, took 159 ms and grew with the square of that count. A paragraph
+/// under this many applies is styled before the window returns to the main
+/// loop. The count is per paragraph: a long document of ordinary paragraphs
+/// does not wait on the heaviest line's budget.
+pub(crate) const SYNC_TAG_APPLIES: usize = 800;
+
+/// Tags still to apply after [`Paint::begin`] has inserted the characters.
+/// The editor applies a large document in idle slices so one paragraph of
+/// many runs does not block the UI thread.
+pub(crate) struct Paint {
+    marks: Vec<(usize, usize, CharStyle)>,
+    paras: Vec<(usize, usize, ParaStyle)>,
+    /// Tag applies in the paragraph that has the most. [`SYNC_TAG_APPLIES`]
+    /// compares against this, not against the document total.
+    heavy: usize,
+    index: usize,
+    pos: usize,
+    place: gtk::TextMark,
+    links: HashMap<*const str, Rc<str>>,
+    char_tags: HashMap<CharStyle, Vec<TextTag>>,
+    para_i: usize,
+    chars_done: bool,
+    closed: bool,
+}
+
+impl Paint {
+    pub(crate) fn heavy(&self) -> usize {
+        self.heavy
     }
-    note_insert(1);
-    buffer.set_text(&body);
-    let mut char_tags: HashMap<CharStyle, Vec<TextTag>> = HashMap::new();
-    let mut cursor = buffer.start_iter();
-    let place = buffer.create_mark(None, &cursor, true);
-    let mut pos = 0usize;
-    for (start, end, style) in &marks {
-        cursor = buffer.iter_at_mark(&place);
-        forward(&mut cursor, start.saturating_sub(pos));
-        buffer.move_mark(&place, &cursor);
+
+    /// Inserts `text` with one `set_text`. Adjacent runs that share a style
+    /// become one range. The newline keeps the paragraph's last character
+    /// formatting, so typing at the end of a line continues in that style.
+    pub(crate) fn begin(buffer: &TextBuffer, text: &RichText) -> Self {
+        buffer.begin_irreversible_action();
+        let mut body = String::new();
+        let mut marks = Vec::new();
+        let mut paras = Vec::new();
+        let mut heavy = 0usize;
+        let mut chars = 0usize;
+        let n = text.paragraphs.len();
+        for (i, p) in text.paragraphs.iter().enumerate() {
+            let para_start = chars;
+            let mut para_applies = 0usize;
+            let mut span_style: Option<CharStyle> = None;
+            let mut span_start = chars;
+            // Equal `CharStyle` values produce the same GTK tag set, so
+            // adjacent equal runs are one range. Alternating bold does not
+            // merge: each run keeps its own tags.
+            let close_span = |span_style: &mut Option<CharStyle>,
+                              span_start: usize,
+                              chars: usize,
+                              marks: &mut Vec<(usize, usize, CharStyle)>,
+                              para_applies: &mut usize| {
+                if let Some(style) = span_style.take()
+                    && span_start < chars
+                {
+                    *para_applies += style_tag_count(&style);
+                    marks.push((span_start, chars, style));
+                }
+            };
+            for run in &p.runs {
+                if run.text.is_empty() {
+                    continue;
+                }
+                let same = span_style.as_ref().is_some_and(|style| style == &run.style);
+                if !same {
+                    close_span(
+                        &mut span_style,
+                        span_start,
+                        chars,
+                        &mut marks,
+                        &mut para_applies,
+                    );
+                    span_style = Some(run.style.clone());
+                    span_start = chars;
+                }
+                body.push_str(&run.text);
+                chars += run.text.chars().count();
+            }
+            if i + 1 < n {
+                let newline_style = p
+                    .runs
+                    .last()
+                    .map(|run| run.style.clone())
+                    .unwrap_or_default();
+                let same = span_style
+                    .as_ref()
+                    .is_some_and(|style| style == &newline_style);
+                if !same {
+                    close_span(
+                        &mut span_style,
+                        span_start,
+                        chars,
+                        &mut marks,
+                        &mut para_applies,
+                    );
+                    span_style = Some(newline_style);
+                    span_start = chars;
+                }
+                body.push('\n');
+                chars += 1;
+            }
+            close_span(
+                &mut span_style,
+                span_start,
+                chars,
+                &mut marks,
+                &mut para_applies,
+            );
+            para_applies += para_tags(&p.style).len();
+            heavy = heavy.max(para_applies);
+            paras.push((para_start, chars, p.style.clone()));
+        }
+        note_insert(1);
+        buffer.set_text(&body);
+        let place = buffer.create_mark(None, &buffer.start_iter(), true);
+        buffer.place_cursor(&buffer.start_iter());
+        buffer.set_modified(false);
+        Self {
+            marks,
+            paras,
+            heavy,
+            index: 0,
+            pos: 0,
+            place,
+            links: HashMap::new(),
+            char_tags: HashMap::new(),
+            para_i: 0,
+            chars_done: false,
+            closed: false,
+        }
+    }
+
+    /// Applies ranges until `budget_ms` has passed. One range may run past
+    /// the budget. Returns true when every range has been tagged.
+    pub(crate) fn pump(&mut self, buffer: &TextBuffer, budget_ms: f64) -> bool {
+        if self.closed {
+            return true;
+        }
+        let started = std::time::Instant::now();
+        let mut worked = false;
+        loop {
+            if self.chars_done && self.para_i >= self.paras.len() {
+                return true;
+            }
+            if worked && started.elapsed().as_secs_f64() * 1000.0 >= budget_ms {
+                return false;
+            }
+            if !self.chars_done {
+                self.paint_range(buffer);
+            } else {
+                self.paint_paragraph(buffer);
+            }
+            worked = true;
+        }
+    }
+
+    fn paint_range(&mut self, buffer: &TextBuffer) {
+        if self.index >= self.marks.len() {
+            self.chars_done = true;
+            return;
+        }
+        let (start, end, style) = self.marks[self.index].clone();
+        let mut cursor = buffer.iter_at_mark(&self.place);
+        forward(&mut cursor, start.saturating_sub(self.pos));
+        buffer.move_mark(&self.place, &cursor);
         let mut stop = cursor;
-        forward(&mut stop, end.saturating_sub(*start));
+        forward(&mut stop, end.saturating_sub(start));
         let stop_mark = buffer.create_mark(None, &stop, false);
-        let tags: Vec<TextTag> =
-            cached_char_tags(&mut char_tags, buffer, style, &mut links).to_vec();
+        let tags = cached_char_tags(&mut self.char_tags, buffer, &style, &mut self.links).to_vec();
         for text_tag in &tags {
-            let head = buffer.iter_at_mark(&place);
+            let head = buffer.iter_at_mark(&self.place);
             let tail = buffer.iter_at_mark(&stop_mark);
             buffer.apply_tag(text_tag, &head, &tail);
         }
-        buffer.move_mark(&place, &buffer.iter_at_mark(&stop_mark));
+        buffer.move_mark(&self.place, &buffer.iter_at_mark(&stop_mark));
         buffer.delete_mark(&stop_mark);
-        pos = *end;
+        self.pos = end;
+        self.index += 1;
+        if self.index >= self.marks.len() {
+            self.chars_done = true;
+            self.pos = 0;
+            buffer.move_mark(&self.place, &buffer.start_iter());
+        }
     }
-    buffer.delete_mark(&place);
-    let mut cursor = buffer.start_iter();
-    let mut pos = 0usize;
-    for (start, end, style) in paras {
+
+    fn paint_paragraph(&mut self, buffer: &TextBuffer) {
+        if self.para_i >= self.paras.len() {
+            return;
+        }
+        let (start, end, style) = self.paras[self.para_i].clone();
+        self.para_i += 1;
+        let mut cursor = buffer.iter_at_mark(&self.place);
+        forward(&mut cursor, start.saturating_sub(self.pos));
+        buffer.move_mark(&self.place, &cursor);
         if start == end {
-            continue;
+            self.pos = end;
+            return;
         }
-        forward(&mut cursor, start.saturating_sub(pos));
-        pos = start;
-        let mut stop = cursor;
+        let mut stop = buffer.iter_at_mark(&self.place);
         forward(&mut stop, end.saturating_sub(start));
-        for name in para_tags(style) {
-            buffer.apply_tag(&tag(buffer, &name), &cursor, &stop);
+        let head = buffer.create_mark(None, &buffer.iter_at_mark(&self.place), true);
+        let tail = buffer.create_mark(None, &stop, false);
+        for name in para_tags(&style) {
+            buffer.apply_tag(
+                &tag(buffer, &name),
+                &buffer.iter_at_mark(&head),
+                &buffer.iter_at_mark(&tail),
+            );
         }
+        buffer.move_mark(&self.place, &buffer.iter_at_mark(&tail));
+        self.pos = end;
+        buffer.delete_mark(&head);
+        buffer.delete_mark(&tail);
     }
-    buffer.end_irreversible_action();
-    buffer.set_modified(false);
-    buffer.place_cursor(&buffer.start_iter());
+
+    pub(crate) fn finish(&mut self, buffer: &TextBuffer) {
+        self.close(buffer);
+        buffer.set_modified(false);
+        buffer.place_cursor(&buffer.start_iter());
+    }
+
+    /// Drops the unfinished tag pass. The characters stay; the caller is
+    /// about to replace the buffer or leave this document.
+    pub(crate) fn abandon(&mut self, buffer: &TextBuffer) {
+        self.close(buffer);
+    }
+
+    fn close(&mut self, buffer: &TextBuffer) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        buffer.delete_mark(&self.place);
+        buffer.end_irreversible_action();
+    }
+}
+
+/// Replaces the buffer's contents with `text`. Not undoable.
+#[cfg(test)]
+pub(crate) fn load(buffer: &TextBuffer, text: &RichText) {
+    let mut paint = Paint::begin(buffer, text);
+    while !paint.pump(buffer, f64::MAX) {}
+    paint.finish(buffer);
 }
 
 fn cached_char_tags<'a>(
@@ -631,6 +788,31 @@ pub(crate) mod tests {
                 out.push(p);
             }
         }
+    }
+
+    #[test]
+    fn style_tag_count_matches_the_tag_list() {
+        let full = CharStyle {
+            font: Some("Palatino".into()),
+            size: 24,
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+            color: Some((1, 2, 3)),
+            highlight: Some((4, 5, 6)),
+            script: Script::Super,
+            link: Some(Rc::from("https://example.test/chapter")),
+        };
+        assert_eq!(style_tag_count(&full), char_tags(&full).len());
+        let plain = CharStyle::default();
+        assert_eq!(char_tags(&plain), vec!["c:size=24".to_string()]);
+        assert_eq!(style_tag_count(&plain), 1);
+        let sub = CharStyle {
+            script: Script::Sub,
+            ..CharStyle::default()
+        };
+        assert_eq!(style_tag_count(&sub), char_tags(&sub).len());
     }
 
     #[test]

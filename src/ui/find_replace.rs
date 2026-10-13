@@ -476,6 +476,7 @@ fn reload(win: &Win, report: &replace::Report) {
             {
                 win.editor.load(&text);
                 win.dirty_text.set(false);
+                win.sync_editor_chrome();
             }
             if id.field() == Field::Notes
                 && win.inspector.uuid().as_deref() == Some(id.uuid())

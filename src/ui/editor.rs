@@ -40,6 +40,18 @@ pub struct Editor {
     changed: RefCell<Vec<Box<dyn Fn()>>>,
     formatting: RefCell<Vec<FormattingCallback>>,
     cursor: RefCell<Vec<Box<dyn Fn()>>>,
+    /// Tags not yet applied. While this is set, [`Self::text`] returns the
+    /// source document so a save cannot write a half-styled buffer.
+    paint: RefCell<Option<rich::Paint>>,
+    paint_idle: RefCell<Option<glib::SourceId>>,
+    painted_source: RefCell<Option<RichText>>,
+    restore_edit: Cell<bool>,
+    max_paint_slice_ms: Cell<f64>,
+    paint_done: RefCell<Vec<Box<dyn Fn()>>>,
+    /// Editable once a tag pass finishes. The view itself is not editable
+    /// during the pass.
+    edit_when_ready: Cell<bool>,
+    me: RefCell<std::rc::Weak<Editor>>,
 }
 
 impl Editor {
@@ -104,7 +116,16 @@ impl Editor {
             changed: RefCell::new(Vec::new()),
             formatting: RefCell::new(Vec::new()),
             cursor: RefCell::new(Vec::new()),
+            paint: RefCell::new(None),
+            paint_idle: RefCell::new(None),
+            painted_source: RefCell::new(None),
+            restore_edit: Cell::new(true),
+            max_paint_slice_ms: Cell::new(0.0),
+            paint_done: RefCell::new(Vec::new()),
+            edit_when_ready: Cell::new(true),
+            me: RefCell::new(std::rc::Weak::new()),
         });
+        *ed.me.borrow_mut() = Rc::downgrade(&ed);
         ed.wire();
         ed
     }
@@ -223,17 +244,127 @@ impl Editor {
     }
 
     pub fn load(&self, text: &RichText) {
+        self.cancel_paint();
         *self.lossy.borrow_mut() = text.lossy.clone();
         self.loading.set(true);
-        // A visible view relayouts on every tag. Fill the buffer while the
-        // view holds an empty spare, then show the finished text once.
-        let spare = gtk::TextBuffer::new(None);
-        self.view.set_buffer(Some(&spare));
-        rich::load(&self.buffer, text);
-        self.view.set_buffer(Some(&self.buffer));
-        self.loading.set(false);
+        self.max_paint_slice_ms.set(0.0);
+        let mut paint = rich::Paint::begin(&self.buffer, text);
+        let edit = self.edit_when_ready.get();
+        // A paragraph under the threshold is tagged before this returns, so
+        // the main loop never paints it plain. A heavier one stays plain
+        // until idle slices finish, and the view stays read-only so an edit
+        // cannot race them.
+        if paint.heavy() <= rich::SYNC_TAG_APPLIES {
+            while !paint.pump(&self.buffer, f64::MAX) {}
+            paint.finish(&self.buffer);
+            self.loading.set(false);
+            self.view.set_editable(edit);
+            self.view.set_cursor_visible(edit);
+            self.pending.borrow_mut().clear();
+            self.report();
+            return;
+        }
+        self.painted_source.borrow_mut().replace(text.clone());
+        self.restore_edit.set(edit);
+        self.view.set_editable(false);
+        self.view.set_cursor_visible(false);
+        self.paint.borrow_mut().replace(paint);
+        self.arm_paint();
         self.pending.borrow_mut().clear();
         self.report();
+    }
+
+    /// Whether typing is allowed once tagging finishes. While a pass is
+    /// running the view stays read-only either way.
+    pub fn set_editing(&self, on: bool) {
+        self.edit_when_ready.set(on);
+        if !self.is_painting() {
+            self.view.set_editable(on);
+            self.view.set_cursor_visible(on);
+        }
+    }
+
+    pub fn is_painting(&self) -> bool {
+        self.paint.borrow().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_paint_slice_ms(&self) -> f64 {
+        self.max_paint_slice_ms.get()
+    }
+
+    /// Runs after an idle tag pass finishes and the view can be edited again.
+    pub fn connect_paint_done(&self, f: impl Fn() + 'static) {
+        self.paint_done.borrow_mut().push(Box::new(f));
+    }
+
+    /// Stops an idle tag pass. The buffer may be only partly styled. The
+    /// next [`Self::load`] replaces it.
+    pub fn cancel_paint(&self) {
+        let painting = self.paint.borrow().is_some();
+        if let Some(id) = self.paint_idle.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(mut paint) = self.paint.borrow_mut().take() {
+            paint.abandon(&self.buffer);
+        }
+        self.painted_source.borrow_mut().take();
+        self.loading.set(false);
+        if painting {
+            let edit = self.edit_when_ready.get();
+            self.view.set_editable(edit);
+            self.view.set_cursor_visible(edit);
+        }
+    }
+
+    fn arm_paint(&self) {
+        if self.paint_idle.borrow().is_some() {
+            return;
+        }
+        let weak = self.me.borrow().clone();
+        let id = glib::idle_add_local(move || {
+            let Some(ed) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            ed.pump_paint()
+        });
+        *self.paint_idle.borrow_mut() = Some(id);
+    }
+
+    /// One idle slice. 40 ms leaves room for the one range that starts
+    /// inside the budget. On screen, 4,000 alternating runs stayed at a
+    /// 41 ms slice with that budget.
+    fn pump_paint(&self) -> glib::ControlFlow {
+        let started = std::time::Instant::now();
+        let finished = match self.paint.borrow_mut().as_mut() {
+            Some(paint) => paint.pump(&self.buffer, 40.0),
+            None => return glib::ControlFlow::Break,
+        };
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.max_paint_slice_ms
+            .set(self.max_paint_slice_ms.get().max(ms));
+        if !finished {
+            return glib::ControlFlow::Continue;
+        }
+        // `SourceId` does not remove its source when dropped. Break does.
+        self.paint_idle.borrow_mut().take();
+        self.finish_paint();
+        glib::ControlFlow::Break
+    }
+
+    fn finish_paint(&self) {
+        if let Some(mut paint) = self.paint.borrow_mut().take() {
+            paint.finish(&self.buffer);
+        }
+        self.painted_source.borrow_mut().take();
+        self.loading.set(false);
+        let edit = self.restore_edit.get();
+        self.view.set_editable(edit);
+        self.view.set_cursor_visible(edit);
+        self.report();
+        for f in self.paint_done.borrow().iter() {
+            f();
+        }
     }
 
     /// The formatting for text typed into an empty document.
@@ -255,6 +386,9 @@ impl Editor {
     }
 
     pub fn text(&self) -> RichText {
+        if let Some(source) = self.painted_source.borrow().as_ref() {
+            return source.clone();
+        }
         rich::save(&self.buffer)
     }
 
@@ -275,7 +409,7 @@ impl Editor {
         &self,
         plan: &omaquill::replace::EditPlan,
     ) -> Option<omaquill::replace::Cursor> {
-        if plan.is_empty() {
+        if plan.is_empty() || self.loading.get() {
             return None;
         }
         self.pending.borrow_mut().clear();
@@ -443,6 +577,9 @@ impl Editor {
     /// Bold, italic, underline or strikethrough (`c:b`, `c:i`, `c:u`,
     /// `c:s`) on the selection, or for what's typed next.
     pub fn toggle(&self, name: &str) {
+        if self.loading.get() {
+            return;
+        }
         let buffer = &self.buffer;
         let tag = rich::tag(buffer, name);
         match buffer.selection_bounds() {
@@ -922,12 +1059,157 @@ next}";
         window.close();
     }
 
-    /// Open times for one paragraph of many style runs. Set
-    /// OMAQUILL_GTK_OPEN. The paragraph stays one line.
-    pub(crate) fn time_styled_paragraph_open() {
-        if std::env::var_os("OMAQUILL_GTK_OPEN").is_none() {
-            return;
+    fn drain_paint(ed: &Editor) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while ed.is_painting() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "paint idle did not finish"
+            );
+            if !context.iteration(false) {
+                context.iteration(true);
+            }
         }
+    }
+
+    /// A paragraph GTK cannot tag in one short block shows its words at
+    /// once, on one line, and finishes styling from idle slices. Find works
+    /// on the plain text. The buffer's saved form stays the source document
+    /// until the slices finish, so a save cannot write a half-styled copy.
+    pub(crate) fn a_hostile_paragraph_paints_in_idle_slices() {
+        let mut text = toggled(2_000);
+        text.paragraphs[0].runs[1_000].text = "q".into();
+        text.paragraphs[0].runs[1_001].text = "z".into();
+        let ed = Editor::new(true);
+        let started = std::time::Instant::now();
+        ed.load(&text);
+        let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("hostile open ms={open_ms:.1}");
+        assert!(
+            open_ms < 100.0,
+            "open blocked the thread for {open_ms:.1} ms"
+        );
+        assert!(ed.is_painting());
+        assert!(!ed.view.is_editable());
+        assert!(!ed.view.is_cursor_visible());
+        assert_eq!(ed.buffer.line_count(), 1);
+        assert_eq!(ed.text(), text);
+        assert!(ed.plain_text().contains("qz"));
+        ed.search_entry.set_text("qz");
+        ed.find(true);
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("find missed qz before tagging finished");
+        assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "qz");
+        drain_paint(&ed);
+        assert!(!ed.is_painting());
+        assert!(ed.view.is_editable());
+        assert!(ed.view.is_cursor_visible());
+        assert!(
+            ed.max_paint_slice_ms() < 100.0,
+            "a slice blocked for {:.1} ms",
+            ed.max_paint_slice_ms()
+        );
+        assert_eq!(ed.buffer.line_count(), 1);
+        assert_eq!(ed.text().paragraphs, text.paragraphs);
+    }
+
+    /// Loading another document cancels the idle pass. Later idle turns
+    /// must not write the old paragraph back.
+    pub(crate) fn switching_mid_paint_leaves_the_new_document() {
+        let big = toggled(2_000);
+        let ed = Editor::new(true);
+        ed.load(&big);
+        assert!(ed.is_painting());
+        assert_eq!(ed.text(), big);
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..30 {
+            if ed.max_paint_slice_ms() > 0.0 {
+                break;
+            }
+            context.iteration(true);
+        }
+        assert!(ed.max_paint_slice_ms() > 0.0, "idle never tagged");
+        assert!(ed.is_painting());
+        let hello = rtf::RichText::from_plain("Hello");
+        ed.load(&hello);
+        assert!(!ed.is_painting());
+        assert!(ed.view.is_editable());
+        assert_eq!(ed.plain_text(), "Hello");
+        assert_eq!(ed.text().plain_text(), "Hello");
+        for _ in 0..40 {
+            if !context.iteration(false) {
+                break;
+            }
+        }
+        assert!(!ed.is_painting());
+        assert_eq!(ed.plain_text(), "Hello");
+        assert_eq!(ed.text().plain_text(), "Hello");
+    }
+
+    /// Adjacent runs with the same style are one GTK range, so a long
+    /// uniform paragraph is styled before load returns.
+    pub(crate) fn identical_runs_open_without_an_idle_pass() {
+        let runs = 5_000usize;
+        let mut paragraph = Paragraph::default();
+        for _ in 0..runs {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: true,
+                    ..CharStyle::default()
+                },
+            });
+        }
+        let text = RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        let ed = Editor::new(true);
+        ed.load(&text);
+        assert!(!ed.is_painting());
+        assert!(ed.view.is_editable());
+        assert_eq!(ed.buffer.line_count(), 1);
+        let names = rich::tag_names(&ed.buffer.start_iter());
+        assert!(names.iter().any(|name| name == "c:b"));
+        let back = ed.text();
+        assert_eq!(back.paragraphs.len(), 1);
+        assert_eq!(back.paragraphs[0].runs.len(), 1);
+        assert_eq!(back.paragraphs[0].runs[0].text.len(), runs);
+    }
+
+    /// Many ordinary paragraphs stay fully styled. The idle pass is for one
+    /// paragraph with a large tag count, not for a long manuscript.
+    pub(crate) fn many_plain_paragraphs_stay_editable() {
+        let mut paragraphs = Vec::new();
+        for _ in 0..2_000 {
+            paragraphs.push(Paragraph {
+                runs: vec![Run {
+                    text: "Hello".into(),
+                    style: CharStyle::default(),
+                }],
+                ..Paragraph::default()
+            });
+        }
+        let ed = Editor::new(true);
+        ed.load(&RichText {
+            paragraphs,
+            lossy: Vec::new(),
+        });
+        assert!(!ed.is_painting());
+        assert!(ed.view.is_editable());
+        assert_eq!(ed.buffer.line_count(), 2_000);
+    }
+
+    /// Open times for one paragraph of many style runs, painted in idle
+    /// slices on a visible view. Set OMAQUILL_GTK_OPEN=1 for every size, or
+    /// set it to one run count. The paragraph stays one line.
+    pub(crate) fn time_styled_paragraph_open() {
+        let Some(which) = std::env::var("OMAQUILL_GTK_OPEN").ok() else {
+            return;
+        };
         let ed = Editor::new(true);
         let window = gtk::Window::new();
         window.set_default_size(800, 600);
@@ -941,29 +1223,43 @@ next}";
             context.iteration(false);
         }
         for runs in [1_000usize, 2_000, 4_000, 10_000, 50_000, 100_000] {
+            if which != "1" && which != runs.to_string() {
+                continue;
+            }
             let text = toggled(runs);
-            let buffer = gtk::TextBuffer::new(None);
-            let started = std::time::Instant::now();
-            rich::load(&buffer, &text);
-            let bare_ms = started.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(buffer.line_count(), 1);
             let started = std::time::Instant::now();
             ed.load(&text);
-            let mut shown_ms = started.elapsed().as_secs_f64() * 1000.0;
-            for _ in 0..30 {
-                if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
-                    shown_ms = started.elapsed().as_secs_f64() * 1000.0;
-                    break;
+            let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(ed.buffer.line_count(), 1);
+            assert!(ed.is_painting(), "{runs} runs were tagged inside load");
+            let cpu = std::time::Instant::now();
+            let mut max_iter_ms = 0.0f64;
+            while ed.is_painting() {
+                let step = std::time::Instant::now();
+                let ran = context.iteration(false);
+                let iter_ms = step.elapsed().as_secs_f64() * 1000.0;
+                if ran {
+                    max_iter_ms = max_iter_ms.max(iter_ms);
+                } else {
+                    context.iteration(true);
                 }
-                if !context.pending() {
-                    break;
-                }
-                context.iteration(false);
             }
+            let cpu_ms = cpu.elapsed().as_secs_f64() * 1000.0;
+            let slice_ms = ed.max_paint_slice_ms();
             eprintln!(
-                "gtk open runs={runs} lines={} bare_ms={bare_ms:.1} shown_ms={shown_ms:.1}",
+                "gtk slice runs={runs} lines={} open_ms={open_ms:.1} cpu_ms={cpu_ms:.1} max_slice_ms={slice_ms:.1} max_iter_ms={max_iter_ms:.1}",
                 ed.buffer.line_count()
             );
+            assert!(open_ms < 100.0, "open blocked {open_ms:.1} ms at {runs}");
+            assert!(
+                slice_ms < 100.0,
+                "a slice blocked {slice_ms:.1} ms at {runs}"
+            );
+            assert!(
+                max_iter_ms < 100.0,
+                "a main-loop turn blocked {max_iter_ms:.1} ms at {runs}"
+            );
+            assert!(ed.view.is_editable());
             assert_eq!(ed.buffer.line_count(), 1);
             assert_eq!(ed.text().paragraphs.len(), 1);
             assert_eq!(ed.text().paragraphs[0].runs.len(), runs);

@@ -29,6 +29,10 @@ use std::rc::Rc;
 
 pub const APP_ID: &str = "io.github.shieldsworks.Omaquill";
 
+/// Shown while idle slices tag a paragraph that is too heavy to style
+/// before the window returns to the main loop.
+const FORMATTING_NOTE: &str = "Formatting this document. It can't be edited until that's done.";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FolderView {
     Text,
@@ -622,6 +626,12 @@ impl Win {
         self.wire_inspector();
 
         let weak = Rc::downgrade(self);
+        self.editor.connect_paint_done(move || {
+            if let Some(w) = weak.upgrade() {
+                w.sync_editor_chrome();
+            }
+        });
+        let weak = Rc::downgrade(self);
         self.editor.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
                 w.dirty_text.set(true);
@@ -1161,6 +1171,7 @@ impl Win {
             self.reselect_current();
             return;
         }
+        self.editor.cancel_paint();
         // Everything is saved; the editor and inspector are free.
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
@@ -1217,6 +1228,34 @@ impl Win {
         }
     }
 
+    /// The format bar and the banner follow the editor. A tag pass hides
+    /// the bar and says why the document cannot be edited yet. When the
+    /// pass finishes, a lossy document gets its own note back.
+    fn sync_editor_chrome(&self) {
+        if self.editor_uuid.borrow().is_none() {
+            return;
+        }
+        if self.editor.is_painting() {
+            self.banner.set_title(FORMATTING_NOTE);
+            self.banner.set_revealed(true);
+            self.format_bar.set_visible(false);
+            return;
+        }
+        if !self.composing.get() {
+            self.format_bar.set_visible(true);
+        }
+        let lossy = self.editor.lossy();
+        if lossy.is_empty() {
+            self.banner.set_revealed(false);
+        } else {
+            self.banner.set_title(&format!(
+                "This document has {} that omaquill shows as plain text. Editing it keeps the words but not that layout.",
+                join_words(&lossy)
+            ));
+            self.banner.set_revealed(true);
+        }
+    }
+
     fn show_text(self: &Rc<Self>, item: &Item) {
         let text = self
             .project
@@ -1227,9 +1266,8 @@ impl Win {
         match text {
             Ok(Some(text)) => {
                 let stored = omaquill::project::is_uuid(&item.uuid);
-                self.editor.view.set_editable(stored);
-                self.editor.view.set_cursor_visible(stored);
                 if !stored {
+                    self.editor.set_editing(false);
                     self.editor.load(&rtf::RichText::from_plain(""));
                     self.banner.set_title("This item has no file.");
                     self.banner.set_revealed(true);
@@ -1239,18 +1277,12 @@ impl Win {
                     self.stack.set_visible_child_name("editor");
                     return;
                 }
-                if !text.lossy.is_empty() {
-                    self.banner.set_title(&format!(
-                        "This document has {} that omaquill shows as plain text. Editing it keeps the words but not that layout.",
-                        join_words(&text.lossy)
-                    ));
-                    self.banner.set_revealed(true);
-                }
+                self.editor.set_editing(true);
                 self.editor.load(&text);
                 self.spell.rescan();
                 self.dirty_text.set(false);
                 *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
-                self.format_bar.set_visible(true);
+                self.sync_editor_chrome();
                 self.stack.set_visible_child_name("editor");
                 // Browsing the binder with the keyboard keeps focus there.
                 // set_focus works before the window is shown; grab_focus doesn't.
@@ -1283,8 +1315,10 @@ impl Win {
         if !self.save_now() {
             return;
         }
+        self.editor.cancel_paint();
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
+        self.banner.set_revealed(false);
         match view {
             FolderView::Text if item.kind.has_text() => self.show_text(&item),
             FolderView::Outliner => self.show_outliner(&item),
@@ -1719,6 +1753,88 @@ fn id_less_text_is_read_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(test)]
+fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
+    let dir = std::env::temp_dir().join(format!("omaquill-paint-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Paint.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let big = project
+        .add_item(Kind::Text, "Hostile", &draft, None)
+        .unwrap();
+    let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
+    let link: Rc<str> = Rc::from("https://example.test/chapter");
+    let mut paragraph = rtf::Paragraph::default();
+    for i in 0..2_000 {
+        paragraph.runs.push(rtf::Run {
+            text: "a".into(),
+            style: rtf::CharStyle {
+                bold: i % 2 == 0,
+                link: Some(Rc::clone(&link)),
+                ..rtf::CharStyle::default()
+            },
+        });
+    }
+    project
+        .set_text(
+            &big,
+            &rtf::RichText {
+                paragraphs: vec![paragraph],
+                lossy: Vec::new(),
+            },
+        )
+        .unwrap();
+    project
+        .set_text(&short, &rtf::RichText::from_plain("Hello"))
+        .unwrap();
+    project.save().unwrap();
+    let rtf_path = project.data_dir(&big).join("content.rtf");
+    let before = std::fs::read(&rtf_path).unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Paint")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.show_item(&big);
+    assert!(win.editor.is_painting());
+    assert!(!win.editor.view.is_editable());
+    assert!(!win.dirty_text.get());
+    assert_eq!(win.editor_uuid.borrow().as_deref(), Some(big.as_str()));
+    assert!(win.banner.is_revealed());
+    assert_eq!(
+        win.banner.title().as_str(),
+        "Formatting this document. It can't be edited until that's done."
+    );
+    assert!(!win.format_bar.is_visible());
+    assert_eq!(win.editor.buffer.line_count(), 1);
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..5 {
+        context.iteration(true);
+    }
+    assert!(win.editor.is_painting());
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    win.show_item(&short);
+    assert!(!win.editor.is_painting());
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "Hello");
+    assert!(!win.banner.is_revealed());
+    assert!(win.format_bar.is_visible());
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    for _ in 0..20 {
+        if !context.iteration(false) {
+            break;
+        }
+    }
+    assert_eq!(win.editor.plain_text(), "Hello");
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
 /// that started it, and each #[test] gets its own thread. Needs a display;
 /// skipped without one (CI).
@@ -1733,9 +1849,14 @@ fn gtk_checks() {
     rich::tests::load_inserts_the_text_once();
     editor::tests::find_matches_across_a_style_boundary();
     editor::tests::large_documents_open_in_the_window();
+    editor::tests::a_hostile_paragraph_paints_in_idle_slices();
+    editor::tests::switching_mid_paint_leaves_the_new_document();
+    editor::tests::identical_runs_open_without_an_idle_pass();
+    editor::tests::many_plain_paragraphs_stay_editable();
     editor::tests::time_styled_paragraph_open();
     spell::tests::one_paragraph_is_one_spelling_line();
     id_less_text_is_read_only();
+    a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();
