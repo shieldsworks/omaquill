@@ -3,6 +3,7 @@ use omaquill::replace::{self, ApplyError, ApplyOutcome, Case, Mode, Options, Wor
 use omaquill::rtf::{self, Align, CharStyle, ParaStyle, Paragraph, RichText, Run};
 use omaquill::sha1;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -657,16 +658,22 @@ fn read_only_document_stays_byte_for_byte() {
 #[test]
 fn disk_full_backup_leaves_the_project() {
     if std::env::var_os("OMAQUILL_FULL_READY").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        // RLIMIT_FSIZE applies to the child's regular files. The harness
+        // stdout is often one of those, and it is already larger than the
+        // limit by the time this test runs. The child writes its result to
+        // a pipe, which the limit does not cover.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "disk_full_backup_leaves_the_project",
                 "--test-threads=1",
             ])
             .env("OMAQUILL_FULL_READY", "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        std::io::stdout().write_all(&output.stdout).unwrap();
+        std::io::stderr().write_all(&output.stderr).unwrap();
+        assert!(output.status.success());
         return;
     }
     let copy = copy_fixture("full");
