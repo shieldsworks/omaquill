@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 thread_local! {
     static CONTENT_WRITES: Cell<u64> = const { Cell::new(0) };
+    static RETAINED_INDEX: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -36,6 +37,24 @@ pub(crate) fn reset_content_writes() {
 #[cfg(test)]
 pub(crate) fn content_writes() -> u64 {
     CONTENT_WRITES.with(|n| n.get())
+}
+
+fn note_retained(docs: &HashMap<String, IndexedDoc>) {
+    #[cfg(test)]
+    {
+        let n = docs
+            .values()
+            .map(|doc| doc.body.capacity() + doc.notes.as_ref().map(String::capacity).unwrap_or(0))
+            .sum();
+        RETAINED_INDEX.with(|kept| kept.set(n));
+    }
+    #[cfg(not(test))]
+    let _ = docs;
+}
+
+#[cfg(test)]
+fn retained_index() -> usize {
+    RETAINED_INDEX.with(|kept| kept.get())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -961,25 +980,41 @@ impl Project {
         index_items(self, &self.items(), &mut docs, &mut slots);
         let mut counts = HashMap::new();
         let mut search = HashMap::new();
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for uuid in slots.keys() {
+            if is_uuid(uuid) {
+                *uses.entry(uuid.to_ascii_uppercase()).or_default() += 1;
+            }
+        }
         for (uuid, slot) in slots {
-            let doc = is_uuid(&uuid)
-                .then(|| docs.get(&uuid.to_ascii_uppercase()))
-                .flatten();
-            let synopsis = doc.map(|d| d.synopsis.as_str()).unwrap_or("");
+            let key = uuid.to_ascii_uppercase();
+            let doc = is_uuid(&uuid).then(|| docs.get_mut(&key)).flatten();
+            let synopsis = doc.as_ref().map(|d| d.synopsis.as_str()).unwrap_or("");
             let mut text = format!("{}\n{synopsis}\n", slot.title);
             if slot.has_text {
-                text.push_str(doc.map(|d| d.body.as_str()).unwrap_or(""));
+                text.push_str(doc.as_ref().map(|d| d.body.as_str()).unwrap_or(""));
             }
             if slot.saw_text {
-                let body = doc.map(|d| d.body.as_str()).unwrap_or("");
+                let body = doc.as_ref().map(|d| d.body.as_str()).unwrap_or("");
                 counts.insert(uuid.clone(), rtf::word_count(body));
             }
-            if doc.is_none_or(|d| d.notes.is_some()) {
+            if doc.as_ref().is_none_or(|d| d.notes.is_some()) {
                 text.push('\n');
-                text.push_str(doc.and_then(|d| d.notes.as_deref()).unwrap_or(""));
+                text.push_str(doc.as_ref().and_then(|d| d.notes.as_deref()).unwrap_or(""));
+            }
+            if let Some(doc) = doc {
+                let left = uses
+                    .get_mut(&key)
+                    .expect("every indexed document has a slot");
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    doc.body = String::new();
+                    doc.notes = None;
+                }
             }
             search.insert(uuid, text.to_lowercase());
         }
+        note_retained(&docs);
         BinderIndex { counts, search }
     }
 
@@ -1645,6 +1680,46 @@ mod tests {
         }
         walk(&mut doc.root, aliases, bare, shared);
         std::fs::write(scrivx, doc.to_xml()).unwrap();
+    }
+
+    #[test]
+    fn binder_index_releases_each_body() {
+        let (path, mut project) = temp_project("release");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let body = "lamp ".repeat(4_000);
+        let mut ids = Vec::new();
+        for n in 0..64 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project.set_text(&id, &RichText::from_plain(&body)).unwrap();
+            ids.push(id);
+        }
+        let alias = project.add_item(Kind::Text, "Alias", &draft, None).unwrap();
+        project.save().unwrap();
+        let shared = ids[0].clone();
+        let lower = shared.to_ascii_lowercase();
+        let mut aliases = HashSet::new();
+        aliases.insert(alias);
+        rewrite_ids(&path, &aliases, &HashSet::new(), &lower);
+        let project = Project::open(&path).unwrap();
+        let indexed = project.binder_index();
+        let kept = retained_index();
+        let one = body.len();
+        assert_eq!(
+            kept,
+            0,
+            "kept {kept} body bytes after indexing {} documents of {one}",
+            ids.len()
+        );
+        let upper = indexed.search.get(&shared).unwrap();
+        let folded = indexed.search.get(&lower).unwrap();
+        assert!(upper.contains("lamp"), "{upper}");
+        assert!(folded.contains("lamp"), "{folded}");
+        let words = rtf::word_count(&body);
+        assert_eq!(indexed.counts.get(&shared).copied(), Some(words));
+        assert_eq!(indexed.counts.get(&lower).copied(), Some(words));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
