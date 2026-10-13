@@ -897,22 +897,23 @@ impl Project {
                 if *examined >= STYLE_DOCUMENTS {
                     return None;
                 }
-                if i.kind.has_text() && is_uuid(&i.uuid) && seen.insert(i.uuid.to_ascii_uppercase())
+                if i.kind.has_text()
+                    && is_uuid(&i.uuid)
+                    && seen.insert(i.uuid.to_ascii_uppercase())
+                    && let Ok(t) = p.text(&i.uuid)
                 {
-                    if let Ok(t) = p.text(&i.uuid) {
-                        if let Some(par) = t
-                            .paragraphs
-                            .iter()
-                            .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
-                        {
-                            return Some((par.style.clone(), par.runs[0].style.clone()));
-                        }
-                        if t.paragraphs
-                            .iter()
-                            .any(|par| par.runs.iter().any(|r| !r.text.is_empty()))
-                        {
-                            *examined += 1;
-                        }
+                    if let Some(par) = t
+                        .paragraphs
+                        .iter()
+                        .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
+                    {
+                        return Some((par.style.clone(), par.runs[0].style.clone()));
+                    }
+                    if t.paragraphs
+                        .iter()
+                        .any(|par| par.runs.iter().any(|r| !r.text.is_empty()))
+                    {
+                        *examined += 1;
                     }
                 }
                 if let Some(found) = search(p, &i.children, seen, examined) {
