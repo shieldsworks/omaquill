@@ -14,6 +14,7 @@ use gtk::{TextBuffer, TextIter, TextTag, pango};
 use omaquill::rtf::{Align, CharStyle, LineSpacing, ParaStyle, Paragraph, RichText, Run, Script};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 thread_local! {
     /// How tags are drawn: zoom and which installed font stands in for each
@@ -299,7 +300,7 @@ fn char_style(names: &[String]) -> CharStyle {
             "size" => s.size = value.parse().unwrap_or(24),
             "fg" => s.color = unhex(value),
             "bg" => s.highlight = unhex(value),
-            "link" => s.link = Some(value.to_string()),
+            "link" => s.link = Some(Rc::from(value)),
             _ => {}
         }
     }
@@ -362,18 +363,43 @@ pub fn tag_names(iter: &TextIter) -> Vec<String> {
         .collect()
 }
 
+/// Tag names for one character style. The `c:link=` name is built once per
+/// shared target and reused for every later run.
+fn style_names(style: &CharStyle, links: &mut HashMap<*const str, Rc<str>>) -> Vec<Rc<str>> {
+    let link = style.link.clone();
+    let mut bare = style.clone();
+    bare.link = None;
+    let mut names: Vec<Rc<str>> = char_tags(&bare).into_iter().map(Rc::from).collect();
+    if let Some(link) = link {
+        let key = Rc::as_ptr(&link);
+        let name = links
+            .entry(key)
+            .or_insert_with(|| {
+                let mut tagged = String::from("c:link=");
+                tagged.push_str(&link);
+                Rc::from(tagged)
+            })
+            .clone();
+        names.push(name);
+    }
+    names
+}
+
+fn tags_from(buffer: &TextBuffer, names: &[Rc<str>]) -> Vec<TextTag> {
+    names.iter().map(|name| tag(buffer, name)).collect()
+}
+
 /// Replaces the buffer's contents with `text`. Not undoable.
 pub fn load(buffer: &TextBuffer, text: &RichText) {
     buffer.begin_irreversible_action();
     buffer.set_text("");
+    let mut links = HashMap::new();
     let n = text.paragraphs.len();
     for (i, p) in text.paragraphs.iter().enumerate() {
         let start = buffer.end_iter().offset();
         for run in &p.runs {
-            let tags: Vec<TextTag> = char_tags(&run.style)
-                .iter()
-                .map(|n| tag(buffer, n))
-                .collect();
+            let names = style_names(&run.style, &mut links);
+            let tags = tags_from(buffer, &names);
             let tag_refs: Vec<&TextTag> = tags.iter().collect();
             let mut end = buffer.end_iter();
             buffer.insert_with_tags(&mut end, &run.text, &tag_refs);
@@ -381,14 +407,11 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
         if i + 1 < n {
             // The newline takes the paragraph's last character formatting,
             // so typing at the end of a line continues in that style.
-            let tags: Vec<TextTag> = p
-                .runs
-                .last()
-                .map(|r| char_tags(&r.style))
-                .unwrap_or_else(|| char_tags(&CharStyle::default()))
-                .iter()
-                .map(|n| tag(buffer, n))
-                .collect();
+            let names = match p.runs.last() {
+                Some(run) => style_names(&run.style, &mut links),
+                None => style_names(&CharStyle::default(), &mut links),
+            };
+            let tags = tags_from(buffer, &names);
             let tag_refs: Vec<&TextTag> = tags.iter().collect();
             let mut end = buffer.end_iter();
             buffer.insert_with_tags(&mut end, "\n", &tag_refs);
@@ -480,6 +503,54 @@ pub(crate) mod tests {
                 out.push(p);
             }
         }
+    }
+
+    #[test]
+    fn a_shared_link_builds_one_tag_name() {
+        let link = "https://example.test/".repeat(80);
+        let toggles = 400usize;
+        let mut src = format!(
+            "{{\\rtf1\\ansi{{\\fonttbl\\f0 Palatino-Roman;}}\\f0{{\\field{{\\*\\fldinst{{HYPERLINK \"{link}\"}}}}{{\\fldrslt "
+        );
+        for i in 0..toggles {
+            if i % 2 == 0 {
+                src.push_str("\\b a\\b0 ");
+            } else {
+                src.push_str("a");
+            }
+        }
+        src.push_str("}}}");
+        let text = rtf::parse(src.as_bytes());
+        let mut links = HashMap::new();
+        let mut held = Vec::new();
+        let mut runs = 0usize;
+        for paragraph in &text.paragraphs {
+            for run in &paragraph.runs {
+                runs += 1;
+                held.extend(style_names(&run.style, &mut links));
+            }
+        }
+        let mut seen = std::collections::HashSet::<*const str>::new();
+        let mut bytes = 0usize;
+        for name in &held {
+            let Some(target) = name.strip_prefix("c:link=") else {
+                continue;
+            };
+            if seen.insert(Rc::as_ptr(name)) {
+                bytes += target.len();
+            }
+        }
+        let one = text.paragraphs[0].runs[0]
+            .style
+            .link
+            .as_ref()
+            .expect("the run keeps the link")
+            .len();
+        assert!(runs >= toggles / 2, "runs {runs}");
+        assert_eq!(
+            bytes, one,
+            "tag name bytes {bytes} across {runs} runs, one target is {one}"
+        );
     }
 
     /// Every document survives the trip into a GTK buffer and back. Needs

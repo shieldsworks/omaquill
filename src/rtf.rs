@@ -16,6 +16,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 #[cfg(test)]
 thread_local! {
@@ -113,7 +114,8 @@ pub struct CharStyle {
     /// another document (`scrivlnk://`), or the anchor of a Scrivener
     /// comment or footnote (`scrivcmt://`), whose text lives in the
     /// document's `content.comments`.
-    pub link: Option<String>,
+    /// Shared across runs. A bold toggle clones the style, not the target.
+    pub link: Option<Rc<str>>,
 }
 
 pub type Rgb = (u8, u8, u8);
@@ -796,7 +798,7 @@ impl Reader<'_> {
             }
             "fldrslt" => {
                 self.flush();
-                self.st.ch.link = self.field_link.take();
+                self.st.ch.link = self.field_link.take().map(Rc::from);
             }
             // Unicode.
             "uc" => self.st.uc = n.max(0) as usize,
@@ -1141,10 +1143,10 @@ pub fn write(text: &RichText) -> String {
     let mut cf = usize::MAX;
     // An open `\field`: its link, and the formatting outside it, which
     // comes back when its groups close.
-    let mut field: Option<(String, CharStyle, usize)> = None;
+    let mut field: Option<(Rc<str>, CharStyle, usize)> = None;
     fn close_field(
         out: &mut String,
-        field: &mut Option<(String, CharStyle, usize)>,
+        field: &mut Option<(Rc<str>, CharStyle, usize)>,
         ch: &mut CharStyle,
         cf: &mut usize,
     ) {
@@ -1433,6 +1435,58 @@ mod tests {
         );
         let again = parse(write(&t).as_bytes());
         assert_eq!(again.paragraphs, t.paragraphs);
+    }
+
+    #[test]
+    fn a_link_split_by_bold_is_stored_once() {
+        let link = "https://example.test/".repeat(100);
+        let toggles = 2_000usize;
+        let mut src = format!(
+            "{{\\rtf1\\ansi{{\\fonttbl\\f0 Palatino-Roman;}}\\f0{{\\field{{\\*\\fldinst{{HYPERLINK \"{link}\"}}}}{{\\fldrslt "
+        );
+        for i in 0..toggles {
+            if i % 2 == 0 {
+                src.push_str("\\b a\\b0 ");
+            } else {
+                src.push_str("a");
+            }
+        }
+        src.push_str("}}}");
+        let started = std::time::Instant::now();
+        let text = parse(src.as_bytes());
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let runs = text.paragraphs.iter().map(|p| p.runs.len()).sum::<usize>();
+        assert!(runs >= toggles / 2, "runs {runs}");
+        let bytes = link_storage_bytes(&text);
+        let one = text.paragraphs[0].runs[0]
+            .style
+            .link
+            .as_ref()
+            .expect("the run keeps the link")
+            .len();
+        assert_eq!(
+            bytes, one,
+            "link storage {bytes} across {runs} runs, one target is {one}"
+        );
+        let again = parse(write(&text).as_bytes());
+        assert_eq!(again.plain_text(), text.plain_text());
+        assert_eq!(link_storage_bytes(&again), one);
+        eprintln!("link runs={runs} stored={bytes} ms={ms:.1}");
+    }
+
+    fn link_storage_bytes(text: &RichText) -> usize {
+        let mut seen = std::collections::HashSet::<*const u8>::new();
+        let mut bytes = 0usize;
+        for paragraph in &text.paragraphs {
+            for run in &paragraph.runs {
+                if let Some(link) = &run.style.link {
+                    if seen.insert(link.as_ptr()) {
+                        bytes += link.len();
+                    }
+                }
+            }
+        }
+        bytes
     }
 
     #[test]
