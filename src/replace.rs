@@ -598,6 +598,26 @@ pub fn apply(
     preview: &Preview,
     chosen: &[MatchId],
 ) -> Result<ApplyOutcome, ApplyError> {
+    apply_at(
+        project,
+        backup_dir,
+        keep,
+        preview,
+        chosen,
+        &project::timestamp(),
+    )
+}
+
+/// [`apply`] with `now` in place of the clock. `now` has the shape
+/// [`project::timestamp`] returns.
+pub fn apply_at(
+    project: &mut Project,
+    backup_dir: &Path,
+    keep: usize,
+    preview: &Preview,
+    chosen: &[MatchId],
+    now: &str,
+) -> Result<ApplyOutcome, ApplyError> {
     let chosen: HashSet<MatchId> = chosen.iter().copied().collect();
     let mut pending = Vec::new();
     let mut missed = 0usize;
@@ -625,8 +645,7 @@ pub fn apply(
         }
         return Ok(ApplyOutcome::SkippedOnly(skipped));
     }
-    let backup = project
-        .backup(backup_dir, keep.max(1))
+    let backup = project::backup_at(&project.path, backup_dir, keep.max(1), now)
         .map_err(ApplyError::Backup)?;
     let mut written = Vec::new();
     for (id, text) in pending {

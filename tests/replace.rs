@@ -290,14 +290,17 @@ fn two_replaces_in_one_second_keep_two_restorable_backups() {
     let backups = copy.0.parent().unwrap().join("backups");
     let mut project = Project::open(&copy.0).unwrap();
     let original = file_bytes(&copy.0);
-    let first = apply_all(&mut project, &backups, "Mara", "Marian");
+    let now = "2026-01-02 03:04:05 -0700";
+    let first = apply_all(&mut project, &backups, "Mara", "Marian", now);
     let mid = file_bytes(&copy.0);
-    let second = apply_all(&mut project, &backups, "Twelve", "Eleven");
+    let second = apply_all(&mut project, &backups, "Twelve", "Eleven", now);
     assert_ne!(first, second);
     assert!(first.is_file());
     assert!(second.is_file());
     let n1 = first.file_name().unwrap().to_string_lossy();
     let n2 = second.file_name().unwrap().to_string_lossy();
+    assert_eq!(n1, "2026-01-02 03-04-05.zip");
+    assert_eq!(n2, "2026-01-02 03-04-05 2.zip");
     assert_eq!(&n1[..19], &n2[..19]);
     assert!(n2.contains(" 2") || n1.contains(" 2"));
     assert_eq!(file_bytes(&unzip_stored(&first)), original);
@@ -892,11 +895,17 @@ fn kill_during_apply_keeps_the_original_in_the_backup() {
     assert!(saw_mixed, "never killed between two document writes");
 }
 
-fn apply_all(project: &mut Project, backups: &Path, find: &str, replace_with: &str) -> PathBuf {
+fn apply_all(
+    project: &mut Project,
+    backups: &Path,
+    find: &str,
+    replace_with: &str,
+    now: &str,
+) -> PathBuf {
     let query = literal(find, replace_with);
     let preview = replace::preview(project, &query).unwrap();
     let ids = preview.ids();
-    let outcome = replace::apply(project, backups, 5, &preview, &ids).unwrap();
+    let outcome = replace::apply_at(project, backups, 5, &preview, &ids, now).unwrap();
     let ApplyOutcome::Done(report) = outcome else {
         panic!("{find} had no matches");
     };
