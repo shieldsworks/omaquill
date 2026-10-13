@@ -527,7 +527,7 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
         cursor = buffer.iter_at_mark(&place);
         forward(&mut cursor, start.saturating_sub(pos));
         buffer.move_mark(&place, &cursor);
-        let mut stop = cursor.clone();
+        let mut stop = cursor;
         forward(&mut stop, end.saturating_sub(*start));
         let stop_mark = buffer.create_mark(None, &stop, false);
         let tags: Vec<TextTag> =
@@ -568,7 +568,7 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
         }
         forward(&mut cursor, start.saturating_sub(pos));
         pos = start;
-        let mut stop = cursor.clone();
+        let mut stop = cursor;
         forward(&mut stop, end.saturating_sub(start));
         for name in para_tags(style) {
             buffer.apply_tag(&tag(buffer, &name), &cursor, &stop);
