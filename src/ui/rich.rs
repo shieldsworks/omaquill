@@ -430,7 +430,7 @@ fn forward(iter: &mut TextIter, mut n: usize) {
 /// paragraph stays one line for find and for spell.
 pub fn logical_plain(buffer: &TextBuffer) -> String {
     let (start, end) = buffer.bounds();
-    strip_display_breaks(&buffer.text(&start, &end, false))
+    buffer.text(&start, &end, false).into()
 }
 
 /// How many character-tag applies a document needs after adjacent runs with
@@ -460,20 +460,11 @@ pub(crate) const SYNC_TAG_APPLIES: usize = 800;
 /// characters, 24.4 at 4,096, 73.5 at 8,192, and 101.8 at 10,000.
 /// `set_text` itself stayed under 1 ms. The run count does not matter:
 /// uniform runs merge to one range and still produce that line. A longer
-/// breakless run is shown plain, as one unwrapped line the window scrolls
-/// sideways. Word wrap of a display break every 80 characters laid that
-/// paragraph out inside `place_cursor`, about 80 ms at 100,000 characters.
-/// Ordinary prose breaks on spaces, so a long manuscript of short words
-/// stays editable.
+/// breakless run is shown plain and read-only, with character wrap, so the
+/// line stays inside the column. Ordinary prose breaks on spaces, so a long
+/// manuscript of short words stays editable. A keystroke in an editable
+/// document is not held: that layout is the writer's own line.
 pub(crate) const SYNC_BREAKLESS_CHARS: usize = 8_192;
-
-/// A plain view inserts this between characters of an unbreakable run so
-/// word wrap can show the line. It is not part of the document.
-pub(crate) const DISPLAY_BREAK: char = '\u{200B}';
-
-/// Characters between display breaks. A column of about 760 px holds a run
-/// of this length, and word wrap of those pieces stays off the word-char path.
-pub(crate) const PLAIN_WRAP_CHARS: usize = 80;
 
 /// A no-break space glues the characters on either side. Unicode `White_Space`
 /// includes it, and a line break does not.
@@ -499,15 +490,13 @@ fn breakless_len(chars: impl Iterator<Item = char>) -> usize {
     let mut heavy = 0usize;
     let mut run = 0usize;
     for ch in chars {
-        if ch == DISPLAY_BREAK {
-            continue;
-        }
         if is_cjk_break(ch) {
             heavy = heavy.max(run).max(1);
             run = 0;
             continue;
         }
-        if ch.is_whitespace() && !is_no_break_space(ch) {
+        // U+200B is a break opportunity. Pango wraps there.
+        if ch == '\u{200B}' || (ch.is_whitespace() && !is_no_break_space(ch)) {
             heavy = heavy.max(run);
             run = 0;
             continue;
@@ -527,44 +516,6 @@ pub(crate) fn breakless_chars(text: &RichText) -> usize {
         heavy = heavy.max(breakless_len(chars));
     }
     heavy
-}
-
-/// The same count for one buffer string. A newline starts a new line.
-pub(crate) fn breakless_str(text: &str) -> usize {
-    text.split(['\n', '\r'])
-        .map(|line| breakless_len(line.chars()))
-        .max()
-        .unwrap_or(0)
-}
-
-/// `text` with [`DISPLAY_BREAK`] inserted so an unbreakable run wraps.
-pub(crate) fn with_display_breaks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut run = 0usize;
-    for ch in text.chars() {
-        if ch == DISPLAY_BREAK {
-            continue;
-        }
-        if is_cjk_break(ch) || (ch.is_whitespace() && !is_no_break_space(ch)) {
-            out.push(ch);
-            run = 0;
-            continue;
-        }
-        if run == PLAIN_WRAP_CHARS {
-            out.push(DISPLAY_BREAK);
-            run = 0;
-        }
-        out.push(ch);
-        run += 1;
-    }
-    out
-}
-
-pub(crate) fn strip_display_breaks(text: &str) -> String {
-    if !text.contains(DISPLAY_BREAK) {
-        return text.to_string();
-    }
-    text.chars().filter(|&ch| ch != DISPLAY_BREAK).collect()
 }
 
 /// The plain read-only view. Either the heaviest paragraph needs too many
@@ -892,7 +843,7 @@ pub fn save(buffer: &TextBuffer) -> RichText {
             let text: String = buffer
                 .text(&at, &next, true)
                 .chars()
-                .filter(|&c| c != '\u{fffc}' && c != DISPLAY_BREAK)
+                .filter(|&c| c != '\u{fffc}')
                 .collect();
             let s = char_style(&tag_names(&at), &mut links);
             match p.runs.last_mut() {
@@ -986,13 +937,9 @@ pub(crate) mod tests {
         let cjk = "漢".repeat(10_000);
         assert_eq!(breakless_chars(&RichText::from_plain(&cjk)), 1);
         assert!(!needs_plain_view(&RichText::from_plain(&cjk)));
-        let shown = with_display_breaks(&"a".repeat(PLAIN_WRAP_CHARS + 5));
-        assert!(shown.contains(DISPLAY_BREAK));
-        assert_eq!(
-            strip_display_breaks(&shown).chars().count(),
-            PLAIN_WRAP_CHARS + 5
-        );
-        assert!(!with_display_breaks("hello").contains(DISPLAY_BREAK));
+        let broken = "a\u{200B}".repeat(100);
+        assert_eq!(breakless_chars(&RichText::from_plain(&broken)), 1);
+        assert!(!needs_plain_view(&RichText::from_plain(&broken)));
     }
 
     #[test]

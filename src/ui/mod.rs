@@ -629,22 +629,6 @@ impl Win {
         self.wire_board();
         self.wire_inspector();
 
-        self.editor.connect_line_limit({
-            let weak = Rc::downgrade(self);
-            move || {
-                if let Some(w) = weak.upgrade() {
-                    w.toast(LENGTH_NOTE);
-                }
-            }
-        });
-        self.notes.connect_line_limit({
-            let weak = Rc::downgrade(self);
-            move || {
-                if let Some(w) = weak.upgrade() {
-                    w.toast(LENGTH_NOTE);
-                }
-            }
-        });
         let weak = Rc::downgrade(self);
         self.editor.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
@@ -1985,8 +1969,8 @@ fn gtk_checks() {
     editor::tests::a_hostile_paragraph_opens_plain_and_read_only();
     editor::tests::a_held_document_refuses_every_edit();
     editor::tests::a_long_uniform_line_opens_plain();
-    editor::tests::a_plain_unspaced_line_scrolls_sideways();
-    editor::tests::an_edit_past_the_unspaced_cap_is_refused();
+    editor::tests::a_held_long_line_wraps_on_characters();
+    editor::tests::a_zero_width_space_survives_edit_and_replace();
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();
     editor::tests::many_plain_paragraphs_stay_editable();
