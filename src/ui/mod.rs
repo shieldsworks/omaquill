@@ -1731,7 +1731,10 @@ fn gtk_checks() {
     }
     adw::init().unwrap();
     rich::tests::load_inserts_the_text_once();
+    editor::tests::find_matches_across_a_style_boundary();
     editor::tests::large_documents_open_in_the_window();
+    editor::tests::time_styled_paragraph_open();
+    spell::tests::one_paragraph_is_one_spelling_line();
     id_less_text_is_read_only();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();

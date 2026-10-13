@@ -909,6 +909,51 @@ pub(crate) mod tests {
         assert!(labels.iter().any(|label| label == "Ignore"));
     }
 
+    /// Spell walks `line_count`. One paragraph is one line, including when
+    /// its runs would have been split after 32 style spans.
+    pub(crate) fn one_paragraph_is_one_spelling_line() {
+        let editor = Editor::new(true);
+        let mut paragraph = omaquill::rtf::Paragraph::default();
+        for i in 0..32 {
+            paragraph.runs.push(omaquill::rtf::Run {
+                text: "q".into(),
+                style: omaquill::rtf::CharStyle {
+                    bold: i % 2 == 0,
+                    ..omaquill::rtf::CharStyle::default()
+                },
+            });
+        }
+        paragraph.runs.push(omaquill::rtf::Run {
+            text: "zz ".into(),
+            style: omaquill::rtf::CharStyle {
+                italic: true,
+                ..omaquill::rtf::CharStyle::default()
+            },
+        });
+        let word = format!("{}zz", "q".repeat(32));
+        editor.load(&omaquill::rtf::RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        });
+        assert_eq!(
+            editor.buffer.line_count(),
+            1,
+            "spell would check {} lines",
+            editor.buffer.line_count()
+        );
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
+        let session = Session::new(&editor, &Settings::default());
+        session.rescan();
+        drain(&session);
+        assert_eq!(session.line.get(), editor.buffer.line_count());
+        assert_eq!(editor.buffer.line_count(), 1);
+        if session.has_dictionary() {
+            assert_eq!(marked_words(&editor.buffer), vec![word]);
+        } else {
+            eprintln!("no spelling dictionary; the line count still stands");
+        }
+    }
+
     pub(crate) fn the_same_spelling_settings_do_not_restart_the_scan() {
         let editor = Editor::new(true);
         let session = Session::new(&editor, &Settings::default());

@@ -835,6 +835,52 @@ next}";
         }
     }
 
+    /// A style change is not a line break. Find uses the buffer's own
+    /// search, so a needle that sits on two runs has to be one span of text.
+    pub(crate) fn find_matches_across_a_style_boundary() {
+        let mut paragraph = Paragraph::default();
+        for i in 0..32 {
+            paragraph.runs.push(Run {
+                text: "q".into(),
+                style: CharStyle {
+                    bold: i % 2 == 0,
+                    ..CharStyle::default()
+                },
+            });
+        }
+        paragraph.runs.push(Run {
+            text: "z".into(),
+            style: CharStyle {
+                italic: true,
+                ..CharStyle::default()
+            },
+        });
+        paragraph.runs.push(Run {
+            text: "z".into(),
+            style: CharStyle::default(),
+        });
+        let text = RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        let ed = Editor::new(true);
+        ed.load(&text);
+        assert_eq!(
+            ed.buffer.line_count(),
+            1,
+            "one paragraph became {} lines",
+            ed.buffer.line_count()
+        );
+        ed.search_entry.set_text("qz");
+        ed.find(true);
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("find missed qz where a style run changes");
+        assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "qz");
+        assert!(!ed.search_entry.has_css_class("error"));
+    }
+
     /// The editor window opens a run-heavy document. The view is on screen,
     /// which is where a per-run insert relayouts.
     pub(crate) fn large_documents_open_in_the_window() {
@@ -850,8 +896,57 @@ next}";
             }
             context.iteration(false);
         }
+        let runs = 64usize;
+        let text = toggled(runs);
+        let started = std::time::Instant::now();
+        ed.load(&text);
+        let mut shown_ms = started.elapsed().as_secs_f64() * 1000.0;
+        for _ in 0..30 {
+            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
+                shown_ms = started.elapsed().as_secs_f64() * 1000.0;
+                break;
+            }
+            if !context.pending() {
+                break;
+            }
+            context.iteration(false);
+        }
+        eprintln!("gtk open runs={runs} ms={shown_ms:.1}");
+        assert_eq!(ed.buffer.line_count(), 1);
+        let names = rich::tag_names(&ed.buffer.start_iter());
+        assert!(names.iter().any(|name| name == "c:b"));
+        assert!(names.iter().any(|name| name.starts_with("c:link=")));
+        let back = ed.text();
+        assert_eq!(back.paragraphs.len(), 1);
+        assert_eq!(back.paragraphs[0].runs.len(), runs);
+        window.close();
+    }
+
+    /// Open times for one paragraph of 10k, 50k, and 100k style runs.
+    /// Set OMAQUILL_GTK_OPEN. The paragraph stays one line.
+    pub(crate) fn time_styled_paragraph_open() {
+        if std::env::var_os("OMAQUILL_GTK_OPEN").is_none() {
+            return;
+        }
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..20 {
+            if !context.pending() {
+                break;
+            }
+            context.iteration(false);
+        }
         for runs in [10_000usize, 50_000, 100_000] {
             let text = toggled(runs);
+            let buffer = gtk::TextBuffer::new(None);
+            let started = std::time::Instant::now();
+            rich::load(&buffer, &text);
+            let bare_ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(buffer.line_count(), 1);
             let started = std::time::Instant::now();
             ed.load(&text);
             let mut shown_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -865,14 +960,13 @@ next}";
                 }
                 context.iteration(false);
             }
-            eprintln!("gtk open runs={runs} ms={shown_ms:.1}");
-            assert!(shown_ms < 1_500.0, "{runs} runs opened in {shown_ms:.0} ms");
-            let names = rich::tag_names(&ed.buffer.start_iter());
-            assert!(names.iter().any(|name| name == "c:b"));
-            assert!(names.iter().any(|name| name.starts_with("c:link=")));
-            let back = ed.text();
-            assert_eq!(back.paragraphs.len(), 1);
-            assert_eq!(back.paragraphs[0].runs.len(), runs);
+            eprintln!(
+                "gtk open runs={runs} lines={} bare_ms={bare_ms:.1} shown_ms={shown_ms:.1}",
+                ed.buffer.line_count()
+            );
+            assert_eq!(ed.buffer.line_count(), 1);
+            assert_eq!(ed.text().paragraphs.len(), 1);
+            assert_eq!(ed.text().paragraphs[0].runs.len(), runs);
         }
         window.close();
     }

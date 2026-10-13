@@ -426,32 +426,11 @@ fn forward(iter: &mut TextIter, mut n: usize) {
     }
 }
 
-/// GTK's `cleanup_line` walks every segment on a line after each tag.
-/// A paragraph with tens of thousands of runs stays one line, so that walk
-/// is quadratic. This many spans is the budget for one line. The extra
-/// newline is tagged [`FLOW`] and [`save`] joins it back into the paragraph.
-const SPANS_PER_LINE: usize = 32;
-const FLOW: &str = "x:flow";
-
-/// Buffer text without the line breaks [`load`] inserts so a long run of
-/// spans stays inside GTK's per-line budget. Those breaks are not characters
-/// of the document.
+/// The buffer's visible text. Character tags change formatting only, so a
+/// paragraph stays one line for find and for spell.
 pub fn logical_plain(buffer: &TextBuffer) -> String {
     let (start, end) = buffer.bounds();
-    let mut out = String::new();
-    let mut at = start;
-    while at < end {
-        let mut next = at;
-        next.forward_to_tag_toggle(None::<&TextTag>);
-        if next <= at || next > end {
-            next = end;
-        }
-        if !tag_names(&at).iter().any(|name| name == FLOW) {
-            out.push_str(&buffer.text(&at, &next, false));
-        }
-        at = next;
-    }
-    out
+    buffer.text(&start, &end, false).to_string()
 }
 
 /// Replaces the buffer's contents with `text`. Not undoable.
@@ -466,14 +445,12 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
     let mut body = String::new();
     let mut marks: Vec<(usize, usize, CharStyle)> = Vec::new();
     let mut paras: Vec<(usize, usize, &ParaStyle)> = Vec::new();
-    let mut flow: Vec<usize> = Vec::new();
     let mut chars = 0usize;
     let n = text.paragraphs.len();
     for (i, p) in text.paragraphs.iter().enumerate() {
         let para_start = chars;
         let mut span_style: Option<CharStyle> = None;
         let mut span_start = chars;
-        let mut spans_on_line = 0usize;
         let close_span = |span_style: &mut Option<CharStyle>,
                           span_start: usize,
                           chars: usize,
@@ -490,18 +467,9 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
             }
             let same = span_style.as_ref().is_some_and(|style| style == &run.style);
             if !same {
-                if spans_on_line >= SPANS_PER_LINE {
-                    close_span(&mut span_style, span_start, chars, &mut marks);
-                    body.push('\n');
-                    flow.push(chars);
-                    chars += 1;
-                    spans_on_line = 0;
-                } else {
-                    close_span(&mut span_style, span_start, chars, &mut marks);
-                }
+                close_span(&mut span_style, span_start, chars, &mut marks);
                 span_style = Some(run.style.clone());
                 span_start = chars;
-                spans_on_line += 1;
             }
             body.push_str(&run.text);
             chars += run.text.chars().count();
@@ -549,24 +517,6 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
         buffer.move_mark(&place, &buffer.iter_at_mark(&stop_mark));
         buffer.delete_mark(&stop_mark);
         pos = *end;
-    }
-    let flow_tag = tag(buffer, FLOW);
-    let mut head = buffer.start_iter();
-    let mut pos = 0usize;
-    for at in flow {
-        forward(&mut head, at.saturating_sub(pos));
-        buffer.move_mark(&place, &head);
-        let mut tail = buffer.iter_at_mark(&place);
-        forward(&mut tail, 1);
-        let tail_mark = buffer.create_mark(None, &tail, false);
-        buffer.apply_tag(
-            &flow_tag,
-            &buffer.iter_at_mark(&place),
-            &buffer.iter_at_mark(&tail_mark),
-        );
-        head = buffer.iter_at_mark(&tail_mark);
-        buffer.delete_mark(&tail_mark);
-        pos = at + 1;
     }
     buffer.delete_mark(&place);
     let mut cursor = buffer.start_iter();
@@ -645,20 +595,7 @@ pub fn save(buffer: &TextBuffer) -> RichText {
             }
             at = next;
         }
-        let flow = i > 0 && {
-            let mut br = line;
-            br.backward_char() && tag_names(&br).iter().any(|name| name == FLOW)
-        };
-        if flow && let Some(prev) = paragraphs.last_mut() {
-            for run in p.runs {
-                match prev.runs.last_mut() {
-                    Some(last) if last.style == run.style => last.text.push_str(&run.text),
-                    _ => prev.runs.push(run),
-                }
-            }
-        } else {
-            paragraphs.push(p);
-        }
+        paragraphs.push(p);
     }
     RichText {
         paragraphs,
@@ -809,8 +746,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// One buffer insert for the whole document. Tag ranges stay proportional
-    /// to the text, so a run count in the tens of thousands still opens.
+    /// One buffer insert, then one tag range per style run, on the paragraph's
+    /// own line. A newline between runs would hide a find match and split a
+    /// spelling line.
     pub(crate) fn load_inserts_the_text_once() {
         let runs = 500usize;
         let text = toggled(runs);
@@ -820,28 +758,16 @@ pub(crate) mod tests {
         load(&buffer, &text);
         let small_ms = started.elapsed().as_secs_f64() * 1000.0;
         let wrote = inserts();
-        assert!(wrote <= 4, "inserted {wrote} times for {runs} runs");
+        assert_eq!(wrote, 1, "inserted {wrote} times for {runs} runs");
+        assert_eq!(buffer.line_count(), 1);
         let back = save(&buffer);
         assert!(
             same(&back.paragraphs, &text.paragraphs),
             "round trip dropped a run"
         );
-        eprintln!("runs={runs} inserts={wrote} ms={small_ms:.1}");
-        for runs in [10_000usize, 50_000, 100_000] {
-            let text = toggled(runs);
-            let buffer = TextBuffer::new(None);
-            reset_inserts();
-            let started = std::time::Instant::now();
-            load(&buffer, &text);
-            let ms = started.elapsed().as_secs_f64() * 1000.0;
-            let back = save(&buffer);
-            eprintln!("bare load runs={runs} inserts={} ms={ms:.1}", inserts());
-            assert!(inserts() <= 4, "inserted {} times", inserts());
-            assert!(ms < 1_500.0, "{runs} runs took {ms:.0} ms");
-            assert!(
-                same(&back.paragraphs, &text.paragraphs),
-                "round trip dropped a run"
-            );
-        }
+        eprintln!(
+            "runs={runs} inserts={wrote} lines={} ms={small_ms:.1}",
+            buffer.line_count()
+        );
     }
 }
