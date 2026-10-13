@@ -11,6 +11,7 @@ thread_local! {
     static STYLE_VISITS: Cell<u64> = const { Cell::new(0) };
     static EMIT_VISITS: Cell<u64> = const { Cell::new(0) };
     static SLICE_VISITS: Cell<u64> = const { Cell::new(0) };
+    static SNIPPET_VISITS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn note_visits(n: usize) {
@@ -35,6 +36,23 @@ fn reset_emit_visits() {
 #[cfg(test)]
 fn emit_visits() -> u64 {
     EMIT_VISITS.with(|visits| visits.get())
+}
+
+fn note_snippet(n: usize) {
+    #[cfg(test)]
+    SNIPPET_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_snippet_visits() {
+    SNIPPET_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn snippet_visits() -> u64 {
+    SNIPPET_VISITS.with(|visits| visits.get())
 }
 
 fn note_slice(n: usize) {
@@ -1329,14 +1347,14 @@ fn push_group(
     if edits.is_empty() {
         return;
     }
+    let snippets = snippets_of(&plain, &edits);
     let mut rows = Vec::new();
-    for edit in edits {
+    for (edit, snippet) in edits.into_iter().zip(snippets) {
         let Some(advanced) = scan.next.checked_add(1) else {
             break;
         };
         let id = MatchId(*scan.next);
         *scan.next = advanced;
-        let snippet = snippet_of(&plain, edit.range, &edit.replacement);
         rows.push(Row { id, edit, snippet });
     }
     if rows.is_empty() {
@@ -1368,8 +1386,22 @@ fn push_group(
     }
 }
 
+fn snippets_of(plain: &str, edits: &[Edit]) -> Vec<Snippet> {
+    let chars: Vec<char> = plain.chars().collect();
+    note_snippet(chars.len());
+    edits
+        .iter()
+        .map(|edit| snippet_from(&chars, edit.range, &edit.replacement))
+        .collect()
+}
+
 fn snippet_of(plain: &str, range: CharRange, replacement: &str) -> Snippet {
     let chars: Vec<char> = plain.chars().collect();
+    note_snippet(chars.len());
+    snippet_from(&chars, range, replacement)
+}
+
+fn snippet_from(chars: &[char], range: CharRange, replacement: &str) -> Snippet {
     let from = range.start().saturating_sub(40);
     let to = (range.end() + 40).min(chars.len());
     let take = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
@@ -1829,5 +1861,40 @@ mod tests {
             "visited {visits} of {chars}"
         );
         eprintln!("slice visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn snippets_read_the_document_once() {
+        let sample = snippet_of(
+            "abcdefghijklmnopqrstuvwxyz",
+            CharRange::try_bounds(10, 12).unwrap(),
+            "XY",
+        );
+        assert_eq!(sample.before, "abcdefghij");
+        assert_eq!(sample.matched, "kl");
+        assert_eq!(sample.after, "mnopqrstuvwxyz");
+        assert_eq!(sample.replacement, "XY");
+
+        let n = 4_000usize;
+        let plain = "x ".repeat(n);
+        let text = RichText::from_plain(&plain);
+        let query = literal("x", "y", Word::Any, Case::Sensitive);
+        let edits = edits_of(&find_in(&text, &query));
+        assert_eq!(edits.len(), n);
+        reset_snippet_visits();
+        let started = std::time::Instant::now();
+        let snippets = snippets_of(&plain, &edits);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(snippets.len(), n);
+        assert_eq!(snippets[0].matched, "x");
+        assert_eq!(snippets[0].replacement, "y");
+        assert!(snippets[0].after.starts_with(' '));
+        let visits = snippet_visits();
+        let chars = u64::try_from(plain.chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("snippet visits={visits} chars={chars} ms={ms:.1}");
     }
 }
