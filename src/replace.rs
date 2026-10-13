@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 thread_local! {
     static STYLE_VISITS: Cell<u64> = const { Cell::new(0) };
+    static EMIT_VISITS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn note_visits(n: usize) {
@@ -16,6 +17,23 @@ fn note_visits(n: usize) {
     STYLE_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
     #[cfg(not(test))]
     let _ = n;
+}
+
+fn note_emit(n: usize) {
+    #[cfg(test)]
+    EMIT_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_emit_visits() {
+    EMIT_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn emit_visits() -> u64 {
+    EMIT_VISITS.with(|visits| visits.get())
 }
 
 #[cfg(test)]
@@ -310,6 +328,7 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
     }
     let atoms = atoms_of(text);
     let total = atoms.last().map(Atom::end).unwrap_or(0);
+    let mut source = EmitCursor::default();
     let mut paras = vec![Paragraph {
         style: text
             .paragraphs
@@ -334,7 +353,7 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
             .get(edit_ix)
             .map(|e| e.range.start)
             .unwrap_or(total);
-        emit_source(&mut paras, &atoms, i, limit);
+        emit_source(&mut paras, &atoms, &mut source, i, limit);
         i = limit;
     }
     Some(RichText {
@@ -981,6 +1000,7 @@ impl<'a> StyleWalk<'a> {
     }
 }
 
+#[cfg(test)]
 fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
     let mut at = 0usize;
     let mut previous = CharStyle::default();
@@ -1020,6 +1040,7 @@ fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
 
 enum Atom {
     Chars {
+        start: usize,
         end: usize,
         text: String,
         style: CharStyle,
@@ -1028,6 +1049,13 @@ enum Atom {
         at: usize,
         next: ParaStyle,
     },
+}
+
+#[derive(Default)]
+struct EmitCursor {
+    atom: usize,
+    taken: usize,
+    byte: usize,
 }
 
 impl Atom {
@@ -1056,6 +1084,7 @@ fn atoms_of(text: &RichText) -> Vec<Atom> {
                 continue;
             }
             atoms.push(Atom::Chars {
+                start: at,
                 end: at + n,
                 text: run.text.clone(),
                 style: run.style.clone(),
@@ -1066,27 +1095,81 @@ fn atoms_of(text: &RichText) -> Vec<Atom> {
     atoms
 }
 
-fn emit_source(paras: &mut Vec<Paragraph>, atoms: &[Atom], from: usize, to: usize) {
-    for atom in atoms {
-        match atom {
-            Atom::Break { at, next } if *at >= from && *at < to => {
+fn emit_source(
+    paras: &mut Vec<Paragraph>,
+    atoms: &[Atom],
+    cursor: &mut EmitCursor,
+    from: usize,
+    to: usize,
+) {
+    while cursor.atom < atoms.len() && from < to {
+        if let Atom::Break { at, next } = &atoms[cursor.atom] {
+            let at = *at;
+            if at >= to {
+                return;
+            }
+            let next = next.clone();
+            if at >= from {
                 paras.push(Paragraph {
-                    style: next.clone(),
+                    style: next,
                     runs: Vec::new(),
                 });
             }
-            Atom::Chars { end, text, style } => {
-                let start = end - text.chars().count();
-                let lo = from.max(start);
-                let hi = to.min(*end);
-                if lo < hi {
-                    let slice: String = text.chars().skip(lo - start).take(hi - lo).collect();
-                    push_chars(paras, &slice, style);
-                }
-            }
-            Atom::Break { .. } => {}
+            cursor.atom += 1;
+            cursor.taken = 0;
+            cursor.byte = 0;
+            continue;
+        }
+        let Atom::Chars {
+            start,
+            end,
+            text,
+            style,
+        } = &atoms[cursor.atom]
+        else {
+            continue;
+        };
+        let start = *start;
+        let end = *end;
+        if start >= to {
+            return;
+        }
+        if end <= from {
+            cursor.atom += 1;
+            cursor.taken = 0;
+            cursor.byte = 0;
+            continue;
+        }
+        let lo = from.max(start);
+        let hi = to.min(end);
+        let style = style.clone();
+        let (skipped, taken) = advance_run(text, cursor.byte, cursor.taken, lo - start);
+        let (byte, taken) = advance_run(text, skipped, taken, hi - start);
+        let slice = text[skipped..byte].to_string();
+        push_chars(paras, &slice, &style);
+        cursor.byte = byte;
+        cursor.taken = taken;
+        if hi == end {
+            cursor.atom += 1;
+            cursor.taken = 0;
+            cursor.byte = 0;
+        } else {
+            return;
         }
     }
+}
+
+fn advance_run(text: &str, mut byte: usize, mut taken: usize, target: usize) -> (usize, usize) {
+    while taken < target {
+        let ch = text[byte..]
+            .chars()
+            .next()
+            .expect("run text has the character length atoms_of stored");
+        byte += ch.len_utf8();
+        taken += 1;
+        note_emit(1);
+    }
+    (byte, taken)
 }
 
 fn emit_replacement(paras: &mut Vec<Paragraph>, edit: &Edit) {
@@ -1654,5 +1737,37 @@ mod tests {
             assert_eq!(from_walk.0, from_at.0, "char style at {index}");
             assert_eq!(from_walk.1, from_at.1, "para style at {index}");
         }
+    }
+
+    #[test]
+    fn render_walks_source_atoms_once() {
+        let n = 2_000usize;
+        let runs: Vec<Run> = (0..n)
+            .map(|_| Run {
+                text: "ab ".into(),
+                style: CharStyle::default(),
+            })
+            .collect();
+        let text = RichText {
+            paragraphs: vec![Paragraph {
+                style: ParaStyle::default(),
+                runs,
+            }],
+            lossy: Vec::new(),
+        };
+        let plan = plan_all(&text, &literal("a", "A", Word::Any, Case::Sensitive));
+        assert_eq!(plan.edits().len(), n);
+        reset_emit_visits();
+        let started = std::time::Instant::now();
+        let next = render(&text, &plan).unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(next.plain_text().matches('A').count(), n);
+        let visits = emit_visits();
+        let chars = u64::try_from(text.plain_text().chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("render visits={visits} chars={chars} ms={ms:.1}");
     }
 }
