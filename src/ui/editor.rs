@@ -922,8 +922,8 @@ next}";
         window.close();
     }
 
-    /// Open times for one paragraph of 10k, 50k, and 100k style runs.
-    /// Set OMAQUILL_GTK_OPEN. The paragraph stays one line.
+    /// Open times for one paragraph of many style runs. Set
+    /// OMAQUILL_GTK_OPEN. The paragraph stays one line.
     pub(crate) fn time_styled_paragraph_open() {
         if std::env::var_os("OMAQUILL_GTK_OPEN").is_none() {
             return;
@@ -940,7 +940,7 @@ next}";
             }
             context.iteration(false);
         }
-        for runs in [10_000usize, 50_000, 100_000] {
+        for runs in [1_000usize, 2_000, 4_000, 10_000, 50_000, 100_000] {
             let text = toggled(runs);
             let buffer = gtk::TextBuffer::new(None);
             let started = std::time::Instant::now();
