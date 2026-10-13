@@ -761,3 +761,17 @@ fn checking_spelling_does_not_change_the_project() {
     drop(project);
     assert_eq!(before, tree_bytes(&c.0));
 }
+
+#[test]
+fn short_declarations_before_the_root_still_open() {
+    let c = copy_fixture("bang-decl");
+    let path = c.0.join("Lighthouse.scrivx");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut xml = "<!x>".repeat(2_000);
+    xml.push_str(&original);
+    std::fs::write(&path, &xml).unwrap();
+    let p = Project::open(&c.0).unwrap();
+    assert_eq!(p.item(SCENE).unwrap().title, "The Storm");
+    assert_eq!(p.item(MORNING).unwrap().title, "Morning & After");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), xml);
+}

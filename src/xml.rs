@@ -68,6 +68,32 @@ fn open_element_mut(stack: &mut [Element]) -> &mut Element {
         .expect("parser stack is non-empty until the root element returns")
 }
 
+struct BangDecl {
+    opens_subset: bool,
+    gt: Option<usize>,
+    examined: usize,
+}
+
+fn bang_decl(rest: &str) -> BangDecl {
+    let Some(g) = rest.find('>') else {
+        return BangDecl {
+            opens_subset: false,
+            gt: None,
+            examined: rest.len(),
+        };
+    };
+    let bracket = rest[..g].find('[');
+    let bracket_walk = match bracket {
+        Some(i) => i + 1,
+        None => g,
+    };
+    BangDecl {
+        opens_subset: bracket.is_some(),
+        gt: Some(g),
+        examined: g + 1 + bracket_walk,
+    }
+}
+
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
@@ -233,16 +259,20 @@ impl<'a> Parser<'a> {
             self.take_until("]]>")?
         } else if self.rest().starts_with("<!") {
             // A DOCTYPE's internal subset `[...]` can hold '>'.
-            let b = self.find_char('[');
-            let g = self.find_char('>');
-            match (b, g) {
-                (Some(b), Some(g)) if b < g => {
-                    let start = self.pos;
-                    self.take_until("]")?;
-                    self.take_until(">")?;
-                    &self.src[start..self.pos]
-                }
-                _ => self.take_until(">")?,
+            let bang = bang_decl(self.rest());
+            self.note(bang.examined);
+            if bang.opens_subset {
+                let start = self.pos;
+                self.take_until("]")?;
+                self.take_until(">")?;
+                &self.src[start..self.pos]
+            } else if let Some(g) = bang.gt {
+                let end = self.pos + g + 1;
+                let raw = &self.src[self.pos..end];
+                self.pos = end;
+                raw
+            } else {
+                return self.err("unterminated, expected \">\"");
             }
         } else {
             return Ok(None);
@@ -964,5 +994,249 @@ mod tests {
             large <= limit,
             "walked {large} bytes of a {large_len}-byte file, limit {limit}"
         );
+    }
+
+    fn assert_linear_parse(label: &str, small: &str, large: &str) {
+        let cost = |xml: &str| {
+            let (doc, scanned) = parse_scanned(xml);
+            assert_eq!(doc.unwrap().to_xml(), xml, "{label}");
+            (scanned, u64::try_from(xml.len()).unwrap())
+        };
+        let (small_n, _) = cost(small);
+        let (large_n, large_len) = cost(large);
+        let growth = large_n / small_n.max(1);
+        assert!(
+            large_n < small_n.saturating_mul(30),
+            "{label}: 10x input walked {large_n} bytes after {small_n} ({growth}x), limit 30x"
+        );
+        let limit = large_len * 8;
+        assert!(
+            large_n <= limit,
+            "{label}: walked {large_n} bytes of a {large_len}-byte file, limit {limit}"
+        );
+    }
+
+    fn repeat_before_root(token: &str, n: usize) -> String {
+        let mut xml = token.repeat(n);
+        xml.push_str("<r/>");
+        xml
+    }
+
+    #[test]
+    fn prolog_constructs_scan_linearly() {
+        assert_linear_parse(
+            "doctype",
+            &repeat_before_root("<!DOCTYPE a>", 1_000),
+            &repeat_before_root("<!DOCTYPE a>", 10_000),
+        );
+        assert_linear_parse(
+            "doctype subset",
+            &repeat_before_root("<!DOCTYPE a [x]>", 1_000),
+            &repeat_before_root("<!DOCTYPE a [x]>", 10_000),
+        );
+        assert_linear_parse(
+            "comment",
+            &repeat_before_root("<!--x-->", 1_000),
+            &repeat_before_root("<!--x-->", 10_000),
+        );
+        assert_linear_parse(
+            "cdata",
+            &repeat_before_root("<![CDATA[x]]>", 1_000),
+            &repeat_before_root("<![CDATA[x]]>", 10_000),
+        );
+        assert_linear_parse(
+            "pi",
+            &repeat_before_root("<?x?>", 1_000),
+            &repeat_before_root("<?x?>", 10_000),
+        );
+        let elements = |n: usize| {
+            let mut xml = String::from("<r>");
+            xml.push_str(&"<a/>".repeat(n));
+            xml.push_str("</r>");
+            xml
+        };
+        assert_linear_parse("empty elements", &elements(1_000), &elements(10_000));
+        assert_linear_parse(
+            "text",
+            &format!("<r>{}</r>", "x".repeat(1_000)),
+            &format!("<r>{}</r>", "x".repeat(10_000)),
+        );
+        assert_linear_parse(
+            "entities",
+            &format!("<r>{}</r>", "&amp;".repeat(1_000)),
+            &format!("<r>{}</r>", "&amp;".repeat(10_000)),
+        );
+    }
+
+    #[test]
+    fn scrivx_shapes_round_trip_byte_for_byte() {
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Lighthouse.scriv/Lighthouse.scrivx"
+        ))
+        .unwrap();
+        assert_eq!(parse(&fixture).unwrap().to_xml(), fixture);
+
+        let shapes = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE ScrivenerProject [<!ENTITY e \"quoted &amp; text\">]>\n\
+<!-- keep -->\n\
+<?omaquill note?>\n\
+<ScrivenerProject>\n\
+    <Title>Fish &amp; Chips</Title>\n\
+    <Style><![CDATA[{\\rtf1 hi}]]></Style>\n\
+    <Note>a &lt; b &gt; c &quot;d&quot; &apos;e&apos;</Note>\n\
+</ScrivenerProject>\n";
+        let doc = parse(shapes).unwrap();
+        assert_eq!(doc.to_xml(), shapes);
+        assert_eq!(
+            parse("<!DOCTYPE").unwrap_err().message,
+            "unterminated, expected \">\""
+        );
+        assert_eq!(
+            doc.root.child_text("Title").as_deref(),
+            Some("Fish & Chips")
+        );
+        assert_eq!(
+            doc.root.child_text("Note").as_deref(),
+            Some("a < b > c \"d\" 'e'")
+        );
+        assert_eq!(doc.root.child_text("Style").as_deref(), Some("{\\rtf1 hi}"));
+    }
+
+    fn legacy_bracket_before_gt(rest: &str) -> bool {
+        matches!(
+            (rest.find('['), rest.find('>')),
+            (Some(b), Some(g)) if b < g
+        )
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn bang_decl_matches_the_old_bracket_search() {
+        let mut state = 0xA5A5_1234_F00D_7788u64;
+        for _ in 0..5_000 {
+            let len = (xorshift(&mut state) as usize) % 48;
+            let mut body = String::new();
+            for _ in 0..len {
+                let b = (xorshift(&mut state) % 95) as u8 + 32;
+                body.push(b as char);
+            }
+            if xorshift(&mut state).is_multiple_of(3) {
+                body.push('[');
+            }
+            if xorshift(&mut state).is_multiple_of(3) {
+                body.push('>');
+            }
+            if xorshift(&mut state).is_multiple_of(5) {
+                body.push('<');
+            }
+            let src = format!("<!{body}");
+            assert_eq!(
+                bang_decl(&src).opens_subset,
+                legacy_bracket_before_gt(&src),
+                "{src:?}"
+            );
+            let doc_src = format!("{src}<r/>");
+            assert_eq!(
+                bang_decl(&doc_src).opens_subset,
+                legacy_bracket_before_gt(&doc_src),
+                "{doc_src:?}"
+            );
+            if let Ok(doc) = parse(&doc_src) {
+                assert_eq!(doc.to_xml(), doc_src, "{doc_src:?}");
+            }
+        }
+
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        for _ in 0..2_000 {
+            let mut src = String::from("<?xml version=\"1.0\"?>");
+            let pieces = (xorshift(&mut state) % 6) as usize;
+            for _ in 0..pieces {
+                let piece = match xorshift(&mut state) % 6 {
+                    0 => "<!--x-->",
+                    1 => "<![CDATA[z]]>",
+                    2 => "<?pi?>",
+                    3 => "<!x>",
+                    4 => "<!DOCTYPE a [b]>",
+                    _ => "<!DOCTYPE a>",
+                };
+                src.push_str(piece);
+            }
+            src.push_str("<r>");
+            let texts = (xorshift(&mut state) % 8) as usize;
+            for _ in 0..texts {
+                let piece = match xorshift(&mut state) % 4 {
+                    0 => "Fish &amp; Chips",
+                    1 => "a&lt;b",
+                    2 => "x",
+                    _ => "<e/>",
+                };
+                src.push_str(piece);
+            }
+            src.push_str("</r>");
+            assert_eq!(parse(&src).unwrap().to_xml(), src);
+        }
+    }
+
+    #[test]
+    #[ignore = "one million tokens of each construct"]
+    fn million_token_constructs_stay_linear() {
+        let n = 1_000_000;
+        let cases = [
+            ("bang", {
+                let mut xml = "<!x>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("doctype", {
+                let mut xml = "<!DOCTYPE a>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("doctype subset", {
+                let mut xml = "<!DOCTYPE a [x]>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("comment", {
+                let mut xml = "<!--x-->".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("cdata", {
+                let mut xml = "<![CDATA[x]]>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("pi", {
+                let mut xml = "<?x?>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("elements", format!("<r>{}</r>", "<a/>".repeat(n))),
+            ("text", format!("<r>{}</r>", "x".repeat(n))),
+            ("entities", format!("<r>{}</r>", "&amp;".repeat(n))),
+        ];
+        for (label, xml) in cases {
+            let len = u64::try_from(xml.len()).unwrap();
+            let started = std::time::Instant::now();
+            let (doc, scanned) = parse_scanned(&xml);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(doc.unwrap().to_xml(), xml, "{label}");
+            let limit = len * 8;
+            assert!(
+                scanned <= limit,
+                "{label} walked {scanned} of {len}, limit {limit}"
+            );
+            eprintln!("{label} len={len} scanned={scanned} ms={ms:.1}");
+        }
     }
 }
