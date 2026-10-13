@@ -126,16 +126,22 @@ impl Session {
         self.rescan();
     }
 
-    /// A one-character edit checks the words next to the caret. A paste, or
-    /// any larger change, checks the whole buffer.
+    /// A paste, or any larger change, checks the whole buffer. A smaller
+    /// change still drops the carried line anchor. One inserted scalar can
+    /// be several bytes, so the stored byte would no longer match the
+    /// character index.
     pub fn after_edit(&self) {
         let n = self.editor.buffer.char_count();
         let prev = self.chars.replace(n);
-        if (n - prev).abs() > 1 {
+        let delta = n - prev;
+        if delta.abs() > 1 {
             self.left.set(None);
             self.rescan();
             return;
         }
+        let (index, byte) = spell::line_anchor_after_edit(self.index.get(), self.byte.get(), delta);
+        self.index.set(index);
+        self.byte.set(byte);
         self.refresh_cursor();
     }
 
