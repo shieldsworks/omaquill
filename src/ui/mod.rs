@@ -1809,7 +1809,9 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
         win.banner.title().as_str(),
         "Formatting this document. It can't be edited until that's done."
     );
-    assert!(!win.format_bar.is_visible());
+    // `is_visible` stays false until the window is shown. The property is
+    // the flag `sync_editor_chrome` sets.
+    assert!(!win.format_bar.property::<bool>("visible"));
     assert_eq!(win.editor.buffer.line_count(), 1);
     let context = gtk::glib::MainContext::default();
     for _ in 0..5 {
@@ -1822,7 +1824,7 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
     assert!(win.editor.view.is_editable());
     assert_eq!(win.editor.plain_text(), "Hello");
     assert!(!win.banner.is_revealed());
-    assert!(win.format_bar.is_visible());
+    assert!(win.format_bar.property::<bool>("visible"));
     assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
     for _ in 0..20 {
         if !context.iteration(false) {
