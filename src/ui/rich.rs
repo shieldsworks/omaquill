@@ -306,7 +306,16 @@ pub fn para_tags(s: &ParaStyle) -> Vec<String> {
     out
 }
 
-fn char_style(names: &[String]) -> CharStyle {
+fn shared_link(links: &mut HashMap<String, Rc<str>>, value: &str) -> Rc<str> {
+    if let Some(link) = links.get(value) {
+        return Rc::clone(link);
+    }
+    let link = Rc::<str>::from(value);
+    links.insert(value.to_string(), Rc::clone(&link));
+    link
+}
+
+fn char_style(names: &[String], links: &mut HashMap<String, Rc<str>>) -> CharStyle {
     let mut s = CharStyle::default();
     for n in names {
         let Some(rest) = n.strip_prefix("c:") else {
@@ -324,7 +333,7 @@ fn char_style(names: &[String]) -> CharStyle {
             "size" => s.size = value.parse().unwrap_or(24),
             "fg" => s.color = unhex(value),
             "bg" => s.highlight = unhex(value),
-            "link" => s.link = Some(Rc::from(value)),
+            "link" => s.link = Some(shared_link(links, value)),
             _ => {}
         }
     }
@@ -598,6 +607,7 @@ fn cached_char_tags<'a>(
 /// Reads the buffer back into [`RichText`].
 pub fn save(buffer: &TextBuffer) -> RichText {
     let mut paragraphs: Vec<Paragraph> = Vec::new();
+    let mut links = HashMap::new();
     // By line number: forward_line() won't step onto an empty last line.
     for i in 0..buffer.line_count() {
         let Some(line) = buffer.iter_at_line(i) else {
@@ -624,7 +634,7 @@ pub fn save(buffer: &TextBuffer) -> RichText {
                 .chars()
                 .filter(|&c| c != '\u{fffc}')
                 .collect();
-            let s = char_style(&tag_names(&at));
+            let s = char_style(&tag_names(&at), &mut links);
             match p.runs.last_mut() {
                 Some(last) if last.style == s => last.text.push_str(&text),
                 _ => {
@@ -684,6 +694,20 @@ pub(crate) mod tests {
                 out.push(p);
             }
         }
+    }
+
+    #[test]
+    fn save_reuses_one_link_for_every_run() {
+        let mut links = HashMap::new();
+        let names = vec![
+            "c:b".to_string(),
+            "c:link=https://example.test/chapter".to_string(),
+        ];
+        let first = char_style(&names, &mut links);
+        let second = char_style(&names, &mut links);
+        let left = first.link.clone().expect("first link");
+        let right = second.link.clone().expect("second link");
+        assert!(Rc::ptr_eq(&left, &right), "each run allocated its own link");
     }
 
     #[test]
