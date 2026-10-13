@@ -1655,26 +1655,35 @@ next}";
         }
     }
 
+    /// `present` queues a frame. `pending()` can be false until that frame
+    /// is ready, so a non-blocking drain returns without mapping the window.
+    /// On `f8810dd` the timed turn was still that map, 222.5 ms on aarch64.
+    fn show_window(window: &gtk::Window) {
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..30 {
+            if window.is_mapped() {
+                return;
+            }
+            if !context.iteration(true) {
+                return;
+            }
+        }
+    }
+
     /// A held unspaced line wraps on characters inside the column. The buffer
     /// is a window of the file text, and find matches that text.
     ///
-    /// `present` maps the window on a later main-loop turn. On the aarch64
-    /// xvfb runner that turn was 171.2 ms when the line was already loaded
-    /// (`a4a463b`). A document opens into a window that is already on screen,
-    /// so the timed turns start after the map.
+    /// The timed turns start after the window is mapped. A document opens
+    /// into a window that is already on screen.
     pub(crate) fn a_held_long_line_wraps_on_characters() {
         let ed = Editor::new(true);
         let window = gtk::Window::new();
         window.set_default_size(800, 600);
         window.set_child(Some(&ed.root));
-        window.present();
+        show_window(&window);
+        assert!(window.is_mapped(), "the window did not map");
         let context = gtk::glib::MainContext::default();
-        for _ in 0..20 {
-            if !context.pending() {
-                break;
-            }
-            context.iteration(false);
-        }
         let chars = 10_000usize;
         let body = "a".repeat(chars);
         let started = std::time::Instant::now();
@@ -1823,14 +1832,9 @@ next}";
         let window = gtk::Window::new();
         window.set_default_size(800, 600);
         window.set_child(Some(&ed.root));
-        window.present();
+        show_window(&window);
+        assert!(window.is_mapped(), "the window did not map");
         let context = gtk::glib::MainContext::default();
-        for _ in 0..20 {
-            if !context.pending() {
-                break;
-            }
-            context.iteration(false);
-        }
         if which == "probe" {
             probe_word_char(&ed, &context);
             window.close();
