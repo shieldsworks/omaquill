@@ -19,7 +19,7 @@ use crate::xml::{self, Element};
 use crate::{sha1, zip};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -884,24 +884,54 @@ impl Project {
                 return Some((p.style.clone(), p.runs[0].style.clone()));
             }
         }
-        fn first(p: &Project, items: &[Item]) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
+        // A shared id is one file. Stop after a few documents that actually
+        // contain text, so a binder full of aliases cannot reparse one manuscript.
+        const STYLE_DOCUMENTS: usize = 8;
+        fn search(
+            p: &Project,
+            items: &[Item],
+            seen: &mut HashSet<String>,
+            examined: &mut usize,
+        ) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
             for i in items.iter().filter(|i| i.include_in_compile) {
-                if i.kind.has_text()
-                    && let Ok(t) = p.text(&i.uuid)
-                    && let Some(par) = t
-                        .paragraphs
-                        .iter()
-                        .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
-                {
-                    return Some((par.style.clone(), par.runs[0].style.clone()));
+                if *examined >= STYLE_DOCUMENTS {
+                    return None;
                 }
-                if let Some(found) = first(p, &i.children) {
+                if i.kind.has_text() && is_uuid(&i.uuid) && seen.insert(i.uuid.to_ascii_uppercase())
+                {
+                    if let Ok(t) = p.text(&i.uuid) {
+                        if let Some(par) = t
+                            .paragraphs
+                            .iter()
+                            .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
+                        {
+                            return Some((par.style.clone(), par.runs[0].style.clone()));
+                        }
+                        if t.paragraphs
+                            .iter()
+                            .any(|par| par.runs.iter().any(|r| !r.text.is_empty()))
+                        {
+                            *examined += 1;
+                        }
+                    }
+                }
+                if let Some(found) = search(p, &i.children, seen, examined) {
                     return Some(found);
+                }
+                if *examined >= STYLE_DOCUMENTS {
+                    return None;
                 }
             }
             None
         }
-        first(self, &self.root_folder(Kind::Draft)?.children)
+        let mut seen = HashSet::new();
+        let mut examined = 0usize;
+        search(
+            self,
+            &self.root_folder(Kind::Draft)?.children,
+            &mut seen,
+            &mut examined,
+        )
     }
 
     pub fn synopsis(&self, uuid: &str) -> String {
@@ -1730,5 +1760,78 @@ mod tests {
         assert_eq!(project.synopsis(""), "");
         assert_eq!(rtf::parses(), 0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_reads_a_bounded_number_of_documents() {
+        let (hit_path, mut project) = temp_project("style-hit");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        project
+            .set_text(
+                &scene,
+                &RichText::from_plain("This sentence is definitely longer than twenty characters."),
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&hit_path).unwrap();
+        rtf::reset_parses();
+        assert!(project.default_style().is_some());
+        assert!(rtf::parses() <= 2);
+
+        let (alias_path, mut project) = temp_project("style-alias");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let shared = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
+        project
+            .set_text(&shared, &RichText::from_plain("short words"))
+            .unwrap();
+        let mut aliases = HashSet::new();
+        for n in 0..400 {
+            aliases.insert(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        rewrite_ids(&alias_path, &aliases, &HashSet::new(), &shared);
+        let project = Project::open(&alias_path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        assert!(project.default_style().is_none());
+        let alias_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let alias_parses = rtf::parses();
+        assert!(
+            alias_parses <= 2,
+            "400 aliases parsed the short file {alias_parses} times"
+        );
+
+        let (cap_path, mut project) = temp_project("style-cap");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        for n in 0..24 {
+            let id = project
+                .add_item(Kind::Text, &format!("Short {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain("short words"))
+                .unwrap();
+        }
+        project.save().unwrap();
+        let project = Project::open(&cap_path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        assert!(project.default_style().is_none());
+        let cap_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let cap_parses = rtf::parses();
+        assert!(
+            cap_parses <= 8,
+            "24 short documents parsed {cap_parses} times"
+        );
+        eprintln!(
+            "aliases parses={alias_parses} ms={alias_ms:.1}; distinct parses={cap_parses} ms={cap_ms:.1}"
+        );
+        let _ = std::fs::remove_dir_all(hit_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(alias_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(cap_path.parent().unwrap());
     }
 }
