@@ -1970,6 +1970,7 @@ fn gtk_checks() {
     editor::tests::a_held_document_refuses_every_edit();
     editor::tests::a_long_uniform_line_opens_plain();
     editor::tests::a_held_long_line_wraps_on_characters();
+    editor::tests::find_in_a_long_held_line_reaches_the_tail();
     editor::tests::a_zero_width_space_survives_edit_and_replace();
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();

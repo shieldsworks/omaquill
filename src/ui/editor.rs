@@ -47,7 +47,19 @@ pub struct Editor {
     /// Typing is allowed when the buffer is fully tagged. A held document
     /// stays read-only.
     edit_when_ready: Cell<bool>,
+    /// Scrolls a held document that is longer than [`HELD_WINDOW`].
+    held_bar: gtk::Scrollbar,
+    /// Character index of the first buffer character in that document.
+    held_origin: Cell<usize>,
+    /// The bar is changing the buffer, so its own signal does not run again.
+    held_adjusting: Cell<bool>,
 }
+
+/// Character wrap of one unspaced line on a visible 800×600 editor, GTK
+/// 4.14.5, debug build. `place_cursor` was about 3 ms at 10,000 characters,
+/// 33 ms at 20,000, 85 ms at 50,000, and 165 ms at 100,000. A held document
+/// longer than this is shown in a window of this many of its own characters.
+const HELD_WINDOW: usize = 10_000;
 
 impl Editor {
     /// `page` is the main editor: centered column, find bar. Otherwise a
@@ -94,7 +106,21 @@ impl Editor {
             view.set_right_margin(8);
             scrolled.set_child(Some(&view));
         }
-        root.append(&scrolled);
+        let held_bar = gtk::Scrollbar::new(
+            gtk::Orientation::Vertical,
+            Some(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 1.0, 0.0)),
+        );
+        held_bar.set_visible(false);
+        held_bar.set_halign(gtk::Align::End);
+        held_bar.set_valign(gtk::Align::Fill);
+        // The bar overlays the column. A sibling would shrink the text view
+        // and lay the line out a second time when the bar appears.
+        let overlay = gtk::Overlay::new();
+        overlay.set_vexpand(true);
+        scrolled.set_hexpand(true);
+        overlay.set_child(Some(&scrolled));
+        overlay.add_overlay(&held_bar);
+        root.append(&overlay);
 
         let ed = Rc::new(Editor {
             root,
@@ -113,6 +139,9 @@ impl Editor {
             cursor: RefCell::new(Vec::new()),
             painted_source: RefCell::new(None),
             edit_when_ready: Cell::new(true),
+            held_bar,
+            held_origin: Cell::new(0),
+            held_adjusting: Cell::new(false),
         });
         ed.wire();
         ed
@@ -199,6 +228,23 @@ impl Editor {
             }
         });
         let weak = Rc::downgrade(self);
+        self.held_bar
+            .adjustment()
+            .connect_value_changed(move |adj| {
+                let Some(ed) = weak.upgrade() else {
+                    return;
+                };
+                if ed.held_adjusting.get() || ed.painted_source.borrow().is_none() {
+                    return;
+                }
+                let origin = bar_chars(adj.value()) * HELD_WINDOW;
+                if origin == ed.held_origin.get() {
+                    return;
+                }
+                ed.held_origin.set(origin);
+                ed.fill_held_window();
+            });
+        let weak = Rc::downgrade(self);
         self.search_entry.connect_activate(move |_| {
             if let Some(ed) = weak.upgrade() {
                 ed.find(true);
@@ -267,17 +313,26 @@ impl Editor {
             self.report();
             return;
         }
-        // Character wrap is GTK's own break. The buffer is the file text,
-        // so an unspaced line stays inside the column without a character
-        // the file did not have.
+        // Character wrap is GTK's own break. The buffer holds the file's
+        // characters and no others. A line longer than [`HELD_WINDOW`] is
+        // shown one window at a time, because wrapping the whole line at
+        // 100,000 characters took about 170 ms.
         self.view.set_wrap_mode(gtk::WrapMode::Char);
         let plain = text.plain_text();
-        self.buffer.begin_irreversible_action();
-        self.buffer.set_text(&plain);
-        self.buffer.end_irreversible_action();
-        self.buffer.place_cursor(&self.buffer.start_iter());
-        self.buffer.set_modified(false);
+        let total = plain.chars().count();
         self.painted_source.borrow_mut().replace(text);
+        self.held_origin.set(0);
+        if total > HELD_WINDOW {
+            self.fill_held_window();
+            self.place_held_bar(total, 0);
+        } else {
+            self.held_bar.set_visible(false);
+            self.buffer.begin_irreversible_action();
+            self.buffer.set_text(&plain);
+            self.buffer.end_irreversible_action();
+            self.buffer.place_cursor(&self.buffer.start_iter());
+        }
+        self.buffer.set_modified(false);
         self.view.set_editable(false);
         self.view.set_cursor_visible(true);
         self.loading.set(false);
@@ -326,6 +381,8 @@ impl Editor {
     pub fn release_plain(&self) {
         let held = self.painted_source.borrow().is_some();
         self.painted_source.borrow_mut().take();
+        self.held_origin.set(0);
+        self.held_bar.set_visible(false);
         self.loading.set(false);
         if held {
             self.view.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -333,6 +390,44 @@ impl Editor {
             self.view.set_editable(edit);
             self.view.set_cursor_visible(edit);
         }
+    }
+
+    /// The buffer shows one window of a long held document. The characters
+    /// are the file's, starting at [`Self::held_origin`].
+    fn fill_held_window(&self) {
+        let Some(plain) = self
+            .painted_source
+            .borrow()
+            .as_ref()
+            .map(|text| text.plain_text())
+        else {
+            return;
+        };
+        let origin = self.held_origin.get();
+        let slice: String = plain.chars().skip(origin).take(HELD_WINDOW).collect();
+        let was_loading = self.loading.get();
+        self.loading.set(true);
+        self.buffer.begin_irreversible_action();
+        self.buffer.set_text(&slice);
+        self.buffer.end_irreversible_action();
+        self.buffer.place_cursor(&self.buffer.start_iter());
+        self.loading.set(was_loading);
+    }
+
+    fn place_held_bar(&self, total: usize, origin: usize) {
+        let pages = total.div_ceil(HELD_WINDOW).max(1);
+        let page = origin / HELD_WINDOW;
+        let adj = self.held_bar.adjustment();
+        self.held_adjusting.set(true);
+        adj.set_lower(0.0);
+        adj.set_upper(pages as f64);
+        adj.set_page_size(1.0);
+        adj.set_page_increment(1.0);
+        adj.set_step_increment(1.0);
+        let max = (pages as f64 - 1.0).max(0.0);
+        adj.set_value((page as f64).min(max));
+        self.held_adjusting.set(false);
+        self.held_bar.set_visible(pages > 1);
     }
 
     /// The formatting for text typed into an empty document.
@@ -366,6 +461,9 @@ impl Editor {
     }
 
     pub fn plain_text(&self) -> String {
+        if let Some(source) = self.painted_source.borrow().as_ref() {
+            return source.plain_text();
+        }
         rich::logical_plain(&self.buffer)
     }
 
@@ -671,6 +769,10 @@ impl Editor {
         if needle.is_empty() {
             return;
         }
+        if self.held_bar.is_visible() {
+            self.find_in_held(forward);
+            return;
+        }
         let buffer = &self.buffer;
         let (sel_start, sel_end) = buffer.selection_bounds().unwrap_or_else(|| {
             let i = buffer.iter_at_mark(&buffer.get_insert());
@@ -696,6 +798,115 @@ impl Editor {
             None => self.search_entry.add_css_class("error"),
         }
     }
+
+    /// Find in a held document whose buffer is one window of the file text.
+    fn find_in_held(&self, forward: bool) {
+        let needle = self.search_entry.text();
+        let Some(plain) = self
+            .painted_source
+            .borrow()
+            .as_ref()
+            .map(|text| text.plain_text())
+        else {
+            return;
+        };
+        let total = plain.chars().count();
+        let origin = self.held_origin.get();
+        let (sel_start, sel_end) = self.buffer.selection_bounds().unwrap_or_else(|| {
+            let i = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            (i, i)
+        });
+        let from = if forward {
+            origin + sel_end.offset().max(0) as usize
+        } else {
+            origin + sel_start.offset().max(0) as usize
+        };
+        let hit = find_ci(&plain, needle.as_str(), forward, from).or_else(|| {
+            let wrap = if forward { 0 } else { total };
+            find_ci(&plain, needle.as_str(), forward, wrap)
+        });
+        let Some((start, end)) = hit else {
+            self.search_entry.add_css_class("error");
+            return;
+        };
+        let window_end = origin + HELD_WINDOW;
+        if start < origin || end > window_end {
+            let next = start / HELD_WINDOW * HELD_WINDOW;
+            self.held_origin.set(next);
+            self.fill_held_window();
+            self.place_held_bar(total, next);
+        }
+        let origin = self.held_origin.get();
+        let s = self
+            .buffer
+            .iter_at_offset(text_offset(start.saturating_sub(origin)));
+        let e = self
+            .buffer
+            .iter_at_offset(text_offset(end.saturating_sub(origin)));
+        self.search_entry.remove_css_class("error");
+        self.buffer.select_range(&s, &e);
+        let mut s = s;
+        self.view.scroll_to_iter(&mut s, 0.1, true, 0.0, 0.35);
+    }
+}
+
+fn bar_chars(value: f64) -> usize {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    // The bar's value is a page index. A page is [`HELD_WINDOW`]
+    // characters, and the page count fits in the exact integer range of f64.
+    value as usize
+}
+
+fn eq_ci(a: char, b: char) -> bool {
+    if a == b || a.eq_ignore_ascii_case(&b) {
+        return true;
+    }
+    let mut ac = a.to_lowercase();
+    let mut bc = b.to_lowercase();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Character offsets of `needle` in `hay`. `from_char` is where the scan
+/// starts. A forward scan begins there. A backward scan begins on the
+/// character before it.
+fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(usize, usize)> {
+    let hay: Vec<char> = hay.chars().collect();
+    let needle: Vec<char> = needle.chars().collect();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    let matches = |i: usize| {
+        hay[i..i + needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| eq_ci(*a, *b))
+    };
+    if forward {
+        let start = from_char.min(hay.len());
+        if start > last {
+            return None;
+        }
+        return (start..=last)
+            .find(|&i| matches(i))
+            .map(|i| (i, i + needle.len()));
+    }
+    if from_char == 0 {
+        return None;
+    }
+    let start = from_char.saturating_sub(1).min(last);
+    (0..=start)
+        .rev()
+        .find(|&i| matches(i))
+        .map(|i| (i, i + needle.len()))
 }
 
 fn text_offset(n: usize) -> i32 {
@@ -1338,8 +1549,10 @@ next}";
             }
         }
         eprintln!(
-            "gtk plain shape={label} chars={chars} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} shown={shown}",
-            ed.buffer.line_count()
+            "gtk plain shape={label} chars={chars} buf={} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} shown={shown} bar={}",
+            ed.buffer.char_count(),
+            ed.buffer.line_count(),
+            ed.held_bar.is_visible()
         );
         assert!(
             open_ms < 100.0,
@@ -1362,6 +1575,48 @@ next}";
         assert_eq!(ed.plain_text(), text.plain_text());
         assert_eq!(ed.plain_text().chars().count(), chars);
         assert_eq!(ed.text(), *text);
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        let shown = ed.buffer.text(&buf_start, &buf_end, false);
+        assert!(
+            text.plain_text().starts_with(shown.as_str()),
+            "{label} buffer is not a prefix of the file"
+        );
+        assert_eq!(shown.chars().count(), chars.min(HELD_WINDOW));
+        if chars > HELD_WINDOW {
+            assert!(ed.held_bar.is_visible());
+            let adj = ed.held_bar.adjustment();
+            let started = std::time::Instant::now();
+            adj.set_value(adj.upper());
+            let scroll_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut scroll_iter = 0.0f64;
+            for _ in 0..20 {
+                let step = std::time::Instant::now();
+                if !context.iteration(false) && !context.pending() {
+                    break;
+                }
+                scroll_iter = scroll_iter.max(step.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!(
+                "gtk plain scroll={label} chars={chars} scroll_ms={scroll_ms:.1} max_iter_ms={scroll_iter:.1}"
+            );
+            assert!(
+                scroll_ms < 100.0,
+                "{label} scroll blocked {scroll_ms:.1} ms at {chars}"
+            );
+            assert!(
+                scroll_iter < 100.0,
+                "{label} scroll turn blocked {scroll_iter:.1} ms at {chars}"
+            );
+            let (tail_start, tail_end) = ed.buffer.bounds();
+            let tail = ed.buffer.text(&tail_start, &tail_end, false);
+            assert!(
+                text.plain_text().ends_with(tail.as_str()),
+                "{label} tail is not the file text"
+            );
+            assert_eq!(tail.chars().count(), HELD_WINDOW.min(chars));
+        } else {
+            assert!(!ed.held_bar.is_visible());
+        }
         let names = rich::tag_names(&ed.buffer.start_iter());
         assert!(
             !names.iter().any(|name| name == "c:b"),
@@ -1505,6 +1760,29 @@ next}";
         let saved = rtf::write(&ed.text());
         assert!(saved.contains("\\uc0\\u8203 "));
         assert_eq!(saved.as_bytes(), rtf::write(&expected).as_bytes());
+    }
+
+    /// A match past the first window moves that window. The selected text is
+    /// the file's own characters.
+    pub(crate) fn find_in_a_long_held_line_reaches_the_tail() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        window.present();
+        let mut body = "a".repeat(HELD_WINDOW);
+        body.push_str("TAIL");
+        ed.load(RichText::from_plain(&body));
+        assert!(ed.is_too_formatted());
+        assert!(ed.held_bar.is_visible());
+        let (start, end) = ed.buffer.bounds();
+        assert!(!ed.buffer.text(&start, &end, false).contains("TAIL"));
+        ed.search_entry.set_text("TAIL");
+        ed.find(true);
+        let (start, end) = ed.buffer.selection_bounds().expect("find missed the tail");
+        assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "TAIL");
+        assert!(ed.plain_text().ends_with("TAIL"));
+        window.close();
     }
 
     /// Open times for one paragraph on a visible view. Uniform runs,
