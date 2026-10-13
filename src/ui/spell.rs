@@ -46,6 +46,9 @@ pub struct Session {
     ignore_path: RefCell<Option<PathBuf>>,
     line: Cell<i32>,
     index: Cell<i32>,
+    /// Byte offset of `index` in the current line. Idle slices advance it
+    /// instead of recounting the line prefix.
+    byte: Cell<usize>,
     idle: RefCell<Option<glib::SourceId>>,
     me: RefCell<std::rc::Weak<Session>>,
     /// Buffer offsets of the word the caret was in, so leaving it can mark it.
@@ -71,6 +74,7 @@ impl Session {
             ignore_path: RefCell::new(None),
             line: Cell::new(0),
             index: Cell::new(0),
+            byte: Cell::new(0),
             idle: RefCell::new(None),
             me: RefCell::new(std::rc::Weak::new()),
             left: Cell::new(None),
@@ -166,6 +170,7 @@ impl Session {
         }
         self.line.set(0);
         self.index.set(0);
+        self.byte.set(0);
         self.arm();
     }
 
@@ -416,8 +421,7 @@ impl Session {
             return glib::ControlFlow::Break;
         }
         let Some(line_start) = buffer.iter_at_line(line) else {
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         };
         let mut line_end = line_start;
@@ -428,39 +432,46 @@ impl Session {
         let index = self.index.get().clamp(0, chars.max(0));
         if chars <= 2_000 {
             self.paint_slice(&line_start, &line_end);
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         }
         if index >= chars {
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         }
         let text = buffer.text(&line_start, &line_end, false).to_string();
-        let Some(scan) = spell::next_scan(&text, byte_between(&text, index), 1_500) else {
-            self.line.set(line + 1);
-            self.index.set(0);
+        let mut mark = spell::LineMark::resume(
+            usize::try_from(index).unwrap_or(0),
+            if index == 0 { 0 } else { self.byte.get() },
+        );
+        let Some(slice) = spell::take_slice(&text, &mut mark, 1_500) else {
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         };
-        if scan.end > scan.start {
-            let start = iter_at(&line_start, &text, scan.start);
-            let end = iter_at(&line_start, &text, scan.end);
+        if slice.end_byte > slice.start_byte {
+            let start = iter_chars(&line_start, slice.start_chars);
+            let end = iter_chars(&line_start, slice.end_chars);
             self.paint_slice(&start, &end);
         }
-        if scan.resume > scan.end {
-            let start = iter_at(&line_start, &text, scan.end);
-            let end = iter_at(&line_start, &text, scan.resume);
+        if slice.resume_byte > slice.end_byte {
+            let start = iter_chars(&line_start, slice.end_chars);
+            let end = iter_chars(&line_start, slice.resume_chars);
             buffer.remove_tag(&self.tag(), &start, &end);
         }
-        let next = chars_before(&text, scan.resume);
+        let next = i32::try_from(slice.resume_chars).unwrap_or(i32::MAX);
         if next >= chars {
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
         } else {
             self.index.set(next);
+            self.byte.set(mark.byte());
         }
         glib::ControlFlow::Continue
+    }
+
+    fn advance_line(&self, line: i32) {
+        self.line.set(line + 1);
+        self.index.set(0);
+        self.byte.set(0);
     }
 
     fn paint_slice(&self, start: &gtk::TextIter, end: &gtk::TextIter) {
@@ -526,6 +537,12 @@ fn replace_word(editor: &Editor, start: i32, end: i32, word: &str) {
     buffer.delete(&mut s, &mut e);
     buffer.insert(&mut s, word);
     buffer.end_user_action();
+}
+
+fn iter_chars(origin: &gtk::TextIter, chars: usize) -> gtk::TextIter {
+    let mut iter = *origin;
+    iter.forward_chars(i32::try_from(chars).unwrap_or(i32::MAX));
+    iter
 }
 
 fn iter_at(origin: &gtk::TextIter, text: &str, byte: usize) -> gtk::TextIter {

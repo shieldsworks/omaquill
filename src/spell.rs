@@ -2,6 +2,8 @@
 //! is not a mark, and neither is any word while spelling is off or while
 //! composition mode is hiding marks.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::ops::Range;
 
 /// How many characters a single lookup will accept.
@@ -534,6 +536,124 @@ pub fn next_scan(text: &str, index: usize, budget: usize) -> Option<Scan> {
     Some(Scan { start, end, resume })
 }
 
+#[cfg(test)]
+thread_local! {
+    static MARK_VISITS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_mark(n: u64) {
+    #[cfg(test)]
+    MARK_VISITS.with(|visits| visits.set(visits.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_mark_visits() {
+    MARK_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn mark_visits() -> u64 {
+    MARK_VISITS.with(|visits| visits.get())
+}
+
+/// Char and byte offsets into one line. `Session::pump` keeps a mark and
+/// moves it forward, so the next idle slice does not reread the prefix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineMark {
+    chars: usize,
+    byte: usize,
+}
+
+impl LineMark {
+    pub fn chars(self) -> usize {
+        self.chars
+    }
+
+    pub fn byte(self) -> usize {
+        self.byte
+    }
+
+    pub fn resume(chars: usize, byte: usize) -> Self {
+        Self { chars, byte }
+    }
+
+    fn byte_for(&mut self, text: &str, chars: usize) -> usize {
+        if chars < self.chars || self.byte > text.len() {
+            self.chars = 0;
+            self.byte = 0;
+        }
+        let mut byte = self.byte;
+        let mut have = self.chars;
+        while have < chars {
+            let Some(ch) = text[byte..].chars().next() else {
+                break;
+            };
+            byte += ch.len_utf8();
+            have += 1;
+            note_mark(1);
+        }
+        self.chars = have;
+        self.byte = byte;
+        byte
+    }
+
+    fn chars_for(&mut self, text: &str, byte: usize) -> usize {
+        let byte = floor(text, byte);
+        if byte < self.byte {
+            self.chars = 0;
+            self.byte = 0;
+        }
+        let mut at = self.byte;
+        let mut chars = self.chars;
+        while at < byte {
+            let Some(ch) = text[at..].chars().next() else {
+                break;
+            };
+            let next = at + ch.len_utf8();
+            if next > byte {
+                break;
+            }
+            at = next;
+            chars += 1;
+            note_mark(1);
+        }
+        self.byte = at;
+        self.chars = chars;
+        chars
+    }
+}
+
+/// Offsets of one idle slice. `start`, `end`, and `resume` are character
+/// offsets into `text`, matching [`Scan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slice {
+    pub start_chars: usize,
+    pub end_chars: usize,
+    pub resume_chars: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub resume_byte: usize,
+}
+
+/// The next idle slice of `text`, starting where `mark` left off.
+pub fn take_slice(text: &str, mark: &mut LineMark, budget: usize) -> Option<Slice> {
+    let origin = mark.byte_for(text, mark.chars);
+    let scan = next_scan(text, origin, budget)?;
+    let start_chars = mark.chars_for(text, scan.start);
+    let end_chars = mark.chars_for(text, scan.end);
+    let resume_chars = mark.chars_for(text, scan.resume);
+    Some(Slice {
+        start_chars,
+        end_chars,
+        resume_chars,
+        start_byte: scan.start,
+        end_byte: scan.end,
+        resume_byte: scan.resume,
+    })
+}
+
 /// `en_US.UTF-8` and `en-GB` become the tag Enchant asks a provider for.
 pub fn tag_from_locale(raw: &str) -> String {
     let base = raw.split(['.', '@']).next().unwrap_or("").trim();
@@ -897,5 +1017,52 @@ mod tests {
         let mut known = |w: &str| w.eq_ignore_ascii_case("zorvath");
         assert!(bad_ranges("Zorvath", 0, 7, None, &policy, &mut known).is_empty());
         assert!(bad_ranges("Zorvath's", 0, 9, None, &policy, &mut known).is_empty());
+    }
+
+    #[test]
+    fn long_line_slices_read_each_character_once() {
+        let text = "helo ".repeat(40_000);
+        reset_mark_visits();
+        let started = std::time::Instant::now();
+        let mut mark = LineMark::default();
+        let mut slices = 0usize;
+        let mut previous = 0usize;
+        while let Some(slice) = take_slice(&text, &mut mark, 1_500) {
+            assert!(slice.resume_byte >= previous);
+            assert_eq!(slice.resume_chars, mark.chars());
+            previous = slice.resume_byte;
+            slices += 1;
+            assert!(slices <= 400, "slice {slices} did not reach the end");
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(mark.byte(), text.len());
+        assert_eq!(mark.chars(), text.chars().count());
+        let visits = mark_visits();
+        let len = u64::try_from(text.len()).unwrap();
+        assert!(
+            visits <= len.saturating_mul(4),
+            "visited {visits} of {len} across {slices} slices"
+        );
+        eprintln!("spell visits={visits} chars={len} slices={slices} ms={ms:.1}");
+    }
+
+    #[test]
+    fn carried_offsets_match_a_count_from_the_start() {
+        let text = "héllo — wörld ".repeat(40);
+        let mut mark = LineMark::default();
+        let mut seen = 0usize;
+        while let Some(slice) = take_slice(&text, &mut mark, 17) {
+            let start = text[..slice.start_byte].chars().count();
+            let end = text[..slice.end_byte].chars().count();
+            let resume = text[..slice.resume_byte].chars().count();
+            assert_eq!(slice.start_chars, start);
+            assert_eq!(slice.end_chars, end);
+            assert_eq!(slice.resume_chars, resume);
+            assert_eq!(mark.chars(), resume);
+            assert_eq!(mark.byte(), slice.resume_byte);
+            seen += 1;
+            assert!(seen < 10_000);
+        }
+        assert_eq!(mark.byte(), text.len());
     }
 }
