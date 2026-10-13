@@ -32,6 +32,11 @@ pub const APP_ID: &str = "io.github.shieldsworks.Omaquill";
 /// Shown when a paragraph has too many style runs to tag on the UI thread.
 const FORMATTING_NOTE: &str = "This document has too much inline formatting to edit safely. The words are shown plain, and the file stays unchanged.";
 
+/// Shown when one unspaced run is long enough that word-char layout would
+/// block the UI thread. The file has one style, so the formatting sentence
+/// would name the wrong reason.
+const LENGTH_NOTE: &str = "This line is too long to edit safely. The words are shown plain, and the file stays unchanged.";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FolderView {
     Text,
@@ -627,6 +632,9 @@ impl Win {
         let weak = Rc::downgrade(self);
         self.editor.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
+                if !w.editor.allows_edits() {
+                    return;
+                }
                 w.dirty_text.set(true);
                 w.update_doc_words();
                 w.schedule_save();
@@ -642,6 +650,9 @@ impl Win {
         let weak = Rc::downgrade(self);
         self.notes.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
+                if !w.notes.allows_edits() {
+                    return;
+                }
                 w.dirty_notes.set(true);
                 w.schedule_save();
             }
@@ -1228,7 +1239,12 @@ impl Win {
             return;
         }
         if self.editor.is_too_formatted() {
-            self.banner.set_title(FORMATTING_NOTE);
+            let note = if self.editor.held_for_length() {
+                LENGTH_NOTE
+            } else {
+                FORMATTING_NOTE
+            };
+            self.banner.set_title(note);
             self.banner.set_revealed(true);
             self.format_bar.set_visible(false);
             return;
@@ -1386,7 +1402,8 @@ impl Win {
         };
         let mut touched = Vec::new();
         if self.dirty_text.get() {
-            if let Some(uuid) = &editor_uuid
+            if !self.editor.is_too_formatted()
+                && let Some(uuid) = &editor_uuid
                 && omaquill::project::is_uuid(uuid)
             {
                 let text = self.editor.text();
@@ -1401,7 +1418,7 @@ impl Win {
         if let Some(uuid) = &inspector_uuid
             && omaquill::project::is_uuid(uuid)
         {
-            if self.dirty_notes.get() {
+            if self.dirty_notes.get() && !self.notes.is_too_formatted() {
                 p.set_notes(uuid, &self.notes.text())?;
                 touched.push(uuid.clone());
             }
@@ -1627,13 +1644,40 @@ impl Win {
         rich::restyle(&self.notes.buffer);
     }
 
+    fn format_bar_visible(&self) -> bool {
+        !self.composing.get()
+            && self.editor_uuid.borrow().is_some()
+            && !self.editor.is_too_formatted()
+    }
+
+    /// Project replace leaves a held document in the skipped list, the same
+    /// place as a document that contains an image.
+    pub(super) fn hold_open_preview(&self, preview: &mut omaquill::replace::Preview) {
+        let mut held = Vec::new();
+        if self.editor.is_too_formatted()
+            && let Some(uuid) = self.editor_uuid.borrow().clone()
+        {
+            held.push((uuid, omaquill::replace::Field::Body));
+        }
+        if self.notes.is_too_formatted()
+            && let Some(uuid) = self.inspector.uuid()
+        {
+            held.push((uuid, omaquill::replace::Field::Notes));
+        }
+        let refs: Vec<(&str, omaquill::replace::Field)> = held
+            .iter()
+            .map(|(uuid, field)| (uuid.as_str(), *field))
+            .collect();
+        preview.skip_held(&refs);
+    }
+
     fn set_composing(&self, on: bool) {
         self.composing.set(on);
         self.toolbar_view.set_reveal_top_bars(!on);
         self.toolbar_view.set_reveal_bottom_bars(!on);
         self.outer.set_show_sidebar(!on);
         self.inner.set_show_sidebar(!on);
-        self.format_bar.set_visible(!on);
+        self.format_bar.set_visible(self.format_bar_visible());
         if on {
             self.window.add_css_class("omaquill-compose");
             self.window.fullscreen();
@@ -1737,6 +1781,12 @@ fn id_less_text_is_read_only() {
     win.dirty_text.set(true);
     assert!(win.save_now());
     assert!(!win.dirty_text.get());
+    win.set_composing(true);
+    win.set_composing(false);
+    assert!(!win.format_bar.property::<bool>("visible"));
+    win.editor.set_align(rtf::Align::Center);
+    assert!(!win.dirty_text.get());
+    assert_eq!(win.editor.plain_text(), "");
     win.show_item(&real);
     assert_eq!(win.current.borrow().as_deref(), Some(real.as_str()));
     assert!(win.editor.view.is_editable());
@@ -1759,6 +1809,7 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
     let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
     let link: Rc<str> = Rc::from("https://example.test/chapter");
     let mut paragraph = rtf::Paragraph::default();
+    paragraph.style.align = rtf::Align::Center;
     for i in 0..2_000 {
         paragraph.runs.push(rtf::Run {
             text: "a".into(),
@@ -1811,6 +1862,41 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
     }
     assert!(win.editor.is_too_formatted());
     assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    win.set_composing(true);
+    win.set_composing(false);
+    assert!(
+        !win.format_bar.property::<bool>("visible"),
+        "leaving compose showed the format bar"
+    );
+    win.editor.set_align(rtf::Align::Left);
+    assert!(!win.dirty_text.get());
+    assert!(win.save_now());
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    assert!(
+        String::from_utf8_lossy(&before).contains("\\qc"),
+        "the fixture lost its center alignment before the edit"
+    );
+    let query = omaquill::replace::query("a", "b", omaquill::replace::Options::default()).unwrap();
+    let mut preview = {
+        let guard = win.project.borrow();
+        omaquill::replace::preview(guard.as_ref().unwrap(), &query).unwrap()
+    };
+    assert!(
+        preview
+            .groups()
+            .iter()
+            .any(|group| group.id().uuid().eq_ignore_ascii_case(&big))
+    );
+    win.hold_open_preview(&mut preview);
+    assert!(
+        preview
+            .groups()
+            .iter()
+            .all(|group| !group.id().uuid().eq_ignore_ascii_case(&big))
+    );
+    assert!(preview.skipped().iter().any(|skip| {
+        skip.id().uuid().eq_ignore_ascii_case(&big) && skip.reason() == ["inline formatting"]
+    }));
     win.show_item(&short);
     assert!(!win.editor.is_too_formatted());
     assert!(win.editor.view.is_editable());
@@ -1844,6 +1930,8 @@ fn gtk_checks() {
     editor::tests::find_matches_across_a_style_boundary();
     editor::tests::large_documents_open_in_the_window();
     editor::tests::a_hostile_paragraph_opens_plain_and_read_only();
+    editor::tests::a_held_document_refuses_every_edit();
+    editor::tests::a_long_uniform_line_opens_plain();
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();
     editor::tests::many_plain_paragraphs_stay_editable();
@@ -1865,6 +1953,7 @@ fn gtk_checks() {
     spell::tests::leaving_the_word_by_a_jump_marks_it();
     spell::tests::a_paste_marks_every_new_word();
     spell::tests::suggestions_share_the_text_view_menu();
+    spell::tests::a_suggestion_does_not_change_a_held_document();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
     spell::tests::activating_spellcheck_flips_its_state();
 }

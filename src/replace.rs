@@ -583,6 +583,31 @@ impl Preview {
         &self.skipped
     }
 
+    /// Documents open as a plain read-only view are not rewritten. They
+    /// are listed with the documents whose rewrite would drop images or
+    /// other content the reader does not keep.
+    pub fn skip_held(&mut self, held: &[(&str, Field)]) {
+        let mut keep = Vec::new();
+        for group in std::mem::take(&mut self.groups) {
+            let blocked = held.iter().any(|(uuid, field)| {
+                group.id.field == *field && group.id.uuid.eq_ignore_ascii_case(uuid)
+            });
+            if blocked {
+                self.skipped.push(Skipped {
+                    id: group.id,
+                    title: group.title,
+                    path_label: group.path_label,
+                    in_trash: group.in_trash,
+                    reason: vec!["inline formatting"],
+                    rows: group.rows,
+                });
+            } else {
+                keep.push(group);
+            }
+        }
+        self.groups = keep;
+    }
+
     pub fn ids(&self) -> Vec<MatchId> {
         self.groups
             .iter()
@@ -1712,6 +1737,70 @@ mod tests {
         let plain = RichText::from_plain("alpha beta");
         let plan = plan_document(&[], &plain, &query).unwrap();
         assert_eq!(render(&plain, &plan).unwrap().plain_text(), "omega beta");
+    }
+
+    #[test]
+    fn a_held_document_is_skipped_like_an_image() {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-held-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Held.scriv");
+        let mut project = Project::create(&path).unwrap();
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        project
+            .set_text(&scene, &RichText::from_plain("alpha beta"))
+            .unwrap();
+        let other = project.add_item(Kind::Text, "Other", &draft, None).unwrap();
+        project
+            .set_text(&other, &RichText::from_plain("alpha gamma"))
+            .unwrap();
+        project.save().unwrap();
+        let before = std::fs::read(project.data_dir(&scene).join("content.rtf")).unwrap();
+        let project = Project::open(&path).unwrap();
+        let query = literal("alpha", "omega", Word::Any, Case::Sensitive);
+        let mut preview = preview(&project, &query).unwrap();
+        assert!(
+            preview
+                .groups()
+                .iter()
+                .any(|group| group.id().uuid().eq_ignore_ascii_case(&scene))
+        );
+        preview.skip_held(&[(&scene, Field::Body)]);
+        assert!(
+            preview
+                .groups()
+                .iter()
+                .all(|group| !group.id().uuid().eq_ignore_ascii_case(&scene))
+        );
+        let skipped = preview
+            .skipped()
+            .iter()
+            .find(|skip| skip.id().uuid().eq_ignore_ascii_case(&scene))
+            .expect("the held document is listed with the image documents");
+        assert_eq!(skipped.reason(), ["inline formatting"]);
+        assert!(!skipped.rows().is_empty());
+        let mut project = Project::open(&path).unwrap();
+        let outcome = apply(
+            &mut project,
+            &dir.join("backups"),
+            1,
+            &preview,
+            &preview.ids(),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Done(_) | ApplyOutcome::SkippedOnly(_)
+        ));
+        assert_eq!(
+            std::fs::read(project.data_dir(&scene).join("content.rtf")).unwrap(),
+            before
+        );
+        let other_text = project.text(&other).unwrap().plain_text();
+        assert!(other_text.contains("omega"), "{other_text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

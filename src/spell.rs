@@ -558,12 +558,24 @@ fn mark_visits() -> u64 {
     MARK_VISITS.with(|visits| visits.get())
 }
 
-/// Character index and byte offset for the idle scan after the buffer
-/// changes by `delta` characters. The stored byte belongs to the previous
-/// text. One inserted scalar can be several bytes, and a replacement of
-/// the same character count can change the byte length.
-pub fn line_anchor_after_edit(_index: i32, _byte: usize, _delta: i32) -> (i32, usize) {
-    (0, 0)
+/// Character index where the idle scan resumes after a keystroke at
+/// `edit_at` on this line. `delta` is the change in character count: an
+/// insertion's new characters sit just before the caret, and a deletion
+/// or a same-length replacement sits at the caret.
+///
+/// The scan starts one word before that edit. A keystroke then rechecks
+/// the token that changed and does not reread the line from the first
+/// character. The byte offset of the old scan belongs to the previous
+/// text, so the caller counts the new byte from the current line.
+pub fn line_anchor_after_edit(edit_at: i32, delta: i32) -> i32 {
+    let edit_at = edit_at.max(0);
+    let touched = if delta > 0 {
+        edit_at.saturating_sub(delta)
+    } else {
+        edit_at
+    };
+    let word = i32::try_from(MAX_WORD).unwrap_or(i32::MAX);
+    touched.saturating_sub(word).max(0)
 }
 
 /// Character range to copy for one idle slice. `index` is the character to
@@ -1100,41 +1112,46 @@ mod tests {
     }
 
     #[test]
-    fn a_multibyte_insert_restarts_the_line_anchor() {
-        // Eighty ASCII characters are already scanned. Inserting one `é`
-        // changes the character count by 1 and shifts each later byte by 2.
-        let (index, byte) = line_anchor_after_edit(80, 80, 1);
-        assert_eq!(
-            (index, byte),
-            (0, 0),
-            "a one-scalar edit kept the stale byte"
-        );
-        let (index, byte) = line_anchor_after_edit(80, 80, 0);
-        assert_eq!(
-            (index, byte),
-            (0, 0),
-            "a same-length replacement kept the stale byte"
-        );
+    fn a_keystroke_anchors_near_the_edit() {
+        let word = i32::try_from(MAX_WORD).unwrap();
+        let inserted = line_anchor_after_edit(4_000, 1);
+        assert_ne!(inserted, 0, "a keystroke restarted the line");
+        assert_eq!(inserted, 4_000 - 1 - word);
+        assert_eq!(line_anchor_after_edit(4_000, 0), 4_000 - word);
+        assert_eq!(line_anchor_after_edit(10, 1), 0);
 
+        // The stored byte belongs to the previous text. A leading `é`
+        // shifts every later byte, so the resume byte is counted on the
+        // new line at the anchor, not reused from the old scan.
         let line = format!("é{}", "alpha ".repeat(4_000));
-        let chars = line.chars().count();
+        let anchor = usize::try_from(inserted).unwrap();
+        let byte = byte_of_chars(&line, anchor);
+        assert_ne!(
+            byte, 4_000,
+            "byte 4000 is not character {anchor} after a leading é"
+        );
         reset_mark_visits();
         let started = std::time::Instant::now();
-        let mut fresh = LineMark::default();
-        let expected = take_slice(&line, &mut fresh, 1_500).expect("fresh slice");
-        let mut restarted = LineMark::resume(usize::try_from(index).unwrap_or(0), byte);
-        let got = take_slice(&line, &mut restarted, 1_500).expect("restarted slice");
-        assert_eq!(got, expected);
+        let mut from_anchor = LineMark::resume(anchor, byte);
+        let got = take_slice(&line, &mut from_anchor, 1_500).expect("anchor slice");
+        assert!(
+            got.start_chars + MAX_WORD >= anchor && got.start_chars <= anchor,
+            "slice started at {} for an edit near {anchor}",
+            got.start_chars
+        );
+        assert!(
+            got.start_chars > 0,
+            "the slice reread the line from the start"
+        );
+        let mut stale = LineMark::resume(4_000, 4_000);
+        let wrong = take_slice(&line, &mut stale, 1_500).expect("stale slice");
+        let at = line[..wrong.start_byte].chars().count();
+        assert_ne!(at, 4_000, "byte 4000 is character {at} after a leading é");
         let visits = mark_visits();
-        let len = u64::try_from(chars).unwrap();
+        let len = u64::try_from(line.chars().count()).unwrap();
         assert!(visits <= len.saturating_mul(4), "visited {visits} of {len}");
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("anchor visits={visits} chars={len} ms={ms:.1}");
-
-        let mut stale = LineMark::resume(80, 80);
-        let wrong = take_slice(&line, &mut stale, 1_500).expect("stale slice");
-        let at = line[..wrong.start_byte].chars().count();
-        assert_ne!(at, 80, "byte 80 is character {at} after a leading é");
     }
 
     #[test]

@@ -455,6 +455,43 @@ pub(crate) fn style_tag_count(style: &CharStyle) -> usize {
 /// loop turn took 1.3 s. The editor then shows the words and does not tag.
 pub(crate) const SYNC_TAG_APPLIES: usize = 800;
 
+/// Word-char wrap of one unspaced line is laid out on the next main-loop
+/// turn. A visible 800×600 editor, GTK 4.14.5, took 20.9 ms at 2,048
+/// characters, 24.4 at 4,096, 73.5 at 8,192, and 101.8 at 10,000.
+/// `set_text` itself stayed under 1 ms. The run count does not matter:
+/// uniform runs merge to one range and still produce that line. A longer
+/// breakless run is shown with word wrap and no style tags. Ordinary
+/// prose breaks on spaces, so a long manuscript of short words stays
+/// editable.
+pub(crate) const SYNC_BREAKLESS_CHARS: usize = 8_192;
+
+/// Characters in the longest stretch that word-char wrap cannot break.
+pub(crate) fn breakless_chars(text: &RichText) -> usize {
+    let mut heavy = 0usize;
+    for paragraph in &text.paragraphs {
+        let mut run = 0usize;
+        for piece in &paragraph.runs {
+            for ch in piece.text.chars() {
+                if ch.is_whitespace() {
+                    heavy = heavy.max(run);
+                    run = 0;
+                } else {
+                    run += 1;
+                }
+            }
+        }
+        heavy = heavy.max(run);
+    }
+    heavy
+}
+
+/// The plain read-only view. Either the heaviest paragraph needs too many
+/// tag applies, or one unspaced run is long enough that word-char layout
+/// blocks the UI thread.
+pub(crate) fn needs_plain_view(text: &RichText) -> bool {
+    heavy_applies(text) > SYNC_TAG_APPLIES || breakless_chars(text) > SYNC_BREAKLESS_CHARS
+}
+
 /// Tag applies in the paragraph that has the most, after adjacent runs with
 /// the same style have been merged. Paragraphs do not add together.
 pub(crate) fn heavy_applies(text: &RichText) -> usize {
@@ -847,6 +884,13 @@ pub(crate) mod tests {
             lossy: Vec::new(),
         };
         assert_eq!(heavy_applies(&uniform), 2);
+        assert!(!needs_plain_view(&uniform));
+        let long = RichText::from_plain(&"a".repeat(SYNC_BREAKLESS_CHARS + 1));
+        assert!(heavy_applies(&long) <= SYNC_TAG_APPLIES);
+        assert!(needs_plain_view(&long));
+        let spaced = RichText::from_plain(&"aa ".repeat(10_000));
+        assert!(!needs_plain_view(&spaced));
+        assert!(breakless_chars(&spaced) < SYNC_BREAKLESS_CHARS);
     }
 
     #[test]

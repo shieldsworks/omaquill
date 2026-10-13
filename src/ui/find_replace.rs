@@ -80,6 +80,10 @@ pub fn present(win: &Rc<Win>) {
                 win.toast("Click in the document first");
                 return;
             };
+            if editor.is_too_formatted() {
+                win.toast(&replace::skip_label(&["inline formatting"]));
+                return;
+            }
             let lossy = editor.lossy();
             if !lossy.is_empty() {
                 win.toast(&replace::skip_label(&lossy));
@@ -126,7 +130,7 @@ pub fn present(win: &Rc<Win>) {
                     return;
                 }
             };
-            match replace::plan_document(&editor.lossy(), &editor.text(), &query) {
+            match editor.plan_replace(&query) {
                 Ok(plan) => {
                     let count = plan.edits().len();
                     if editor.apply_edits(&plan).is_none() {
@@ -173,7 +177,10 @@ pub fn present(win: &Rc<Win>) {
                     return;
                 };
                 match replace::preview(project, &query) {
-                    Ok(preview) => preview,
+                    Ok(mut preview) => {
+                        win.hold_open_preview(&mut preview);
+                        preview
+                    }
                     Err(e) => {
                         win.toast(&e.to_string());
                         return;

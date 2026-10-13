@@ -132,10 +132,10 @@ impl Session {
         self.rescan();
     }
 
-    /// A paste, or any larger change, checks the whole buffer. A smaller
-    /// change still drops the carried line anchor. One inserted scalar can
-    /// be several bytes, so the stored byte would no longer match the
-    /// character index.
+    /// A paste, or any larger change, checks the whole buffer. A
+    /// one-character edit on the line being scanned resumes within a word
+    /// of that edit. The stored byte belonged to the previous text, so the
+    /// new byte is counted from the current line.
     pub fn after_edit(&self) {
         let n = self.editor.buffer.char_count();
         let prev = self.chars.replace(n);
@@ -145,10 +145,22 @@ impl Session {
             self.rescan();
             return;
         }
-        let (index, byte) = spell::line_anchor_after_edit(self.index.get(), self.byte.get(), delta);
-        self.index.set(index);
-        self.byte.set(byte);
-        self.clear_scan_mark();
+        let buffer = &self.editor.buffer;
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        if cursor.line() == self.line.get() {
+            let index = spell::line_anchor_after_edit(cursor.line_offset(), delta);
+            self.index.set(index);
+            let mut start = cursor;
+            start.set_line_offset(0);
+            let mut end = start;
+            if !end.ends_line() {
+                end.forward_to_line_end();
+            }
+            let line = buffer.text(&start, &end, false);
+            let at = usize::try_from(index.max(0)).unwrap_or(0);
+            self.byte.set(spell::byte_of_chars(line.as_str(), at));
+            self.clear_scan_mark();
+        }
         self.refresh_cursor();
     }
 
@@ -586,6 +598,9 @@ impl Session {
 }
 
 fn replace_word(editor: &Editor, start: i32, end: i32, word: &str) {
+    if !editor.allows_edits() {
+        return;
+    }
     let buffer = &editor.buffer;
     let mut s = buffer.iter_at_offset(start);
     let mut e = buffer.iter_at_offset(end);
@@ -907,6 +922,29 @@ pub(crate) mod tests {
         );
         assert!(labels.iter().any(|label| label == "Add to Dictionary"));
         assert!(labels.iter().any(|label| label == "Ignore"));
+    }
+
+    /// A suggestion replaces the buffer even when the view is not editable,
+    /// unless the held state refuses it. `text()` would still return the
+    /// source, so the buffer and the file would disagree.
+    pub(crate) fn a_suggestion_does_not_change_a_held_document() {
+        let mut paragraph = omaquill::rtf::Paragraph::default();
+        paragraph.runs.push(omaquill::rtf::Run {
+            text: format!("{} helo", "a".repeat(10_000)),
+            style: omaquill::rtf::CharStyle::default(),
+        });
+        let text = omaquill::rtf::RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        let editor = Editor::new(true);
+        editor.load(&text);
+        assert!(editor.is_too_formatted());
+        let plain = editor.plain_text();
+        let at = i32::try_from(plain.find("helo").expect("helo")).unwrap_or(0);
+        replace_word(&editor, at, at + 4, "hello");
+        assert_eq!(editor.plain_text(), plain);
+        assert_eq!(editor.text().plain_text(), plain);
     }
 
     /// Spell walks `line_count`. One paragraph is one line, including when

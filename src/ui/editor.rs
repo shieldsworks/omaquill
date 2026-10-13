@@ -120,6 +120,20 @@ impl Editor {
 
     fn wire(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
+        self.buffer
+            .connect_insert_text(move |buffer, _iter, _text| {
+                if weak.upgrade().is_some_and(|ed| ed.blocks_signal()) {
+                    buffer.stop_signal_emission_by_name("insert-text");
+                }
+            });
+        let weak = Rc::downgrade(self);
+        self.buffer
+            .connect_delete_range(move |buffer, _start, _end| {
+                if weak.upgrade().is_some_and(|ed| ed.blocks_signal()) {
+                    buffer.stop_signal_emission_by_name("delete-range");
+                }
+            });
+        let weak = Rc::downgrade(self);
         self.buffer.connect_closure(
             "insert-text",
             true,
@@ -162,7 +176,7 @@ impl Editor {
         let weak = Rc::downgrade(self);
         self.buffer.connect_changed(move |_| {
             if let Some(ed) = weak.upgrade()
-                && !ed.loading.get()
+                && ed.allows_edits()
             {
                 for f in ed.changed.borrow().iter() {
                     f();
@@ -240,7 +254,7 @@ impl Editor {
         // A heavier one is shown as plain words. Tagging it, then laying
         // that line out, blocked the UI thread for longer than a slice
         // can hide.
-        if rich::heavy_applies(text) <= rich::SYNC_TAG_APPLIES {
+        if !rich::needs_plain_view(text) {
             // The previous document may have been held, which uses word wrap.
             self.view.set_wrap_mode(gtk::WrapMode::WordChar);
             let mut paint = rich::Paint::begin(&self.buffer, text);
@@ -253,10 +267,11 @@ impl Editor {
             self.report();
             return;
         }
-        // Word-char wrap of one unspaced paragraph took about 100 ms at
-        // 10,000 characters inside `set_text`, and the next draw did it
-        // again. Word wrap still breaks at spaces. A run of letters stays
-        // on one line, which stayed under 100 ms at 100,000 characters.
+        // Word-char wrap of an unspaced line of 10,000 characters took
+        // 101.8 ms on the next main-loop turn. Word wrap still breaks at
+        // spaces. A run of letters stays on one line, and that path stayed
+        // under 50 ms to open and under 40 ms on the next turn at 100,000
+        // characters.
         self.view.set_wrap_mode(gtk::WrapMode::Word);
         self.buffer.begin_irreversible_action();
         self.buffer.set_text(&text.plain_text());
@@ -266,8 +281,21 @@ impl Editor {
         self.painted_source.borrow_mut().replace(text.clone());
         self.view.set_editable(false);
         self.view.set_cursor_visible(true);
+        self.loading.set(false);
         self.pending.borrow_mut().clear();
         self.report();
+    }
+
+    /// Typing, tags, paste, drop, and undo may change the buffer.
+    pub fn allows_edits(&self) -> bool {
+        !self.is_too_formatted() && !self.loading.get() && self.view.is_editable()
+    }
+
+    /// `insert-text` and `delete-range` while a document is loading are the
+    /// load itself. After that, a held document and a read-only view refuse
+    /// every insert and delete, including paste, drop, and undo.
+    fn blocks_signal(&self) -> bool {
+        !self.loading.get() && !self.allows_edits()
     }
 
     /// Whether typing is allowed. A document held for too much formatting
@@ -284,6 +312,15 @@ impl Editor {
     /// formatting to tag safely. [`Self::text`] still returns that document.
     pub fn is_too_formatted(&self) -> bool {
         self.painted_source.borrow().is_some()
+    }
+
+    /// Held because one unspaced run is long, not because of the tag count.
+    /// The formatting banner would be the wrong reason.
+    pub fn held_for_length(&self) -> bool {
+        self.painted_source.borrow().as_ref().is_some_and(|text| {
+            rich::heavy_applies(text) <= rich::SYNC_TAG_APPLIES
+                && rich::breakless_chars(text) > rich::SYNC_BREAKLESS_CHARS
+        })
     }
 
     /// Drops a plain-only hold. The next [`Self::load`] replaces the buffer.
@@ -336,11 +373,25 @@ impl Editor {
         omaquill::rtf::word_count(&self.plain_text())
     }
 
+    /// Replace All for this buffer. A held document is reported the way an
+    /// image is: the plan is refused, and nothing is written.
+    pub fn plan_replace(
+        &self,
+        query: &omaquill::replace::Query,
+    ) -> Result<omaquill::replace::EditPlan, omaquill::replace::ReplaceBlock> {
+        if self.is_too_formatted() {
+            return Err(omaquill::replace::ReplaceBlock::Lossy(vec![
+                "inline formatting",
+            ]));
+        }
+        omaquill::replace::plan_document(&self.lossy(), &self.text(), query)
+    }
+
     pub fn apply_edits(
         &self,
         plan: &omaquill::replace::EditPlan,
     ) -> Option<omaquill::replace::Cursor> {
-        if plan.is_empty() || self.loading.get() {
+        if plan.is_empty() || !self.allows_edits() {
             return None;
         }
         self.pending.borrow_mut().clear();
@@ -508,7 +559,7 @@ impl Editor {
     /// Bold, italic, underline or strikethrough (`c:b`, `c:i`, `c:u`,
     /// `c:s`) on the selection, or for what's typed next.
     pub fn toggle(&self, name: &str) {
-        if self.loading.get() {
+        if !self.allows_edits() {
             return;
         }
         let buffer = &self.buffer;
@@ -554,6 +605,9 @@ impl Editor {
 
     /// Aligns every paragraph the selection touches.
     pub fn set_align(&self, align: Align) {
+        if !self.allows_edits() {
+            return;
+        }
         let buffer = &self.buffer;
         let (mut s, mut e) = buffer.selection_bounds().unwrap_or_else(|| {
             let i = buffer.iter_at_mark(&buffer.get_insert());
@@ -701,6 +755,7 @@ fn paint_new_lines(
 pub(crate) mod tests {
     use super::*;
     use omaquill::rtf::{self, Align, CharStyle, Paragraph, RichText, Run};
+    use std::cell::Cell;
     use std::rc::Rc;
 
     fn type_at(ed: &Editor, offset: i32, text: &str) {
@@ -1061,8 +1116,61 @@ next}";
         assert_eq!(ed.text().plain_text(), "Hello");
     }
 
-    /// Adjacent runs with the same style are one GTK range, so a long
-    /// uniform paragraph is styled before load returns.
+    /// A held document accepts no edit. Alignment, paste, undo, and replace
+    /// leave the buffer and the source alone, and replace is reported the
+    /// way an image document is.
+    pub(crate) fn a_held_document_refuses_every_edit() {
+        let mut text = toggled(2_000);
+        text.paragraphs[0].style.align = Align::Center;
+        text.paragraphs[0].runs[10].text = " helo ".into();
+        let ed = Editor::new(true);
+        ed.load(&text);
+        assert!(ed.is_too_formatted());
+        assert!(!ed.held_for_length());
+        assert!(!ed.loading.get());
+        assert!(!ed.allows_edits());
+        assert!(!ed.view.is_editable());
+        let plain = ed.plain_text();
+        let dirtied = Rc::new(Cell::new(false));
+        let flag = dirtied.clone();
+        ed.connect_changed(move || flag.set(true));
+        ed.set_align(Align::Left);
+        ed.toggle("c:b");
+        assert!(!dirtied.get());
+        assert_eq!(ed.text(), text);
+        assert_eq!(ed.text().paragraphs[0].style.align, Align::Center);
+        let mut at = ed.buffer.start_iter();
+        ed.buffer.insert(&mut at, "ZZ");
+        ed.buffer.undo();
+        assert_eq!(ed.plain_text(), plain);
+        let query = omaquill::replace::query(
+            "helo",
+            "hello",
+            omaquill::replace::Options {
+                case: omaquill::replace::Case::Sensitive,
+                word: omaquill::replace::Word::Any,
+                mode: omaquill::replace::Mode::Literal,
+            },
+        )
+        .unwrap();
+        let blocked = ed.plan_replace(&query);
+        assert!(
+            matches!(
+                blocked,
+                Err(omaquill::replace::ReplaceBlock::Lossy(ref reason))
+                    if reason.as_slice() == ["inline formatting"]
+            ),
+            "{blocked:?}"
+        );
+        let plan = omaquill::replace::plan_document(&[], &text, &query).unwrap();
+        assert!(ed.apply_edits(&plan).is_none());
+        assert_eq!(ed.plain_text(), plain);
+        assert_eq!(ed.text(), text);
+        assert!(!dirtied.get());
+    }
+
+    /// Adjacent runs with the same style are one GTK range, so a uniform
+    /// paragraph under the line-length cap is styled before load returns.
     pub(crate) fn identical_runs_open_without_an_idle_pass() {
         let runs = 5_000usize;
         let mut paragraph = Paragraph::default();
@@ -1092,8 +1200,57 @@ next}";
         assert_eq!(back.paragraphs[0].runs[0].text.len(), runs);
     }
 
+    /// One uniform style merges to a couple of tag applies, so the tag cap
+    /// does not hold it. The line is one unspaced run, and word-char layout
+    /// of that run is what blocks the UI thread.
+    pub(crate) fn a_long_uniform_line_opens_plain() {
+        let runs = 10_000usize;
+        let mut paragraph = Paragraph::default();
+        for _ in 0..runs {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: true,
+                    ..CharStyle::default()
+                },
+            });
+        }
+        let text = RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        assert!(rich::heavy_applies(&text) <= rich::SYNC_TAG_APPLIES);
+        assert!(rich::needs_plain_view(&text));
+        let ed = Editor::new(true);
+        let started = std::time::Instant::now();
+        ed.load(&text);
+        let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("uniform plain runs={runs} open_ms={open_ms:.1}");
+        assert!(
+            open_ms < 100.0,
+            "open blocked the thread for {open_ms:.1} ms"
+        );
+        assert!(ed.is_too_formatted());
+        assert!(ed.held_for_length());
+        assert!(!ed.loading.get());
+        assert!(!ed.view.is_editable());
+        assert_eq!(ed.buffer.line_count(), 1);
+        assert_eq!(ed.text(), text);
+        assert_eq!(ed.plain_text().chars().count(), runs);
+        let names = rich::tag_names(&ed.buffer.start_iter());
+        assert!(
+            !names.iter().any(|name| name == "c:b"),
+            "plain open applied a bold tag: {names:?}"
+        );
+        let plain = ed.plain_text();
+        let mut at = ed.buffer.start_iter();
+        ed.buffer.insert(&mut at, "ZZ");
+        assert_eq!(ed.plain_text(), plain);
+    }
+
     /// Many ordinary paragraphs stay fully styled. The plain hold is for one
-    /// paragraph with a large tag count, not for a long manuscript.
+    /// paragraph with a large tag count or one long unspaced run, not for a
+    /// long manuscript.
     pub(crate) fn many_plain_paragraphs_stay_editable() {
         let mut paragraphs = Vec::new();
         for _ in 0..2_000 {
@@ -1115,9 +1272,111 @@ next}";
         assert_eq!(ed.buffer.line_count(), 2_000);
     }
 
-    /// Open times for one paragraph of many style runs on a visible view.
-    /// Set OMAQUILL_GTK_OPEN=1 for every size, or set it to one run count.
-    /// The paragraph stays one plain line, and load does not tag it.
+    fn uniform(runs: usize) -> RichText {
+        let mut paragraph = Paragraph::default();
+        for _ in 0..runs {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: true,
+                    ..CharStyle::default()
+                },
+            });
+        }
+        RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        }
+    }
+
+    fn one_line(chars: usize) -> RichText {
+        RichText {
+            paragraphs: vec![Paragraph {
+                runs: vec![Run {
+                    text: "a".repeat(chars),
+                    style: CharStyle::default(),
+                }],
+                ..Paragraph::default()
+            }],
+            lossy: Vec::new(),
+        }
+    }
+
+    fn time_open(ed: &Editor, context: &gtk::glib::MainContext, label: &str, text: &RichText) {
+        let chars = text.plain_text().chars().count();
+        let started = std::time::Instant::now();
+        ed.load(text);
+        let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(ed.buffer.line_count(), 1);
+        assert!(ed.is_too_formatted());
+        assert!(!ed.view.is_editable());
+        assert!(!ed.loading.get());
+        let mut max_iter_ms = 0.0f64;
+        let mut shown = false;
+        for _ in 0..40 {
+            let step = std::time::Instant::now();
+            let ran = context.iteration(false);
+            let iter_ms = step.elapsed().as_secs_f64() * 1000.0;
+            if ran {
+                max_iter_ms = max_iter_ms.max(iter_ms);
+            }
+            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
+                shown = true;
+            }
+            if shown && !context.pending() {
+                break;
+            }
+        }
+        eprintln!(
+            "gtk plain shape={label} chars={chars} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} shown={shown}",
+            ed.buffer.line_count()
+        );
+        assert!(
+            open_ms < 100.0,
+            "{label} open blocked {open_ms:.1} ms at {chars}"
+        );
+        assert!(
+            max_iter_ms < 100.0,
+            "{label} main-loop turn blocked {max_iter_ms:.1} ms at {chars}"
+        );
+        assert!(shown, "{label} did not get a line height");
+        assert_eq!(ed.plain_text().chars().count(), chars);
+        assert_eq!(ed.text(), *text);
+        let names = rich::tag_names(&ed.buffer.start_iter());
+        assert!(
+            !names.iter().any(|name| name == "c:b"),
+            "{label} applied a bold tag"
+        );
+    }
+
+    /// Word-char layout cost of one unspaced line, before the plain-view
+    /// cap. Set OMAQUILL_GTK_OPEN=probe. This is the cost the cap avoids.
+    fn probe_word_char(ed: &Editor, context: &gtk::glib::MainContext) {
+        ed.view.set_wrap_mode(gtk::WrapMode::WordChar);
+        for chars in [2_048usize, 4_096, 8_192, 10_000] {
+            let body = "a".repeat(chars);
+            let started = std::time::Instant::now();
+            ed.buffer.set_text(&body);
+            let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut max_iter_ms = 0.0f64;
+            for _ in 0..20 {
+                let step = std::time::Instant::now();
+                if !context.iteration(false) && !context.pending() {
+                    break;
+                }
+                max_iter_ms = max_iter_ms.max(step.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!(
+                "gtk wordchar chars={chars} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} lines={}",
+                ed.buffer.line_count()
+            );
+        }
+    }
+
+    /// Open times for one paragraph on a visible view. Set
+    /// OMAQUILL_GTK_OPEN=1 for uniform runs, alternating runs, and one
+    /// unspaced line at 10k, 50k, and 100k. Set it to `probe` to time
+    /// word-char layout under the cap. The paragraph stays one plain line.
     pub(crate) fn time_styled_paragraph_open() {
         let Some(which) = std::env::var("OMAQUILL_GTK_OPEN").ok() else {
             return;
@@ -1134,54 +1393,18 @@ next}";
             }
             context.iteration(false);
         }
-        for runs in [1_000usize, 2_000, 4_000, 10_000, 50_000, 100_000] {
-            if which != "1" && which != runs.to_string() {
+        if which == "probe" {
+            probe_word_char(&ed, &context);
+            window.close();
+            return;
+        }
+        for chars in [10_000usize, 50_000, 100_000] {
+            if which != "1" && which != chars.to_string() {
                 continue;
             }
-            let text = toggled(runs);
-            let started = std::time::Instant::now();
-            ed.load(&text);
-            let open_ms = started.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(ed.buffer.line_count(), 1);
-            assert!(ed.is_too_formatted());
-            assert!(!ed.view.is_editable());
-            let mut max_iter_ms = 0.0f64;
-            let mut shown = false;
-            for _ in 0..40 {
-                let step = std::time::Instant::now();
-                let ran = context.iteration(false);
-                let iter_ms = step.elapsed().as_secs_f64() * 1000.0;
-                if ran {
-                    max_iter_ms = max_iter_ms.max(iter_ms);
-                }
-                if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
-                    shown = true;
-                }
-                if shown && !context.pending() {
-                    break;
-                }
-            }
-            eprintln!(
-                "gtk plain runs={runs} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} shown={shown}",
-                ed.buffer.line_count()
-            );
-            assert!(open_ms < 100.0, "open blocked {open_ms:.1} ms at {runs}");
-            assert!(
-                max_iter_ms < 100.0,
-                "a main-loop turn blocked {max_iter_ms:.1} ms at {runs}"
-            );
-            assert!(shown, "the plain paragraph did not get a line height");
-            assert!(ed.is_too_formatted());
-            assert!(!ed.view.is_editable());
-            assert_eq!(ed.buffer.line_count(), 1);
-            assert_eq!(ed.plain_text().chars().count(), runs);
-            assert_eq!(ed.text().paragraphs.len(), 1);
-            assert_eq!(ed.text().paragraphs[0].runs.len(), runs);
-            let names = rich::tag_names(&ed.buffer.start_iter());
-            assert!(
-                !names.iter().any(|name| name == "c:b"),
-                "plain open applied a bold tag"
-            );
+            time_open(&ed, &context, "uniform", &uniform(chars));
+            time_open(&ed, &context, "alternating", &toggled(chars));
+            time_open(&ed, &context, "line", &one_line(chars));
         }
         window.close();
     }

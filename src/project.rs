@@ -219,7 +219,8 @@ fn missing_item(uuid: &str) -> Error {
 /// Words compiled from `draft`, counting each document once.
 ///
 /// The draft folder's own count is included. A child counts only when it
-/// is included in compile. Rows that share a UUID are one document.
+/// is included in compile, and an excluded folder hides its children.
+/// Rows that share a UUID are one document.
 pub fn compile_words(draft: &Item, counts: &HashMap<String, usize>) -> usize {
     fn add(
         item: &Item,
@@ -227,8 +228,13 @@ pub fn compile_words(draft: &Item, counts: &HashMap<String, usize>) -> usize {
         seen: &mut HashSet<String>,
         gate: bool,
     ) -> usize {
+        // Compile omits an excluded item and everything under it. An
+        // included child of an excluded folder is not in the manuscript.
+        if gate && !item.include_in_compile {
+            return 0;
+        }
         let mut total = 0;
-        if (!gate || item.include_in_compile) && seen.insert(item.uuid.to_ascii_uppercase()) {
+        if seen.insert(item.uuid.to_ascii_uppercase()) {
             total += counts.get(&item.uuid).copied().unwrap_or(0);
         }
         for child in &item.children {
@@ -987,55 +993,34 @@ impl Project {
                 return Some((p.style.clone(), p.runs[0].style.clone()));
             }
         }
-        // A shared id is one file. Stop after a few documents that actually
-        // contain text, so a binder full of aliases cannot reparse one manuscript.
-        const STYLE_DOCUMENTS: usize = 8;
+        // A shared id is one file. Aliases of one short document are parsed
+        // once. The search keeps going through later included documents
+        // until it finds a paragraph long enough to copy, or the binder ends.
         fn search(
             p: &Project,
             items: &[Item],
             seen: &mut HashSet<String>,
-            examined: &mut usize,
         ) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
             for i in items.iter().filter(|i| i.include_in_compile) {
-                if *examined >= STYLE_DOCUMENTS {
-                    return None;
-                }
                 if i.kind.has_text()
                     && is_uuid(&i.uuid)
                     && seen.insert(i.uuid.to_ascii_uppercase())
                     && let Ok(t) = p.text(&i.uuid)
-                {
-                    if let Some(par) = t
+                    && let Some(par) = t
                         .paragraphs
                         .iter()
                         .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
-                    {
-                        return Some((par.style.clone(), par.runs[0].style.clone()));
-                    }
-                    if t.paragraphs
-                        .iter()
-                        .any(|par| par.runs.iter().any(|r| !r.text.is_empty()))
-                    {
-                        *examined += 1;
-                    }
+                {
+                    return Some((par.style.clone(), par.runs[0].style.clone()));
                 }
-                if let Some(found) = search(p, &i.children, seen, examined) {
+                if let Some(found) = search(p, &i.children, seen) {
                     return Some(found);
-                }
-                if *examined >= STYLE_DOCUMENTS {
-                    return None;
                 }
             }
             None
         }
         let mut seen = HashSet::new();
-        let mut examined = 0usize;
-        search(
-            self,
-            &self.root_folder(Kind::Draft)?.children,
-            &mut seen,
-            &mut examined,
-        )
+        search(self, &self.root_folder(Kind::Draft)?.children, &mut seen)
     }
 
     pub fn synopsis(&self, uuid: &str) -> String {
@@ -1200,7 +1185,6 @@ impl Project {
             .expect("the search index has a Documents element");
         let children = std::mem::take(&mut docs.children);
         let mut kept = Vec::with_capacity(children.len());
-        let mut n = 0usize;
         for node in children {
             note_index_visit(1);
             let drop_doc = match &node {
@@ -1217,9 +1201,6 @@ impl Project {
                 }
                 continue;
             }
-            if matches!(node, xml::Node::Element(_)) {
-                n += 1;
-            }
             kept.push(node);
         }
         if !kept
@@ -1231,6 +1212,7 @@ impl Project {
         docs.children = kept;
         let mut rows = HashMap::new();
         index_rows(&self.items(), &mut rows);
+        let mut entries = Vec::new();
         for uuid in uuids {
             let Some((title, has_text)) = rows.get(&uuid.to_ascii_uppercase()) else {
                 continue; // deleted
@@ -1251,9 +1233,9 @@ impl Project {
             }
             add("Notes", &self.notes(&uuid)?.plain_text());
             xml::pretty(&mut entry, "\n        ");
-            docs.insert_element(n, entry, "\n    ");
-            n += 1;
+            entries.push(entry);
         }
+        docs.append_elements(entries, "\n    ");
         write_inside(&self.root, &path, doc.to_xml().as_bytes())?;
         Ok(())
     }
@@ -1843,6 +1825,39 @@ mod tests {
     }
 
     #[test]
+    fn save_search_index_inserts_each_document_once() {
+        let (path, mut project) = temp_project("reindex-linear");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let mut ids = Vec::new();
+        for n in 0..80 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain(&format!("words {n}")))
+                .unwrap();
+            ids.push(id);
+        }
+        project.save().unwrap();
+        for id in &ids {
+            project
+                .set_text(id, &RichText::from_plain("updated lamp"))
+                .unwrap();
+        }
+        xml::reset_insert_walks();
+        project.save().unwrap();
+        let n = u64::try_from(ids.len()).unwrap();
+        let walks = xml::insert_walks();
+        assert!(
+            walks <= n.saturating_mul(4),
+            "inserting {n} documents walked {walks} element-list steps"
+        );
+        let index = std::fs::read_to_string(path.join("Files/search.indexes")).unwrap();
+        assert_eq!(index.matches("updated lamp").count(), ids.len());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn compile_words_counts_a_shared_uuid_once() {
         let shared = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
         let other = "11111111-2222-3333-4444-555555555555";
@@ -1863,6 +1878,28 @@ mod tests {
         let draft = item(shared, Kind::Draft, aliases);
         let words = compile_words(&draft, &counts);
         assert_eq!(words, 14, "shared uuid counted {words}");
+    }
+
+    #[test]
+    fn compile_words_skips_an_included_child_of_an_excluded_folder() {
+        let child_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000001";
+        let nested_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000002";
+        let folder_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000003";
+        let kept_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000004";
+        let mut nested = item(nested_id, Kind::Text, Vec::new());
+        nested.include_in_compile = true;
+        let mut child = item(child_id, Kind::Text, vec![nested]);
+        child.include_in_compile = true;
+        let mut folder = item(folder_id, Kind::Folder, vec![child]);
+        folder.include_in_compile = false;
+        let kept = item(kept_id, Kind::Text, Vec::new());
+        let draft = item("DRAFT", Kind::Draft, vec![folder, kept]);
+        let mut counts = HashMap::new();
+        counts.insert(child_id.to_string(), 40);
+        counts.insert(nested_id.to_string(), 9);
+        counts.insert(folder_id.to_string(), 7);
+        counts.insert(kept_id.to_string(), 3);
+        assert_eq!(compile_words(&draft, &counts), 3);
     }
 
     #[test]
@@ -2087,8 +2124,8 @@ mod tests {
         assert!(project.default_style().is_none());
         let cap_ms = started.elapsed().as_secs_f64() * 1000.0;
         let cap_parses = rtf::parses();
-        assert!(
-            cap_parses <= 8,
+        assert_eq!(
+            cap_parses, 24,
             "24 short documents parsed {cap_parses} times"
         );
         eprintln!(
@@ -2097,6 +2134,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(hit_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(alias_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(cap_path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_reads_past_short_included_documents() {
+        let (path, mut project) = temp_project("style-after-short");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        for n in 0..8 {
+            let id = project
+                .add_item(Kind::Text, &format!("Short {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain("short words"))
+                .unwrap();
+        }
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        let mut paragraph = rtf::Paragraph::default();
+        paragraph.style.align = rtf::Align::Center;
+        paragraph.runs.push(rtf::Run {
+            text: "This sentence is definitely longer than twenty characters.".into(),
+            style: rtf::CharStyle {
+                italic: true,
+                ..rtf::CharStyle::default()
+            },
+        });
+        project
+            .set_text(
+                &scene,
+                &RichText {
+                    paragraphs: vec![paragraph],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&path).unwrap();
+        let style = project
+            .default_style()
+            .expect("a long paragraph after eight short documents");
+        assert_eq!(style.0.align, rtf::Align::Center);
+        assert!(style.1.italic);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
