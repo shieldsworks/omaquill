@@ -1233,6 +1233,19 @@ impl Win {
             .transpose();
         match text {
             Ok(Some(text)) => {
+                let stored = omaquill::project::is_uuid(&item.uuid);
+                self.editor.view.set_editable(stored);
+                self.editor.view.set_cursor_visible(stored);
+                if !stored {
+                    self.editor.load(&rtf::RichText::from_plain(""));
+                    self.banner.set_title("This item has no file.");
+                    self.banner.set_revealed(true);
+                    self.dirty_text.set(false);
+                    *self.editor_uuid.borrow_mut() = None;
+                    self.format_bar.set_visible(false);
+                    self.stack.set_visible_child_name("editor");
+                    return;
+                }
                 if !text.lossy.is_empty() {
                     self.banner.set_title(&format!(
                         "This document has {} that omaquill shows as plain text. Editing it keeps the words but not that layout.",
@@ -1354,7 +1367,9 @@ impl Win {
         };
         let mut touched = Vec::new();
         if self.dirty_text.get() {
-            if let Some(uuid) = &editor_uuid {
+            if let Some(uuid) = &editor_uuid
+                && omaquill::project::is_uuid(uuid)
+            {
                 let text = self.editor.text();
                 p.set_text(uuid, &text)?;
                 self.counts
@@ -1364,7 +1379,9 @@ impl Win {
             }
             self.dirty_text.set(false);
         }
-        if let Some(uuid) = &inspector_uuid {
+        if let Some(uuid) = &inspector_uuid
+            && omaquill::project::is_uuid(uuid)
+        {
             if self.dirty_notes.get() {
                 p.set_notes(uuid, &self.notes.text())?;
                 touched.push(uuid.clone());
@@ -1651,6 +1668,64 @@ fn join_words(list: &[&str]) -> String {
     }
 }
 
+#[cfg(test)]
+fn id_less_text_is_read_only() {
+    let dir = std::env::temp_dir().join(format!("omaquill-noid-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Bare.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let chapter = project
+        .root_folder(Kind::Draft)
+        .unwrap()
+        .children
+        .iter()
+        .find(|item| item.kind == Kind::Text)
+        .unwrap()
+        .uuid
+        .clone();
+    let real = project.add_item(Kind::Text, "Kept", &draft, None).unwrap();
+    project
+        .set_text(&real, &rtf::RichText::from_plain("kept words"))
+        .unwrap();
+    project.save().unwrap();
+    let scrivx = std::fs::read_dir(&path)
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            path.extension()
+                .is_some_and(|ext| ext == "scrivx")
+                .then_some(path)
+        })
+        .unwrap();
+    let xml = std::fs::read_to_string(&scrivx).unwrap();
+    let from = format!("UUID=\"{chapter}\" ");
+    assert!(xml.contains(&from), "{chapter}");
+    std::fs::write(&scrivx, xml.replacen(&from, "", 1)).unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.IdLess")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.show_item("");
+    assert!(!win.editor.view.is_editable());
+    assert!(win.editor_uuid.borrow().is_none());
+    assert!(!win.dirty_text.get());
+    assert!(win.banner.is_revealed());
+    assert_eq!(win.banner.title().as_str(), "This item has no file.");
+    win.dirty_text.set(true);
+    assert!(win.save_now());
+    assert!(!win.dirty_text.get());
+    win.show_item(&real);
+    assert_eq!(win.current.borrow().as_deref(), Some(real.as_str()));
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "kept words");
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
 /// that started it, and each #[test] gets its own thread. Needs a display;
 /// skipped without one (CI).
@@ -1664,6 +1739,7 @@ fn gtk_checks() {
     adw::init().unwrap();
     rich::tests::load_inserts_the_text_once();
     editor::tests::large_documents_open_in_the_window();
+    id_less_text_is_read_only();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();

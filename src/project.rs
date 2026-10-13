@@ -829,6 +829,11 @@ impl Project {
     /// The extension comes from the project's XML, so it must be a plain
     /// one: letters and digits only, no path tricks.
     pub fn media_path(&self, uuid: &str) -> Option<PathBuf> {
+        // An empty id is not a folder. Joining it would look at
+        // `Files/Data/content.<ext>`, which is not a document.
+        if !is_uuid(uuid) {
+            return None;
+        }
         let ext = self.item(uuid)?.extension?;
         if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
@@ -1834,5 +1839,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(hit_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(alias_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(cap_path.parent().unwrap());
+    }
+
+    #[test]
+    fn media_path_refuses_an_empty_id() {
+        let (path, mut project) = temp_project("media-empty");
+        let research = project.root_folder(Kind::Research).unwrap().uuid;
+        let id = project
+            .add_item(Kind::Image, "Plate", &research, None)
+            .unwrap();
+        project.save().unwrap();
+        let scrivx = std::fs::read_dir(&path)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.extension()
+                    .is_some_and(|ext| ext == "scrivx")
+                    .then_some(path)
+            })
+            .unwrap();
+        let mut doc = xml::parse(&std::fs::read_to_string(&scrivx).unwrap()).unwrap();
+        fn strip(el: &mut xml::Element, id: &str) {
+            if el.name == "BinderItem" && el.attr("UUID").as_deref() == Some(id) {
+                el.attrs.retain(|(key, _)| key != "UUID");
+                let mut meta = xml::Element::new("MetaData");
+                let mut ext = xml::Element::new("FileExtension");
+                ext.set_text("png");
+                meta.children.push(Node::Element(ext));
+                el.children.push(Node::Element(meta));
+            }
+            for child in &mut el.children {
+                if let Node::Element(el) = child {
+                    strip(el, id);
+                }
+            }
+        }
+        strip(&mut doc.root, &id);
+        std::fs::write(&scrivx, doc.to_xml()).unwrap();
+        let bait = path.join("Files/Data/content.png");
+        std::fs::write(&bait, b"BAIT").unwrap();
+        let project = Project::open(&path).unwrap();
+        assert!(project.item("").is_some());
+        assert!(project.media_path("").is_none());
+        assert_eq!(std::fs::read(&bait).unwrap(), b"BAIT");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
