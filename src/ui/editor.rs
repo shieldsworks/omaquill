@@ -55,11 +55,13 @@ pub struct Editor {
     held_adjusting: Cell<bool>,
 }
 
-/// Character wrap of one unspaced line on a visible 800×600 editor, GTK
-/// 4.14.5, debug build. `place_cursor` was about 3 ms at 10,000 characters,
-/// 33 ms at 20,000, 85 ms at 50,000, and 165 ms at 100,000. A held document
-/// longer than this is shown in a window of this many of its own characters.
-const HELD_WINDOW: usize = 10_000;
+/// Characters of a held document placed in the buffer at once.
+/// Character wrap of a 10,000-character unspaced line took 114.6 ms on the
+/// x86_64 xvfb runner and 194.6 ms on aarch64, in the first frame of
+/// `a_held_long_line_wraps_on_characters` at `5b6469c`. A held document
+/// longer than this shows this many of its own characters. The bar moves
+/// one window at a time.
+const HELD_WINDOW: usize = 1_024;
 
 impl Editor {
     /// `page` is the main editor: centered column, find bar. Otherwise a
@@ -314,9 +316,9 @@ impl Editor {
             return;
         }
         // Character wrap is GTK's own break. The buffer holds the file's
-        // characters and no others. A line longer than [`HELD_WINDOW`] is
-        // shown one window at a time, because wrapping the whole line at
-        // 100,000 characters took about 170 ms.
+        // characters and no others. A held document longer than
+        // [`HELD_WINDOW`] is shown one window at a time. Wrapping 10,000
+        // unspaced characters in the first frame exceeded 100 ms under xvfb.
         self.view.set_wrap_mode(gtk::WrapMode::Char);
         let plain = text.plain_text();
         let total = plain.chars().count();
@@ -1613,7 +1615,12 @@ next}";
                 text.plain_text().ends_with(tail.as_str()),
                 "{label} tail is not the file text"
             );
-            assert_eq!(tail.chars().count(), HELD_WINDOW.min(chars));
+            // The last page starts on a window boundary and holds the
+            // remainder, which is short when the file is not a whole
+            // number of windows.
+            let last_page = chars.saturating_sub(1) / HELD_WINDOW;
+            let last_len = chars - last_page * HELD_WINDOW;
+            assert_eq!(tail.chars().count(), last_len);
         } else {
             assert!(!ed.held_bar.is_visible());
         }
@@ -1667,6 +1674,12 @@ next}";
         assert!(!ed.view.is_editable());
         assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::Char);
         assert_eq!(ed.plain_text(), body);
+        assert!(ed.held_bar.is_visible());
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        assert_eq!(
+            ed.buffer.text(&buf_start, &buf_end, false).chars().count(),
+            HELD_WINDOW
+        );
         let context = gtk::glib::MainContext::default();
         let mut max_iter = 0.0f64;
         let mut shown = false;
@@ -1770,7 +1783,9 @@ next}";
         window.set_default_size(800, 600);
         window.set_child(Some(&ed.root));
         window.present();
-        let mut body = "a".repeat(HELD_WINDOW);
+        // Past the breakless cap, and past the first window, so find has to
+        // move the bar. A window-sized prefix alone is under the cap.
+        let mut body = "a".repeat(rich::SYNC_BREAKLESS_CHARS + HELD_WINDOW);
         body.push_str("TAIL");
         ed.load(RichText::from_plain(&body));
         assert!(ed.is_too_formatted());
