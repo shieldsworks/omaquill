@@ -398,7 +398,7 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Field {
     Body,
     Notes,
@@ -627,6 +627,7 @@ pub fn preview(project: &Project, query: &Query) -> Result<Preview, project::Err
         groups: &mut groups,
         skipped: &mut skipped,
         next: &mut next,
+        seen: HashSet::new(),
     };
     walk(&mut scan, &items, "", false)?;
     Ok(Preview { groups, skipped })
@@ -1306,6 +1307,9 @@ struct Scan<'a> {
     groups: &'a mut Vec<Group>,
     skipped: &'a mut Vec<Skipped>,
     next: &'a mut u32,
+    /// Uppercase UUID plus field. `Files/Data/<UUID>/` is one document, so a
+    /// later binder row with that id is not parsed or matched again.
+    seen: HashSet<(String, Field)>,
 }
 
 fn walk(
@@ -1321,13 +1325,16 @@ fn walk(
         } else {
             format!("{path} / {}", item.title)
         };
-        if item.kind.has_text() {
+        let key = item.uuid.to_ascii_uppercase();
+        if item.kind.has_text() && scan.seen.insert((key.clone(), Field::Body)) {
             let text = scan.project.text(&item.uuid)?;
             push_group(scan, item, path, here, Field::Body, &text);
         }
-        let notes = scan.project.notes(&item.uuid)?;
-        if !notes.plain_text().is_empty() {
-            push_group(scan, item, path, here, Field::Notes, &notes);
+        if scan.seen.insert((key, Field::Notes)) {
+            let notes = scan.project.notes(&item.uuid)?;
+            if !notes.plain_text().is_empty() {
+                push_group(scan, item, path, here, Field::Notes, &notes);
+            }
         }
         walk(scan, &item.children, &label, here)?;
     }
@@ -1395,6 +1402,7 @@ fn snippets_of(plain: &str, edits: &[Edit]) -> Vec<Snippet> {
         .collect()
 }
 
+#[cfg(test)]
 fn snippet_of(plain: &str, range: CharRange, replacement: &str) -> Snippet {
     let chars: Vec<char> = plain.chars().collect();
     note_snippet(chars.len());
@@ -1896,5 +1904,85 @@ mod tests {
             "visited {visits} of {chars}"
         );
         eprintln!("snippet visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn shared_uuid_is_parsed_and_written_once() {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-alias-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Aliases.scriv");
+        let mut project = Project::create(&path).unwrap();
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let shared = project
+            .add_item(Kind::Text, "The Lamp", &draft, None)
+            .unwrap();
+        let copies = 32usize;
+        project
+            .set_text(&shared, &RichText::from_plain(&"lamp ".repeat(copies)))
+            .unwrap();
+        let mut aliases = Vec::new();
+        for n in 0..100 {
+            aliases.push(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        let scrivx = std::fs::read_dir(&path)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.extension()
+                    .is_some_and(|ext| ext == "scrivx")
+                    .then_some(path)
+            })
+            .unwrap();
+        let mut xml = std::fs::read_to_string(&scrivx).unwrap();
+        for alias in &aliases {
+            let from = format!("UUID=\"{alias}\"");
+            assert!(xml.contains(&from), "{alias}");
+            xml = xml.replacen(&from, &format!("UUID=\"{shared}\""), 1);
+        }
+        std::fs::write(&scrivx, xml).unwrap();
+        let mut project = Project::open(&path).unwrap();
+        let query = literal("lamp", "light", Word::Whole, Case::Sensitive);
+        crate::rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let preview = preview(&project, &query).unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let parses = crate::rtf::parses();
+        assert_eq!(preview.groups().len(), 1, "one document, one group");
+        assert_eq!(preview.groups()[0].rows().len(), copies);
+        assert!(
+            parses <= 4,
+            "101 rows parsed the shared file {parses} times"
+        );
+        project::reset_content_writes();
+        let outcome = apply(
+            &mut project,
+            &dir.join("backups"),
+            1,
+            &preview,
+            &preview.ids(),
+        )
+        .unwrap();
+        let ApplyOutcome::Done(report) = outcome else {
+            panic!("expected a write");
+        };
+        let writes = project::content_writes();
+        assert_eq!(writes, 1, "shared file written {writes} times");
+        assert_eq!(report.written.len(), 1);
+        let text = Project::open(&path)
+            .unwrap()
+            .text(&shared)
+            .unwrap()
+            .plain_text();
+        assert!(text.contains("light"));
+        assert!(!text.contains("lamp"));
+        eprintln!("aliases=100 parses={parses} writes={writes} ms={ms:.1}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

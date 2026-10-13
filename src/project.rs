@@ -17,9 +17,26 @@
 use crate::rtf::{self, RichText};
 use crate::xml::{self, Element};
 use crate::{sha1, zip};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    static CONTENT_WRITES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_content_writes() {
+    CONTENT_WRITES.with(|n| n.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn content_writes() -> u64 {
+    CONTENT_WRITES.with(|n| n.get())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -943,6 +960,10 @@ impl Project {
             Some(bytes) => {
                 create_dir_inside(&self.root, &dir)?;
                 write_inside(&self.root, &path, bytes)?;
+                #[cfg(test)]
+                if file == "content.rtf" {
+                    CONTENT_WRITES.with(|n| n.set(n.get() + 1));
+                }
                 let sum = sha1::hex(bytes);
                 match self.checksums.iter_mut().find(|(k, _)| *k == key) {
                     Some(slot) => slot.1 = sum,
