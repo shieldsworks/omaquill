@@ -125,7 +125,13 @@ impl Editor {
         );
         // One value per property: applying `c:size=40` (a paste brings its
         // own tags) takes any other `c:size=` off that stretch first.
-        self.buffer.connect_apply_tag(|buffer, tag, s, e| {
+        // Loading applies a finished document, so that scan stays off until
+        // the buffer is back on screen.
+        let weak = Rc::downgrade(self);
+        self.buffer.connect_apply_tag(move |buffer, tag, s, e| {
+            if weak.upgrade().is_some_and(|ed| ed.loading.get()) {
+                return;
+            }
             let Some(name) = tag.name() else { return };
             let Some((key, _)) = name.split_once('=') else {
                 return;
@@ -219,7 +225,12 @@ impl Editor {
     pub fn load(&self, text: &RichText) {
         *self.lossy.borrow_mut() = text.lossy.clone();
         self.loading.set(true);
+        // A visible view relayouts on every tag. Fill the buffer while the
+        // view holds an empty spare, then show the finished text once.
+        let spare = gtk::TextBuffer::new(None);
+        self.view.set_buffer(Some(&spare));
         rich::load(&self.buffer, text);
+        self.view.set_buffer(Some(&self.buffer));
         self.loading.set(false);
         self.pending.borrow_mut().clear();
         self.report();
@@ -253,8 +264,7 @@ impl Editor {
     }
 
     pub fn plain_text(&self) -> String {
-        let (s, e) = self.buffer.bounds();
-        self.buffer.text(&s, &e, false).to_string()
+        rich::logical_plain(&self.buffer)
     }
 
     pub fn word_count(&self) -> usize {
@@ -622,7 +632,8 @@ fn paint_new_lines(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use omaquill::rtf::{self, Align};
+    use omaquill::rtf::{self, Align, CharStyle, Paragraph, RichText, Run};
+    use std::rc::Rc;
 
     fn type_at(ed: &Editor, offset: i32, text: &str) {
         let mut at = ed.buffer.iter_at_offset(offset);
@@ -803,5 +814,66 @@ next}";
         let plan = omaquill::replace::plan_document(&ed.lossy(), &ed.text(), &query).unwrap();
         ed.apply_edits(&plan).unwrap();
         assert_eq!(ed.plain_text(), "omega beta");
+    }
+
+    fn toggled(runs: usize) -> RichText {
+        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let mut paragraph = Paragraph::default();
+        for i in 0..runs {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: i % 2 == 0,
+                    link: Some(Rc::clone(&link)),
+                    ..CharStyle::default()
+                },
+            });
+        }
+        RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        }
+    }
+
+    /// The editor window opens a run-heavy document. The view is on screen,
+    /// which is where a per-run insert relayouts.
+    pub(crate) fn large_documents_open_in_the_window() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..20 {
+            if !context.pending() {
+                break;
+            }
+            context.iteration(false);
+        }
+        for runs in [10_000usize, 50_000, 100_000] {
+            let text = toggled(runs);
+            let started = std::time::Instant::now();
+            ed.load(&text);
+            let mut shown_ms = started.elapsed().as_secs_f64() * 1000.0;
+            for _ in 0..30 {
+                if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
+                    shown_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    break;
+                }
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            eprintln!("gtk open runs={runs} ms={shown_ms:.1}");
+            assert!(shown_ms < 1_500.0, "{runs} runs opened in {shown_ms:.0} ms");
+            let names = rich::tag_names(&ed.buffer.start_iter());
+            assert!(names.iter().any(|name| name == "c:b"));
+            assert!(names.iter().any(|name| name.starts_with("c:link=")));
+            let back = ed.text();
+            assert_eq!(back.paragraphs.len(), 1);
+            assert_eq!(back.paragraphs[0].runs.len(), runs);
+        }
+        window.close();
     }
 }

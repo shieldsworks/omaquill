@@ -1662,6 +1662,8 @@ fn gtk_checks() {
         return;
     }
     adw::init().unwrap();
+    rich::tests::load_inserts_the_text_once();
+    editor::tests::large_documents_open_in_the_window();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();

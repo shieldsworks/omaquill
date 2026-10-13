@@ -12,9 +12,33 @@
 use gtk::prelude::*;
 use gtk::{TextBuffer, TextIter, TextTag, pango};
 use omaquill::rtf::{Align, CharStyle, LineSpacing, ParaStyle, Paragraph, RichText, Run, Script};
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+#[cfg(test)]
+thread_local! {
+    static INSERTS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_insert(n: u64) {
+    #[cfg(test)]
+    INSERTS.with(|inserts| inserts.set(inserts.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+pub(crate) fn reset_inserts() {
+    INSERTS.with(|inserts| inserts.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn inserts() -> u64 {
+    INSERTS.with(|inserts| inserts.get())
+}
 
 thread_local! {
     /// How tags are drawn: zoom and which installed font stands in for each
@@ -385,41 +409,169 @@ fn style_names(style: &CharStyle, links: &mut HashMap<*const str, Rc<str>>) -> V
     names
 }
 
-fn tags_from(buffer: &TextBuffer, names: &[Rc<str>]) -> Vec<TextTag> {
-    names.iter().map(|name| tag(buffer, name)).collect()
+fn forward(iter: &mut TextIter, mut n: usize) {
+    while n > 0 {
+        let step = n.min(i32::MAX as usize);
+        iter.forward_chars(step as i32);
+        n -= step;
+    }
+}
+
+/// GTK's `cleanup_line` walks every segment on a line after each tag.
+/// A paragraph with tens of thousands of runs stays one line, so that walk
+/// is quadratic. This many spans is the budget for one line. The extra
+/// newline is tagged [`FLOW`] and [`save`] joins it back into the paragraph.
+const SPANS_PER_LINE: usize = 32;
+const FLOW: &str = "x:flow";
+
+/// Buffer text without the line breaks [`load`] inserts so a long run of
+/// spans stays inside GTK's per-line budget. Those breaks are not characters
+/// of the document.
+pub fn logical_plain(buffer: &TextBuffer) -> String {
+    let (start, end) = buffer.bounds();
+    let mut out = String::new();
+    let mut at = start;
+    while at < end {
+        let mut next = at;
+        next.forward_to_tag_toggle(None::<&TextTag>);
+        if next <= at || next > end {
+            next = end;
+        }
+        if !tag_names(&at).iter().any(|name| name == FLOW) {
+            out.push_str(&buffer.text(&at, &next, false));
+        }
+        at = next;
+    }
+    out
 }
 
 /// Replaces the buffer's contents with `text`. Not undoable.
+///
+/// The characters go in with one `set_text`. Adjacent runs that share a
+/// style become one range, and each tag name is created once. The newline
+/// keeps the paragraph's last character formatting, so typing at the end of
+/// a line continues in that style.
 pub fn load(buffer: &TextBuffer, text: &RichText) {
     buffer.begin_irreversible_action();
-    buffer.set_text("");
     let mut links = HashMap::new();
+    let mut body = String::new();
+    let mut marks: Vec<(usize, usize, CharStyle)> = Vec::new();
+    let mut paras: Vec<(usize, usize, &ParaStyle)> = Vec::new();
+    let mut flow: Vec<usize> = Vec::new();
+    let mut chars = 0usize;
     let n = text.paragraphs.len();
     for (i, p) in text.paragraphs.iter().enumerate() {
-        let start = buffer.end_iter().offset();
+        let para_start = chars;
+        let mut span_style: Option<CharStyle> = None;
+        let mut span_start = chars;
+        let mut spans_on_line = 0usize;
+        let close_span = |span_style: &mut Option<CharStyle>,
+                          span_start: usize,
+                          chars: usize,
+                          marks: &mut Vec<(usize, usize, CharStyle)>| {
+            if let Some(style) = span_style.take()
+                && span_start < chars
+            {
+                marks.push((span_start, chars, style));
+            }
+        };
         for run in &p.runs {
-            let names = style_names(&run.style, &mut links);
-            let tags = tags_from(buffer, &names);
-            let tag_refs: Vec<&TextTag> = tags.iter().collect();
-            let mut end = buffer.end_iter();
-            buffer.insert_with_tags(&mut end, &run.text, &tag_refs);
+            if run.text.is_empty() {
+                continue;
+            }
+            let same = span_style.as_ref().is_some_and(|style| style == &run.style);
+            if !same {
+                if spans_on_line >= SPANS_PER_LINE {
+                    close_span(&mut span_style, span_start, chars, &mut marks);
+                    body.push('\n');
+                    flow.push(chars);
+                    chars += 1;
+                    spans_on_line = 0;
+                } else {
+                    close_span(&mut span_style, span_start, chars, &mut marks);
+                }
+                span_style = Some(run.style.clone());
+                span_start = chars;
+                spans_on_line += 1;
+            }
+            body.push_str(&run.text);
+            chars += run.text.chars().count();
         }
         if i + 1 < n {
-            // The newline takes the paragraph's last character formatting,
-            // so typing at the end of a line continues in that style.
-            let names = match p.runs.last() {
-                Some(run) => style_names(&run.style, &mut links),
-                None => style_names(&CharStyle::default(), &mut links),
-            };
-            let tags = tags_from(buffer, &names);
-            let tag_refs: Vec<&TextTag> = tags.iter().collect();
-            let mut end = buffer.end_iter();
-            buffer.insert_with_tags(&mut end, "\n", &tag_refs);
+            let newline_style = p
+                .runs
+                .last()
+                .map(|run| run.style.clone())
+                .unwrap_or_default();
+            let same = span_style
+                .as_ref()
+                .is_some_and(|style| style == &newline_style);
+            if !same {
+                close_span(&mut span_style, span_start, chars, &mut marks);
+                span_style = Some(newline_style);
+                span_start = chars;
+            }
+            body.push('\n');
+            chars += 1;
         }
-        let s = buffer.iter_at_offset(start);
-        let e = buffer.end_iter();
-        for name in para_tags(&p.style) {
-            buffer.apply_tag(&tag(buffer, &name), &s, &e);
+        close_span(&mut span_style, span_start, chars, &mut marks);
+        paras.push((para_start, chars, &p.style));
+    }
+    note_insert(1);
+    buffer.set_text(&body);
+    let mut char_tags: HashMap<CharStyle, Vec<TextTag>> = HashMap::new();
+    let mut cursor = buffer.start_iter();
+    let place = buffer.create_mark(None, &cursor, true);
+    let mut pos = 0usize;
+    for (start, end, style) in &marks {
+        cursor = buffer.iter_at_mark(&place);
+        forward(&mut cursor, start.saturating_sub(pos));
+        buffer.move_mark(&place, &cursor);
+        let mut stop = cursor.clone();
+        forward(&mut stop, end.saturating_sub(*start));
+        let stop_mark = buffer.create_mark(None, &stop, false);
+        let tags: Vec<TextTag> =
+            cached_char_tags(&mut char_tags, buffer, style, &mut links).to_vec();
+        for text_tag in &tags {
+            let head = buffer.iter_at_mark(&place);
+            let tail = buffer.iter_at_mark(&stop_mark);
+            buffer.apply_tag(text_tag, &head, &tail);
+        }
+        buffer.move_mark(&place, &buffer.iter_at_mark(&stop_mark));
+        buffer.delete_mark(&stop_mark);
+        pos = *end;
+    }
+    let flow_tag = tag(buffer, FLOW);
+    let mut head = buffer.start_iter();
+    let mut pos = 0usize;
+    for at in flow {
+        forward(&mut head, at.saturating_sub(pos));
+        buffer.move_mark(&place, &head);
+        let mut tail = buffer.iter_at_mark(&place);
+        forward(&mut tail, 1);
+        let tail_mark = buffer.create_mark(None, &tail, false);
+        buffer.apply_tag(
+            &flow_tag,
+            &buffer.iter_at_mark(&place),
+            &buffer.iter_at_mark(&tail_mark),
+        );
+        head = buffer.iter_at_mark(&tail_mark);
+        buffer.delete_mark(&tail_mark);
+        pos = at + 1;
+    }
+    buffer.delete_mark(&place);
+    let mut cursor = buffer.start_iter();
+    let mut pos = 0usize;
+    for (start, end, style) in paras {
+        if start == end {
+            continue;
+        }
+        forward(&mut cursor, start.saturating_sub(pos));
+        pos = start;
+        let mut stop = cursor.clone();
+        forward(&mut stop, end.saturating_sub(start));
+        for name in para_tags(style) {
+            buffer.apply_tag(&tag(buffer, &name), &cursor, &stop);
         }
     }
     buffer.end_irreversible_action();
@@ -427,9 +579,25 @@ pub fn load(buffer: &TextBuffer, text: &RichText) {
     buffer.place_cursor(&buffer.start_iter());
 }
 
+fn cached_char_tags<'a>(
+    cache: &'a mut HashMap<CharStyle, Vec<TextTag>>,
+    buffer: &TextBuffer,
+    style: &CharStyle,
+    links: &mut HashMap<*const str, Rc<str>>,
+) -> &'a [TextTag] {
+    if !cache.contains_key(style) {
+        let built = style_names(style, links)
+            .iter()
+            .map(|name| tag(buffer, name))
+            .collect();
+        cache.insert(style.clone(), built);
+    }
+    cache.get(style).expect("the style was stored in the cache")
+}
+
 /// Reads the buffer back into [`RichText`].
 pub fn save(buffer: &TextBuffer) -> RichText {
-    let mut paragraphs = Vec::new();
+    let mut paragraphs: Vec<Paragraph> = Vec::new();
     // By line number: forward_line() won't step onto an empty last line.
     for i in 0..buffer.line_count() {
         let Some(line) = buffer.iter_at_line(i) else {
@@ -467,7 +635,20 @@ pub fn save(buffer: &TextBuffer) -> RichText {
             }
             at = next;
         }
-        paragraphs.push(p);
+        let flow = i > 0 && {
+            let mut br = line;
+            br.backward_char() && tag_names(&br).iter().any(|name| name == FLOW)
+        };
+        if flow && let Some(prev) = paragraphs.last_mut() {
+            for run in p.runs {
+                match prev.runs.last_mut() {
+                    Some(last) if last.style == run.style => last.text.push_str(&run.text),
+                    _ => prev.runs.push(run),
+                }
+            }
+        } else {
+            paragraphs.push(p);
+        }
     }
     RichText {
         paragraphs,
@@ -583,5 +764,60 @@ pub(crate) mod tests {
             assert!(same(&again.paragraphs, &text.paragraphs), "{}", f.display());
         }
         eprintln!("{} documents through a GTK buffer", files.len());
+    }
+
+    fn toggled(runs: usize) -> RichText {
+        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let mut paragraph = Paragraph::default();
+        for i in 0..runs {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: i % 2 == 0,
+                    link: Some(Rc::clone(&link)),
+                    ..CharStyle::default()
+                },
+            });
+        }
+        RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        }
+    }
+
+    /// One buffer insert for the whole document. Tag ranges stay proportional
+    /// to the text, so a run count in the tens of thousands still opens.
+    pub(crate) fn load_inserts_the_text_once() {
+        let runs = 500usize;
+        let text = toggled(runs);
+        let buffer = TextBuffer::new(None);
+        reset_inserts();
+        let started = std::time::Instant::now();
+        load(&buffer, &text);
+        let small_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let wrote = inserts();
+        assert!(wrote <= 4, "inserted {wrote} times for {runs} runs");
+        let back = save(&buffer);
+        assert!(
+            same(&back.paragraphs, &text.paragraphs),
+            "round trip dropped a run"
+        );
+        eprintln!("runs={runs} inserts={wrote} ms={small_ms:.1}");
+        for runs in [10_000usize, 50_000, 100_000] {
+            let text = toggled(runs);
+            let buffer = TextBuffer::new(None);
+            reset_inserts();
+            let started = std::time::Instant::now();
+            load(&buffer, &text);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let back = save(&buffer);
+            eprintln!("bare load runs={runs} inserts={} ms={ms:.1}", inserts());
+            assert!(inserts() <= 4, "inserted {} times", inserts());
+            assert!(ms < 1_500.0, "{runs} runs took {ms:.0} ms");
+            assert!(
+                same(&back.paragraphs, &text.paragraphs),
+                "round trip dropped a run"
+            );
+        }
     }
 }
