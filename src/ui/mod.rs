@@ -1082,16 +1082,9 @@ impl Win {
     /// Words in everything the manuscript compiles.
     fn manuscript_words(&self, project: &Project) -> usize {
         let counts = self.counts.borrow();
-        fn sum(items: &[Item], counts: &HashMap<String, usize>) -> usize {
-            items
-                .iter()
-                .filter(|i| i.include_in_compile)
-                .map(|i| counts.get(&i.uuid).copied().unwrap_or(0) + sum(&i.children, counts))
-                .sum()
-        }
         project
             .root_folder(Kind::Draft)
-            .map(|d| counts.get(&d.uuid).copied().unwrap_or(0) + sum(&d.children, &counts))
+            .map(|draft| omaquill::project::compile_words(&draft, &counts))
             .unwrap_or(0)
     }
 

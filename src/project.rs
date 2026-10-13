@@ -186,6 +186,29 @@ fn missing_item(uuid: &str) -> Error {
     }
 }
 
+/// Words compiled from `draft`, counting each document once.
+///
+/// The draft folder's own count is included. A child counts only when it
+/// is included in compile. Rows that share a UUID are one document.
+pub fn compile_words(draft: &Item, counts: &HashMap<String, usize>) -> usize {
+    fn add(
+        item: &Item,
+        counts: &HashMap<String, usize>,
+        seen: &mut HashSet<String>,
+        gate: bool,
+    ) -> usize {
+        let mut total = 0;
+        if (!gate || item.include_in_compile) && seen.insert(item.uuid.to_ascii_uppercase()) {
+            total += counts.get(&item.uuid).copied().unwrap_or(0);
+        }
+        for child in &item.children {
+            total += add(child, counts, seen, true);
+        }
+        total
+    }
+    add(draft, counts, &mut HashSet::new(), false)
+}
+
 /// Word counts and lowercase search text, one entry per binder id.
 pub struct BinderIndex {
     pub counts: HashMap<String, usize>,
@@ -1680,6 +1703,42 @@ mod tests {
         }
         walk(&mut doc.root, aliases, bare, shared);
         std::fs::write(scrivx, doc.to_xml()).unwrap();
+    }
+
+    fn item(uuid: &str, kind: Kind, children: Vec<Item>) -> Item {
+        Item {
+            uuid: uuid.to_string(),
+            kind,
+            title: String::new(),
+            label: None,
+            status: None,
+            include_in_compile: true,
+            extension: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn compile_words_counts_a_shared_uuid_once() {
+        let shared = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let other = "11111111-2222-3333-4444-555555555555";
+        let mut counts = HashMap::new();
+        counts.insert(shared.to_string(), 10);
+        counts.insert(shared.to_ascii_lowercase(), 10);
+        counts.insert(other.to_string(), 4);
+        counts.insert("SKIP".to_string(), 1_000);
+        let mut aliases = Vec::new();
+        for _ in 0..1_000 {
+            aliases.push(item(shared, Kind::Text, Vec::new()));
+        }
+        aliases.push(item(&shared.to_ascii_lowercase(), Kind::Text, Vec::new()));
+        aliases.push(item(other, Kind::Text, Vec::new()));
+        let mut skipped = item("SKIP", Kind::Text, Vec::new());
+        skipped.include_in_compile = false;
+        aliases.push(skipped);
+        let draft = item(shared, Kind::Draft, aliases);
+        let words = compile_words(&draft, &counts);
+        assert_eq!(words, 14, "shared uuid counted {words}");
     }
 
     #[test]
