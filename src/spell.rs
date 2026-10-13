@@ -566,6 +566,31 @@ pub fn line_anchor_after_edit(_index: i32, _byte: usize, _delta: i32) -> (i32, u
     (0, 0)
 }
 
+/// Character range to copy for one idle slice. `index` is the character to
+/// resume from. The range keeps `MAX_WORD` characters of the token that
+/// may start before `index` or end after the budget.
+pub fn slice_window(line_chars: usize, index: usize, budget: usize) -> (usize, usize) {
+    let index = index.min(line_chars);
+    let start = index.saturating_sub(MAX_WORD);
+    let end = index
+        .saturating_add(budget)
+        .saturating_add(MAX_WORD)
+        .min(line_chars);
+    (start, end)
+}
+
+/// Byte offset of character `chars` in `text`.
+pub fn byte_of_chars(text: &str, chars: usize) -> usize {
+    let mut byte = 0usize;
+    for (n, ch) in text.chars().enumerate() {
+        if n >= chars {
+            break;
+        }
+        byte += ch.len_utf8();
+    }
+    byte
+}
+
 /// Char and byte offsets into one line. `Session::pump` keeps a mark and
 /// moves it forward, so the next idle slice does not reread the prefix.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1110,5 +1135,55 @@ mod tests {
         let wrong = take_slice(&line, &mut stale, 1_500).expect("stale slice");
         let at = line[..wrong.start_byte].chars().count();
         assert_ne!(at, 80, "byte 80 is character {at} after a leading é");
+    }
+
+    #[test]
+    fn long_line_windows_copy_a_linear_amount() {
+        let words = "alpha ".repeat(40);
+        let chars: Vec<char> = words.chars().collect();
+        let index = 100usize;
+        let (start, end) = slice_window(chars.len(), index, 40);
+        let window: String = chars[start..end].iter().collect();
+        let local = index - start;
+        let mut mark = LineMark::resume(local, byte_of_chars(&window, local));
+        let slice = take_slice(&window, &mut mark, 40).expect("window slice");
+        let painted: String = window
+            .chars()
+            .skip(slice.start_chars)
+            .take(slice.end_chars.saturating_sub(slice.start_chars))
+            .collect();
+        assert!(
+            painted.starts_with("alpha"),
+            "window dropped the token around index {index}: {painted}"
+        );
+
+        let line_chars = 200_000usize;
+        let budget = 1_500usize;
+        let mut index = 0usize;
+        let mut copied = 0usize;
+        let mut slices = 0usize;
+        let started = std::time::Instant::now();
+        while index < line_chars {
+            let (start, end) = slice_window(line_chars, index, budget);
+            let window = end.saturating_sub(start);
+            assert!(
+                window <= budget + 2 * MAX_WORD,
+                "window {window} on slice {slices}"
+            );
+            copied += window;
+            let next = index.saturating_add(budget).min(line_chars);
+            assert!(next > index, "slice {slices} did not advance");
+            index = next;
+            slices += 1;
+            assert!(slices <= line_chars, "slice {slices} did not reach the end");
+        }
+        let len = u64::try_from(line_chars).unwrap();
+        let copied = u64::try_from(copied).unwrap();
+        assert!(
+            copied <= len.saturating_mul(4),
+            "copied {copied} of {len} across {slices} slices"
+        );
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("window copied={copied} chars={len} slices={slices} ms={ms:.1}");
     }
 }
