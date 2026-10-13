@@ -818,7 +818,7 @@ impl Win {
                 win.dirty_notes.set(false);
                 win.dirty_synopsis.set(false);
                 win.inspector.forget();
-                win.notes.load(&Default::default());
+                win.notes.load(Default::default());
                 win.stack.set_visible_child_name("empty");
             }
             match win.with_project(|p| p.empty_trash().and_then(|n| p.save().map(|_| n))) {

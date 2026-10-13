@@ -734,15 +734,18 @@ impl Element {
         }
     }
 
-    /// Appends every element after the children already here. One pass
-    /// finds the indent. Inserting one child at a time walks the list
-    /// again for each element.
+    /// Appends every element after the children already here. The existing
+    /// children are examined once. Inserting one child at a time walks the
+    /// list again for each element.
     pub fn append_elements(&mut self, entries: Vec<Element>, own: &str) {
         if entries.is_empty() {
             return;
         }
         let indent = self.child_indent(own);
         let close = self.closing_indent(own);
+        for _ in &self.children {
+            note_insert_walk(1);
+        }
         let has_elements = self.elements().next().is_some();
         if !has_elements {
             let mut fresh = Vec::new();
@@ -753,6 +756,7 @@ impl Element {
                 }
             }
             for entry in entries {
+                note_insert_walk(1);
                 fresh.push(Node::Text(indent.clone()));
                 fresh.push(Node::Element(entry));
             }
@@ -766,6 +770,7 @@ impl Element {
             _ => None,
         };
         for entry in entries {
+            note_insert_walk(1);
             self.children.push(Node::Text(indent.clone()));
             self.children.push(Node::Element(entry));
         }
@@ -891,6 +896,27 @@ mod tests {
         let item = doc.root.child_mut("Item").unwrap();
         item.remove_child("Synopsis");
         assert_eq!(doc.to_xml(), SAMPLE);
+    }
+
+    #[test]
+    fn append_elements_walks_the_list_once() {
+        let mut parent = Element::new("Docs");
+        parent.append_elements(vec![Element::new("Existing")], "\n    ");
+        let n = 80usize;
+        let entries: Vec<Element> = (0..n).map(|_| Element::new("Document")).collect();
+        reset_insert_walks();
+        parent.append_elements(entries, "\n    ");
+        let walks = insert_walks();
+        let bound = u64::try_from(n).unwrap().saturating_mul(4);
+        assert!(
+            walks >= u64::try_from(n).unwrap(),
+            "appending {n} elements recorded {walks} steps"
+        );
+        assert!(
+            walks <= bound,
+            "appending {n} elements walked {walks} element-list steps"
+        );
+        assert_eq!(parent.elements().count(), n + 1);
     }
 
     #[test]

@@ -32,10 +32,10 @@ pub const APP_ID: &str = "io.github.shieldsworks.Omaquill";
 /// Shown when a paragraph has too many style runs to tag on the UI thread.
 const FORMATTING_NOTE: &str = "This document has too much inline formatting to edit safely. The words are shown plain, and the file stays unchanged.";
 
-/// Shown when one unspaced run is long enough that word-char layout would
-/// block the UI thread. The file has one style, so the formatting sentence
-/// would name the wrong reason.
-const LENGTH_NOTE: &str = "This line is too long to edit safely. The words are shown plain, and the file stays unchanged.";
+/// Shown when one unbreakable run is long enough that word-char layout would
+/// block the UI thread. The formatting sentence would name the wrong reason,
+/// including when the tag count is also over the cap.
+const LENGTH_NOTE: &str = "This document has a line too long to edit safely. The words are shown plain, and the file stays unchanged.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FolderView {
@@ -629,6 +629,22 @@ impl Win {
         self.wire_board();
         self.wire_inspector();
 
+        self.editor.connect_line_limit({
+            let weak = Rc::downgrade(self);
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    w.toast(LENGTH_NOTE);
+                }
+            }
+        });
+        self.notes.connect_line_limit({
+            let weak = Rc::downgrade(self);
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    w.toast(LENGTH_NOTE);
+                }
+            }
+        });
         let weak = Rc::downgrade(self);
         self.editor.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
@@ -1276,7 +1292,7 @@ impl Win {
                 let stored = omaquill::project::is_uuid(&item.uuid);
                 if !stored {
                     self.editor.set_editing(false);
-                    self.editor.load(&rtf::RichText::from_plain(""));
+                    self.editor.load(rtf::RichText::from_plain(""));
                     self.banner.set_title("This item has no file.");
                     self.banner.set_revealed(true);
                     self.dirty_text.set(false);
@@ -1286,7 +1302,7 @@ impl Win {
                     return;
                 }
                 self.editor.set_editing(true);
-                self.editor.load(&text);
+                self.editor.load(text);
                 self.spell.rescan();
                 self.dirty_text.set(false);
                 *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
@@ -1915,9 +1931,46 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A long unspaced line is held for its length. The banner does not call
+/// that "too much inline formatting".
+#[cfg(test)]
+fn a_long_line_names_the_line() {
+    let dir = std::env::temp_dir().join(format!("omaquill-length-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Length.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let id = project.add_item(Kind::Text, "Line", &draft, None).unwrap();
+    project
+        .set_text(&id, &rtf::RichText::from_plain(&"a".repeat(10_000)))
+        .unwrap();
+    project.save().unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Length")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.show_item(&id);
+    assert!(win.editor.is_too_formatted());
+    assert!(win.editor.held_for_length());
+    assert!(win.banner.is_revealed());
+    let title = win.banner.title();
+    assert_eq!(title.as_str(), LENGTH_NOTE);
+    assert!(
+        !title.contains("inline formatting"),
+        "a length hold used the formatting banner: {title}"
+    );
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
-/// that started it, and each #[test] gets its own thread. Needs a display;
-/// skipped without one (CI).
+/// that started it, and each #[test] gets its own thread. Needs a display.
+/// CI starts xvfb, so the 10k, 50k, and 100k opens run there. Without a
+/// display the test returns.
 #[cfg(test)]
 #[test]
 fn gtk_checks() {
@@ -1932,10 +1985,13 @@ fn gtk_checks() {
     editor::tests::a_hostile_paragraph_opens_plain_and_read_only();
     editor::tests::a_held_document_refuses_every_edit();
     editor::tests::a_long_uniform_line_opens_plain();
+    editor::tests::a_plain_unspaced_line_scrolls_sideways();
+    editor::tests::an_edit_past_the_unspaced_cap_is_refused();
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();
     editor::tests::many_plain_paragraphs_stay_editable();
     editor::tests::time_styled_paragraph_open();
+    a_long_line_names_the_line();
     spell::tests::one_paragraph_is_one_spelling_line();
     id_less_text_is_read_only();
     a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
@@ -1954,6 +2010,7 @@ fn gtk_checks() {
     spell::tests::a_paste_marks_every_new_word();
     spell::tests::suggestions_share_the_text_view_menu();
     spell::tests::a_suggestion_does_not_change_a_held_document();
+    spell::tests::a_keystroke_ahead_of_the_scan_does_not_skip();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
     spell::tests::activating_spellcheck_flips_its_state();
 }

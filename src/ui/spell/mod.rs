@@ -17,6 +17,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+mod menu;
+
 const TAG: &str = "spell";
 
 thread_local! {
@@ -46,9 +48,6 @@ pub struct Session {
     ignore_path: RefCell<Option<PathBuf>>,
     line: Cell<i32>,
     index: Cell<i32>,
-    /// Byte offset of `index` in the current line. Idle slices advance it
-    /// instead of recounting the line prefix.
-    byte: Cell<usize>,
     /// Line-relative character offset of `scan_mark`, so the next slice
     /// walks forward from there.
     scan_at: Cell<i32>,
@@ -78,7 +77,6 @@ impl Session {
             ignore_path: RefCell::new(None),
             line: Cell::new(0),
             index: Cell::new(0),
-            byte: Cell::new(0),
             scan_at: Cell::new(0),
             scan_mark: RefCell::new(None),
             idle: RefCell::new(None),
@@ -133,9 +131,11 @@ impl Session {
     }
 
     /// A paste, or any larger change, checks the whole buffer. A
-    /// one-character edit on the line being scanned resumes within a word
-    /// of that edit. The stored byte belonged to the previous text, so the
-    /// new byte is counted from the current line.
+    /// one-character edit moves the scan backward to the word that changed.
+    /// It does not move the scan forward, so a keystroke ahead of the idle
+    /// pass cannot skip text that has not been checked. The scan mark is
+    /// cleared only when the index moves, so the next slice does not copy
+    /// the line.
     pub fn after_edit(&self) {
         let n = self.editor.buffer.char_count();
         let prev = self.chars.replace(n);
@@ -147,19 +147,19 @@ impl Session {
         }
         let buffer = &self.editor.buffer;
         let cursor = buffer.iter_at_mark(&buffer.get_insert());
-        if cursor.line() == self.line.get() {
-            let index = spell::line_anchor_after_edit(cursor.line_offset(), delta);
-            self.index.set(index);
-            let mut start = cursor;
-            start.set_line_offset(0);
-            let mut end = start;
-            if !end.ends_line() {
-                end.forward_to_line_end();
-            }
-            let line = buffer.text(&start, &end, false);
-            let at = usize::try_from(index.max(0)).unwrap_or(0);
-            self.byte.set(spell::byte_of_chars(line.as_str(), at));
+        let line = cursor.line();
+        let scan_line = self.line.get();
+        if line < scan_line {
+            self.line.set(line);
+            self.index
+                .set(spell::line_anchor_after_edit(cursor.line_offset(), delta));
             self.clear_scan_mark();
+        } else if line == scan_line {
+            let next = spell::scan_index_after_edit(self.index.get(), cursor.line_offset(), delta);
+            if next < self.index.get() {
+                self.index.set(next);
+                self.clear_scan_mark();
+            }
         }
         self.refresh_cursor();
     }
@@ -196,7 +196,6 @@ impl Session {
         }
         self.line.set(0);
         self.index.set(0);
-        self.byte.set(0);
         self.arm();
     }
 
@@ -226,113 +225,6 @@ impl Session {
             session.prepare_click(x, y);
         });
         self.editor.view.add_controller(click);
-    }
-
-    fn prepare_click(&self, x: f64, y: f64) {
-        let (bx, by) = self.editor.view.window_to_buffer_coords(
-            gtk::TextWindowType::Widget,
-            widget_coord(x),
-            widget_coord(y),
-        );
-        let Some(click) = self.editor.view.iter_at_location(bx, by) else {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return;
-        };
-        self.prepare_at(&click);
-    }
-
-    /// Suggestions, Add, and Ignore are items on the text view's own menu.
-    /// A second popover would sit under that menu.
-    fn prepare_at(&self, click: &gtk::TextIter) -> bool {
-        let mut policy = *self.policy.borrow();
-        policy.hide_word_at_cursor = false;
-        if !spell::shown(&policy) {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return false;
-        }
-        let mut origin = *click;
-        origin.backward_chars(4_200);
-        let mut end = *click;
-        end.forward_chars(80);
-        let text = self.editor.buffer.text(&origin, &end, false).to_string();
-        let at = byte_between(&text, click.offset() - origin.offset());
-        let at = if spell::is_word_char(click.char()) {
-            let ch = click.char();
-            at.saturating_add(ch.len_utf8()).min(text.len())
-        } else {
-            at
-        };
-        let mut known = |w: &str| self.known(w);
-        let touches = spell::keystroke_marks(&text, at, &policy, &mut known);
-        let Some(touch) = touches.into_iter().find(|t| t.start < at && at <= t.end) else {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return false;
-        };
-        let Some(bad) = touch
-            .bad
-            .iter()
-            .find(|r| r.start < at && at <= r.end)
-            .or(touch.bad.first())
-        else {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return false;
-        };
-        let word = text[bad.clone()].to_string();
-        let form = spell::dictionary_form(&word);
-        let suggestions = self
-            .broker
-            .borrow()
-            .as_ref()
-            .map(|b| b.suggest(&form))
-            .unwrap_or_default();
-        let start = origin
-            .offset()
-            .saturating_add(chars_before(&text, bad.start));
-        let end = origin.offset().saturating_add(chars_before(&text, bad.end));
-        self.install_menu(&word, &suggestions, start, end);
-        true
-    }
-
-    fn install_menu(&self, word: &str, suggestions: &[String], start: i32, end: i32) {
-        let menu = gtk::gio::Menu::new();
-        let group = gtk::gio::SimpleActionGroup::new();
-        for (i, suggestion) in suggestions.iter().take(8).enumerate() {
-            let name = format!("s{i}");
-            menu.append(Some(suggestion), Some(&format!("spell.{name}")));
-            let action = gtk::gio::SimpleAction::new(&name, None);
-            let replacement = suggestion.clone();
-            let weak_editor = Rc::downgrade(&self.editor);
-            action.connect_activate(move |_, _| {
-                if let Some(editor) = weak_editor.upgrade() {
-                    replace_word(&editor, start, end, &replacement);
-                }
-            });
-            group.add_action(&action);
-        }
-        menu.append(Some("Add to Dictionary"), Some("spell.add"));
-        menu.append(Some("Ignore"), Some("spell.ignore"));
-        let add = gtk::gio::SimpleAction::new("add", None);
-        let ignore = gtk::gio::SimpleAction::new("ignore", None);
-        let weak = self.me.borrow().clone();
-        let added = word.to_string();
-        add.connect_activate(move |_, _| {
-            if let Some(session) = weak.upgrade() {
-                session.remember(&added, true);
-                session.rescan();
-            }
-        });
-        let weak = self.me.borrow().clone();
-        let ignored = word.to_string();
-        ignore.connect_activate(move |_, _| {
-            if let Some(session) = weak.upgrade() {
-                session.remember(&ignored, false);
-                session.rescan();
-            }
-        });
-        group.add_action(&add);
-        group.add_action(&ignore);
-        self.editor.view.insert_action_group("spell", Some(&group));
-        self.editor.view.set_extra_menu(Some(&menu));
     }
 
     fn remember_cursor_word(&self, origin: &gtk::TextIter, text: &str, cursor: usize) {
@@ -499,7 +391,6 @@ impl Session {
             self.advance_line(line);
         } else {
             self.index.set(next);
-            self.byte.set(0);
         }
         glib::ControlFlow::Continue
     }
@@ -507,7 +398,6 @@ impl Session {
     fn advance_line(&self, line: i32) {
         self.line.set(line + 1);
         self.index.set(0);
-        self.byte.set(0);
         self.clear_scan_mark();
     }
 
@@ -938,7 +828,7 @@ pub(crate) mod tests {
             lossy: Vec::new(),
         };
         let editor = Editor::new(true);
-        editor.load(&text);
+        editor.load(text);
         assert!(editor.is_too_formatted());
         let plain = editor.plain_text();
         let at = i32::try_from(plain.find("helo").expect("helo")).unwrap_or(0);
@@ -969,7 +859,7 @@ pub(crate) mod tests {
             },
         });
         let word = format!("{}zz", "q".repeat(32));
-        editor.load(&omaquill::rtf::RichText {
+        editor.load(omaquill::rtf::RichText {
             paragraphs: vec![paragraph],
             lossy: Vec::new(),
         });
@@ -990,6 +880,50 @@ pub(crate) mod tests {
         } else {
             eprintln!("no spelling dictionary; the line count still stands");
         }
+    }
+
+    /// A keystroke past the idle scan used to jump the index to the caret
+    /// and leave the gap unchecked.
+    pub(crate) fn a_keystroke_ahead_of_the_scan_does_not_skip() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        let body = format!("{}\nend", "alpha ".repeat(800));
+        editor.buffer.set_text(&body);
+        session.rescan();
+        session.pump();
+        let index = session.index.get();
+        assert_eq!(session.line.get(), 0);
+        assert!(
+            index > 0 && index < 4_000,
+            "the first slice did not stop inside the line: {index}"
+        );
+        let mut end = editor.buffer.iter_at_line(0).expect("line");
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        editor.buffer.place_cursor(&end);
+        editor.buffer.insert(&mut end, "x");
+        session.after_edit();
+        assert_eq!(session.line.get(), 0);
+        assert!(
+            session.index.get() <= index,
+            "scan moved from {index} to {}",
+            session.index.get()
+        );
+        let mut second = editor.buffer.iter_at_line(1).expect("second line");
+        editor.buffer.place_cursor(&second);
+        editor.buffer.insert(&mut second, "y");
+        session.after_edit();
+        assert_eq!(
+            session.line.get(),
+            0,
+            "an edit on a later line moved the scan"
+        );
+        assert!(
+            session.index.get() <= index,
+            "scan moved from {index} to {}",
+            session.index.get()
+        );
     }
 
     pub(crate) fn the_same_spelling_settings_do_not_restart_the_scan() {

@@ -25,6 +25,8 @@ pub struct Editor {
     pub view: gtk::TextView,
     pub buffer: gtk::TextBuffer,
     pub clamp: adw::Clamp,
+    pub scrolled: gtk::ScrolledWindow,
+    page: bool,
     pub search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     /// Formatting switched on or off with nothing selected, for the next
@@ -47,6 +49,14 @@ pub struct Editor {
     /// Typing is allowed when the buffer is fully tagged. A held document
     /// stays read-only.
     edit_when_ready: Cell<bool>,
+    /// The plain buffer contains [`rich::DISPLAY_BREAK`] so an unbreakable
+    /// run can wrap. Those characters are not part of the document.
+    display_breaks: Cell<bool>,
+    /// Called when an insert would make an unbreakable run longer than the
+    /// layout cap. The insert does not land.
+    line_limit: RefCell<Vec<Box<dyn Fn()>>>,
+    /// The view is the scrolled window's child, not the column clamp.
+    side_scroll: Cell<bool>,
 }
 
 impl Editor {
@@ -101,6 +111,8 @@ impl Editor {
             view,
             buffer,
             clamp,
+            scrolled,
+            page,
             search_bar,
             search_entry,
             pending: RefCell::new(Vec::new()),
@@ -113,6 +125,9 @@ impl Editor {
             cursor: RefCell::new(Vec::new()),
             painted_source: RefCell::new(None),
             edit_when_ready: Cell::new(true),
+            display_breaks: Cell::new(false),
+            line_limit: RefCell::new(Vec::new()),
+            side_scroll: Cell::new(false),
         });
         ed.wire();
         ed
@@ -120,12 +135,14 @@ impl Editor {
 
     fn wire(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.buffer
-            .connect_insert_text(move |buffer, _iter, _text| {
-                if weak.upgrade().is_some_and(|ed| ed.blocks_signal()) {
-                    buffer.stop_signal_emission_by_name("insert-text");
-                }
-            });
+        self.buffer.connect_insert_text(move |buffer, iter, text| {
+            let Some(ed) = weak.upgrade() else {
+                return;
+            };
+            if ed.blocks_signal() || ed.refuses_line(iter, text) {
+                buffer.stop_signal_emission_by_name("insert-text");
+            }
+        });
         let weak = Rc::downgrade(self);
         self.buffer
             .connect_delete_range(move |buffer, _start, _end| {
@@ -245,7 +262,8 @@ impl Editor {
         self.cursor.borrow_mut().push(Box::new(f));
     }
 
-    pub fn load(&self, text: &RichText) {
+    /// `text` moves in. A held document keeps that value for a later save.
+    pub fn load(&self, text: RichText) {
         self.release_plain();
         *self.lossy.borrow_mut() = text.lossy.clone();
         self.loading.set(true);
@@ -254,10 +272,12 @@ impl Editor {
         // A heavier one is shown as plain words. Tagging it, then laying
         // that line out, blocked the UI thread for longer than a slice
         // can hide.
-        if !rich::needs_plain_view(text) {
-            // The previous document may have been held, which uses word wrap.
+        self.display_breaks.set(false);
+        if !rich::needs_plain_view(&text) {
+            // The previous document may have been held, which scrolls sideways
+            // or uses word wrap.
             self.view.set_wrap_mode(gtk::WrapMode::WordChar);
-            let mut paint = rich::Paint::begin(&self.buffer, text);
+            let mut paint = rich::Paint::begin(&self.buffer, &text);
             while !paint.pump(&self.buffer, f64::MAX) {}
             paint.finish(&self.buffer);
             self.loading.set(false);
@@ -268,17 +288,31 @@ impl Editor {
             return;
         }
         // Word-char wrap of an unspaced line of 10,000 characters took
-        // 101.8 ms on the next main-loop turn. Word wrap still breaks at
-        // spaces. A run of letters stays on one line, and that path stayed
-        // under 50 ms to open and under 40 ms on the next turn at 100,000
-        // characters.
-        self.view.set_wrap_mode(gtk::WrapMode::Word);
+        // 101.8 ms on the next main-loop turn. A line over the cap scrolls
+        // sideways: word wrap of a display break every 80 characters laid
+        // the paragraph out inside `place_cursor`, about 80 ms at 100,000
+        // characters. A shorter unbreakable run, inside a document held for
+        // its formatting, still wraps in the column. Those breaks are not
+        // part of `text`.
+        let plain = text.plain_text();
+        let long = rich::breakless_str(&plain) > rich::SYNC_BREAKLESS_CHARS;
+        let shown = if long {
+            self.display_breaks.set(false);
+            self.set_side_scroll(true);
+            plain
+        } else {
+            self.set_side_scroll(false);
+            let shown = rich::with_display_breaks(&plain);
+            self.display_breaks.set(shown != plain);
+            self.view.set_wrap_mode(gtk::WrapMode::Word);
+            shown
+        };
         self.buffer.begin_irreversible_action();
-        self.buffer.set_text(&text.plain_text());
+        self.buffer.set_text(&shown);
         self.buffer.end_irreversible_action();
         self.buffer.place_cursor(&self.buffer.start_iter());
         self.buffer.set_modified(false);
-        self.painted_source.borrow_mut().replace(text.clone());
+        self.painted_source.borrow_mut().replace(text);
         self.view.set_editable(false);
         self.view.set_cursor_visible(true);
         self.loading.set(false);
@@ -298,6 +332,40 @@ impl Editor {
         !self.loading.get() && !self.allows_edits()
     }
 
+    /// An insert that would leave an unbreakable run longer than
+    /// [`rich::SYNC_BREAKLESS_CHARS`]. Word-char layout of that run blocks
+    /// the UI thread. The insert is stopped, and the callbacks run so the
+    /// window can say why.
+    fn refuses_line(&self, at: &gtk::TextIter, text: &str) -> bool {
+        if self.loading.get() || self.inserting.get() || !self.allows_edits() {
+            return false;
+        }
+        let mut start = *at;
+        start.set_line_offset(0);
+        let mut end = *at;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        let before = self.buffer.text(&start, at, false);
+        let after = self.buffer.text(at, &end, false);
+        let mut combined = String::with_capacity(before.len() + text.len() + after.len());
+        combined.push_str(before.as_str());
+        combined.push_str(text);
+        combined.push_str(after.as_str());
+        if rich::breakless_str(&combined) <= rich::SYNC_BREAKLESS_CHARS {
+            return false;
+        }
+        for f in self.line_limit.borrow().iter() {
+            f();
+        }
+        true
+    }
+
+    /// Fired when [`Self::refuses_line`] stops an insert.
+    pub fn connect_line_limit(&self, f: impl Fn() + 'static) {
+        self.line_limit.borrow_mut().push(Box::new(f));
+    }
+
     /// Whether typing is allowed. A document held for too much formatting
     /// stays read-only even when `on` is true.
     pub fn set_editing(&self, on: bool) {
@@ -314,19 +382,51 @@ impl Editor {
         self.painted_source.borrow().is_some()
     }
 
-    /// Held because one unspaced run is long, not because of the tag count.
-    /// The formatting banner would be the wrong reason.
+    /// Held because one unbreakable run is long. The formatting banner would
+    /// name the wrong reason, including when the tag count is also over the cap.
     pub fn held_for_length(&self) -> bool {
-        self.painted_source.borrow().as_ref().is_some_and(|text| {
-            rich::heavy_applies(text) <= rich::SYNC_TAG_APPLIES
-                && rich::breakless_chars(text) > rich::SYNC_BREAKLESS_CHARS
-        })
+        self.painted_source
+            .borrow()
+            .as_ref()
+            .is_some_and(|text| rich::breakless_chars(text) > rich::SYNC_BREAKLESS_CHARS)
+    }
+
+    /// A line over the breakless cap is one unwrapped row. The page editor's
+    /// clamp would clip that row, and a bar on the scrolled window cannot
+    /// scroll a child that stays inside the clamp. The view becomes the
+    /// scrolled window's child for that document, and goes back in the clamp
+    /// for every other one.
+    fn set_side_scroll(&self, on: bool) {
+        if self.side_scroll.get() == on {
+            return;
+        }
+        self.side_scroll.set(on);
+        if on {
+            self.view.set_wrap_mode(gtk::WrapMode::None);
+            self.scrolled
+                .set_hscrollbar_policy(gtk::PolicyType::Automatic);
+            if self.page {
+                self.clamp.set_child(None::<&gtk::Widget>);
+                self.scrolled.set_child(Some(&self.view));
+            }
+        } else if self.page {
+            self.scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+            self.clamp.set_maximum_size(760);
+            self.clamp.set_tightening_threshold(600);
+            self.scrolled.set_child(None::<&gtk::Widget>);
+            self.clamp.set_child(Some(&self.view));
+            self.scrolled.set_child(Some(&self.clamp));
+        } else {
+            self.scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+        }
     }
 
     /// Drops a plain-only hold. The next [`Self::load`] replaces the buffer.
     pub fn release_plain(&self) {
         let held = self.painted_source.borrow().is_some();
         self.painted_source.borrow_mut().take();
+        self.display_breaks.set(false);
+        self.set_side_scroll(false);
         self.loading.set(false);
         if held {
             let edit = self.edit_when_ready.get();
@@ -672,19 +772,28 @@ impl Editor {
             return;
         }
         let buffer = &self.buffer;
-        let flags = gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY;
         let (sel_start, sel_end) = buffer.selection_bounds().unwrap_or_else(|| {
             let i = buffer.iter_at_mark(&buffer.get_insert());
             (i, i)
         });
-        let found = if forward {
-            sel_end
-                .forward_search(&needle, flags, None)
-                .or_else(|| buffer.start_iter().forward_search(&needle, flags, None))
+        let found = if self.display_breaks.get() {
+            self.find_across_breaks(
+                forward,
+                needle.as_str(),
+                sel_start.offset(),
+                sel_end.offset(),
+            )
         } else {
-            sel_start
-                .backward_search(&needle, flags, None)
-                .or_else(|| buffer.end_iter().backward_search(&needle, flags, None))
+            let flags = gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY;
+            if forward {
+                sel_end
+                    .forward_search(&needle, flags, None)
+                    .or_else(|| buffer.start_iter().forward_search(&needle, flags, None))
+            } else {
+                sel_start
+                    .backward_search(&needle, flags, None)
+                    .or_else(|| buffer.end_iter().backward_search(&needle, flags, None))
+            }
         };
         match found {
             Some((s, e)) => {
@@ -696,6 +805,95 @@ impl Editor {
             None => self.search_entry.add_css_class("error"),
         }
     }
+
+    /// Find in a plain view. Display breaks are not characters of the
+    /// document, so a match may cross one.
+    fn find_across_breaks(
+        &self,
+        forward: bool,
+        needle: &str,
+        sel_start: i32,
+        sel_end: i32,
+    ) -> Option<(gtk::TextIter, gtk::TextIter)> {
+        let (raw_start, raw_end) = self.buffer.bounds();
+        let raw = self.buffer.text(&raw_start, &raw_end, false);
+        let mut logical = String::new();
+        let mut map = Vec::new();
+        let mut off = 0i32;
+        for ch in raw.chars() {
+            if ch != rich::DISPLAY_BREAK {
+                logical.push(ch);
+                map.push(off);
+            }
+            off += 1;
+        }
+        let from = if forward { sel_end } else { sel_start };
+        let logical_from = map
+            .iter()
+            .position(|offset| *offset >= from)
+            .unwrap_or(map.len());
+        let hit = find_ci(logical.as_str(), needle, forward, logical_from).or_else(|| {
+            let wrap = if forward { 0 } else { logical.chars().count() };
+            find_ci(logical.as_str(), needle, forward, wrap)
+        })?;
+        let (start, end) = hit;
+        let start_off = *map.get(start)?;
+        let end_off = map.get(end).copied().unwrap_or(off);
+        Some((
+            self.buffer.iter_at_offset(start_off),
+            self.buffer.iter_at_offset(end_off),
+        ))
+    }
+}
+
+fn eq_ci(a: char, b: char) -> bool {
+    if a == b || a.eq_ignore_ascii_case(&b) {
+        return true;
+    }
+    let mut ac = a.to_lowercase();
+    let mut bc = b.to_lowercase();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Character offsets of `needle` in `hay`, ignoring ASCII case. `from_char`
+/// is where the scan starts. A forward scan begins there. A backward scan
+/// begins on the character before it.
+fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(usize, usize)> {
+    let hay: Vec<char> = hay.chars().collect();
+    let needle: Vec<char> = needle.chars().collect();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    let matches = |i: usize| {
+        hay[i..i + needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| eq_ci(*a, *b))
+    };
+    if forward {
+        let start = from_char.min(hay.len());
+        if start > last {
+            return None;
+        }
+        return (start..=last)
+            .find(|&i| matches(i))
+            .map(|i| (i, i + needle.len()));
+    }
+    if from_char == 0 {
+        return None;
+    }
+    let start = from_char.saturating_sub(1).min(last);
+    (0..=start)
+        .rev()
+        .find(|&i| matches(i))
+        .map(|i| (i, i + needle.len()))
 }
 
 fn text_offset(n: usize) -> i32 {
@@ -770,7 +968,7 @@ pub(crate) mod tests {
         let src = r"{\rtf1\pard one\
 \pard\qc \
 \pard three}";
-        ed.load(&rtf::parse(src.as_bytes()));
+        ed.load(rtf::parse(src.as_bytes()));
         let empty = ed.plain_text().find('\n').unwrap() as i32 + 1;
         type_at(&ed, empty, "two");
         let t = ed.text();
@@ -791,7 +989,7 @@ pub(crate) mod tests {
         let ed = Editor::new(true);
         let src = r"{\rtf1\ansi{\fonttbl\f0 Palatino-Roman;}\pard\qc\fi720\f0\fs26 plain {\i slanted} end\
 next}";
-        ed.load(&rtf::parse(src.as_bytes()));
+        ed.load(rtf::parse(src.as_bytes()));
         // Inside the italic run: italic, same font and size.
         type_at(&ed, 9, "XX");
         // At the start of the second paragraph: its own style.
@@ -860,7 +1058,7 @@ next}";
     /// A spelling underline is a tag the file does not store.
     pub(crate) fn a_spelling_mark_is_not_saved() {
         let ed = Editor::new(true);
-        ed.load(&rtf::parse(br"{\rtf1 hello helo}"));
+        ed.load(rtf::parse(br"{\rtf1 hello helo}"));
         let before = ed.text();
         let tag = gtk::TextTag::new(Some("spell"));
         tag.set_underline(gtk::pango::Underline::Error);
@@ -876,7 +1074,7 @@ next}";
         let ed = Editor::new(true);
         let src =
             r"{\rtf1\ansi{\fonttbl\f0 Palatino-Roman;}\pard\f0\fs24 Say hello and {\i hello}.}";
-        ed.load(&rtf::parse(src.as_bytes()));
+        ed.load(rtf::parse(src.as_bytes()));
         let query = omaquill::replace::query(
             "hello",
             "hi",
@@ -910,7 +1108,7 @@ next}";
     pub(crate) fn replace_all_refuses_a_loaded_image() {
         let ed = Editor::new(true);
         let image = rtf::parse(br"{\rtf1\ansi\pard alpha {\pict\pngblip deadbeef} beta}");
-        ed.load(&image);
+        ed.load(image);
         assert_eq!(ed.lossy(), ["images"]);
         let query = omaquill::replace::query(
             "alpha",
@@ -932,7 +1130,7 @@ next}";
             "{blocked:?}"
         );
         assert!(ed.plain_text().contains("alpha"));
-        ed.load(&rtf::parse(br"{\rtf1\ansi\pard alpha beta}"));
+        ed.load(rtf::parse(br"{\rtf1\ansi\pard alpha beta}"));
         assert!(ed.lossy().is_empty());
         let plan = omaquill::replace::plan_document(&ed.lossy(), &ed.text(), &query).unwrap();
         ed.apply_edits(&plan).unwrap();
@@ -987,7 +1185,7 @@ next}";
             lossy: Vec::new(),
         };
         let ed = Editor::new(true);
-        ed.load(&text);
+        ed.load(text);
         assert_eq!(
             ed.buffer.line_count(),
             1,
@@ -1022,7 +1220,7 @@ next}";
         let runs = 64usize;
         let text = toggled(runs);
         let started = std::time::Instant::now();
-        ed.load(&text);
+        ed.load(text);
         let mut shown_ms = started.elapsed().as_secs_f64() * 1000.0;
         for _ in 0..30 {
             if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
@@ -1054,8 +1252,9 @@ next}";
         text.paragraphs[0].runs[1_000].text = "q".into();
         text.paragraphs[0].runs[1_001].text = "z".into();
         let ed = Editor::new(true);
+        let owned = text.clone();
         let started = std::time::Instant::now();
-        ed.load(&text);
+        ed.load(owned);
         let open_ms = started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("hostile open ms={open_ms:.1}");
         assert!(
@@ -1096,11 +1295,11 @@ next}";
     pub(crate) fn switching_mid_paint_leaves_the_new_document() {
         let big = toggled(2_000);
         let ed = Editor::new(true);
-        ed.load(&big);
+        ed.load(big.clone());
         assert!(ed.is_too_formatted());
         assert_eq!(ed.text(), big);
         let hello = rtf::RichText::from_plain("Hello");
-        ed.load(&hello);
+        ed.load(hello);
         assert!(!ed.is_too_formatted());
         assert!(ed.view.is_editable());
         assert_eq!(ed.plain_text(), "Hello");
@@ -1124,7 +1323,7 @@ next}";
         text.paragraphs[0].style.align = Align::Center;
         text.paragraphs[0].runs[10].text = " helo ".into();
         let ed = Editor::new(true);
-        ed.load(&text);
+        ed.load(text.clone());
         assert!(ed.is_too_formatted());
         assert!(!ed.held_for_length());
         assert!(!ed.loading.get());
@@ -1141,6 +1340,8 @@ next}";
         assert_eq!(ed.text().paragraphs[0].style.align, Align::Center);
         let mut at = ed.buffer.start_iter();
         ed.buffer.insert(&mut at, "ZZ");
+        assert_eq!(ed.plain_text(), plain, "insert changed a held buffer");
+        assert!(!dirtied.get());
         ed.buffer.undo();
         assert_eq!(ed.plain_text(), plain);
         let query = omaquill::replace::query(
@@ -1188,7 +1389,7 @@ next}";
             lossy: Vec::new(),
         };
         let ed = Editor::new(true);
-        ed.load(&text);
+        ed.load(text);
         assert!(!ed.is_too_formatted());
         assert!(ed.view.is_editable());
         assert_eq!(ed.buffer.line_count(), 1);
@@ -1222,8 +1423,9 @@ next}";
         assert!(rich::heavy_applies(&text) <= rich::SYNC_TAG_APPLIES);
         assert!(rich::needs_plain_view(&text));
         let ed = Editor::new(true);
+        let owned = text.clone();
         let started = std::time::Instant::now();
-        ed.load(&text);
+        ed.load(owned);
         let open_ms = started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("uniform plain runs={runs} open_ms={open_ms:.1}");
         assert!(
@@ -1263,7 +1465,7 @@ next}";
             });
         }
         let ed = Editor::new(true);
-        ed.load(&RichText {
+        ed.load(RichText {
             paragraphs,
             lossy: Vec::new(),
         });
@@ -1304,8 +1506,11 @@ next}";
 
     fn time_open(ed: &Editor, context: &gtk::glib::MainContext, label: &str, text: &RichText) {
         let chars = text.plain_text().chars().count();
+        // The copy stays here so the timed load matches the window, which
+        // moves the document it already owns.
+        let owned = text.clone();
         let started = std::time::Instant::now();
-        ed.load(text);
+        ed.load(owned);
         let open_ms = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(ed.buffer.line_count(), 1);
         assert!(ed.is_too_formatted());
@@ -1340,6 +1545,23 @@ next}";
             "{label} main-loop turn blocked {max_iter_ms:.1} ms at {chars}"
         );
         assert!(shown, "{label} did not get a line height");
+        assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::None);
+        assert!(!ed.display_breaks.get());
+        let start_x = ed.view.iter_location(&ed.buffer.start_iter()).x();
+        let mut last = ed.buffer.end_iter();
+        assert!(last.backward_char(), "{label} was empty");
+        let end_x = ed.view.iter_location(&last).x();
+        assert!(
+            end_x > start_x,
+            "{label} did not lay the line out, start {start_x} end {end_x}"
+        );
+        let adj = ed.scrolled.hadjustment();
+        assert!(
+            adj.upper() > adj.page_size() + 1.0,
+            "{label} has nothing to scroll, upper {} page {}",
+            adj.upper(),
+            adj.page_size()
+        );
         assert_eq!(ed.plain_text().chars().count(), chars);
         assert_eq!(ed.text(), *text);
         let names = rich::tag_names(&ed.buffer.start_iter());
@@ -1373,14 +1595,164 @@ next}";
         }
     }
 
-    /// Open times for one paragraph on a visible view. Set
-    /// OMAQUILL_GTK_OPEN=1 for uniform runs, alternating runs, and one
-    /// unspaced line at 10k, 50k, and 100k. Set it to `probe` to time
-    /// word-char layout under the cap. The paragraph stays one plain line.
+    /// A plain unspaced line scrolls sideways. Word wrap of display breaks
+    /// laid the paragraph out inside `place_cursor`. The file text does not
+    /// gain break characters, and find matches the run.
+    pub(crate) fn a_plain_unspaced_line_scrolls_sideways() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        window.present();
+        let chars = 10_000usize;
+        let text = one_line(chars);
+        let started = std::time::Instant::now();
+        ed.load(text);
+        let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(open_ms < 100.0, "open blocked {open_ms:.1} ms");
+        assert!(ed.is_too_formatted());
+        assert!(ed.held_for_length());
+        assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::None);
+        assert!(!ed.display_breaks.get());
+        assert_eq!(ed.scrolled.hscrollbar_policy(), gtk::PolicyType::Automatic);
+        assert_eq!(ed.plain_text().chars().count(), chars);
+        assert!(!ed.text().plain_text().contains(rich::DISPLAY_BREAK));
+        let context = gtk::glib::MainContext::default();
+        let mut max_iter = 0.0f64;
+        let mut shown = false;
+        for _ in 0..40 {
+            let step = std::time::Instant::now();
+            let ran = context.iteration(false);
+            if ran {
+                max_iter = max_iter.max(step.elapsed().as_secs_f64() * 1000.0);
+            }
+            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
+                shown = true;
+            }
+            if shown && !context.pending() {
+                break;
+            }
+        }
+        assert!(shown, "the line was not allocated");
+        assert!(max_iter < 100.0, "main-loop turn blocked {max_iter:.1} ms");
+        let start_x = ed.view.iter_location(&ed.buffer.start_iter()).x();
+        let mut last = ed.buffer.end_iter();
+        assert!(last.backward_char());
+        let end_x = ed.view.iter_location(&last).x();
+        assert!(
+            end_x > start_x,
+            "the line did not extend, start {start_x} end {end_x}"
+        );
+        let adj = ed.scrolled.hadjustment();
+        assert!(
+            adj.upper() > adj.page_size() + 1.0,
+            "nothing to scroll, upper {} page {}",
+            adj.upper(),
+            adj.page_size()
+        );
+        adj.set_value(adj.upper() - adj.page_size());
+        for _ in 0..10 {
+            if !context.iteration(false) && !context.pending() {
+                break;
+            }
+        }
+        let visible = ed.view.visible_rect();
+        let end_loc = ed.view.iter_location(&last);
+        assert!(
+            end_loc.x() < visible.x() + visible.width(),
+            "scrolling did not reach the tail, end {} visible {}+{}",
+            end_loc.x(),
+            visible.x(),
+            visible.width()
+        );
+        ed.search_entry.set_text(&"a".repeat(100));
+        ed.find(true);
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("find missed a run that crosses a display break");
+        let selected = ed.buffer.text(&start, &end, false);
+        assert_eq!(
+            rich::strip_display_breaks(selected.as_str()),
+            "a".repeat(100)
+        );
+        window.close();
+    }
+
+    /// Typing or pasting past the unspaced cap on an editable document used
+    /// to leave word-char wrap in place. The insert is refused, so the next
+    /// main-loop turn does not lay out that line.
+    pub(crate) fn an_edit_past_the_unspaced_cap_is_refused() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        window.present();
+        let body = "a".repeat(rich::SYNC_BREAKLESS_CHARS);
+        ed.load(RichText::from_plain(&body));
+        assert!(!rich::needs_plain_view(&RichText::from_plain(&body)));
+        assert!(!ed.is_too_formatted());
+        assert!(ed.allows_edits());
+        assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::WordChar);
+        let context = gtk::glib::MainContext::default();
+        let mut shown = false;
+        for _ in 0..40 {
+            let ran = context.iteration(false);
+            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
+                shown = true;
+            }
+            if shown && !ran && !context.pending() {
+                break;
+            }
+        }
+        assert!(shown, "the line under the cap was not allocated");
+        let hit = Rc::new(Cell::new(false));
+        let flag = hit.clone();
+        ed.connect_line_limit(move || flag.set(true));
+        let mut end = ed.buffer.end_iter();
+        ed.buffer.insert(&mut end, "a");
+        assert!(hit.get(), "the length limit was silent");
+        assert_eq!(ed.plain_text().chars().count(), rich::SYNC_BREAKLESS_CHARS);
+        assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::WordChar);
+        let mut end = ed.buffer.end_iter();
+        let started = std::time::Instant::now();
+        ed.buffer.insert(&mut end, &"b".repeat(20_000));
+        let paste_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            paste_ms < 100.0,
+            "refusing the paste blocked for {paste_ms:.1} ms"
+        );
+        assert_eq!(ed.plain_text().chars().count(), rich::SYNC_BREAKLESS_CHARS);
+        assert!(!ed.plain_text().contains('b'));
+        let mut max_iter = 0.0f64;
+        for _ in 0..20 {
+            let step = std::time::Instant::now();
+            if !context.iteration(false) && !context.pending() {
+                break;
+            }
+            max_iter = max_iter.max(step.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert!(
+            max_iter < 100.0,
+            "main-loop turn blocked {max_iter:.1} ms after a refused paste"
+        );
+        let mut end = ed.buffer.end_iter();
+        ed.buffer.insert(&mut end, " hello");
+        assert!(
+            ed.plain_text().ends_with(" hello"),
+            "a spaced word was refused: {}",
+            ed.plain_text()
+        );
+        window.close();
+    }
+
+    /// Open times for one paragraph on a visible view. Uniform runs,
+    /// alternating runs, and one unspaced line, at 10k, 50k, and 100k.
+    /// Set OMAQUILL_GTK_OPEN to one of those counts to time only that size.
+    /// Set it to `probe` to time word-char layout under the cap. The
+    /// paragraph stays one plain line, and the line scrolls sideways.
     pub(crate) fn time_styled_paragraph_open() {
-        let Some(which) = std::env::var("OMAQUILL_GTK_OPEN").ok() else {
-            return;
-        };
+        let which = std::env::var("OMAQUILL_GTK_OPEN").unwrap_or_default();
         let ed = Editor::new(true);
         let window = gtk::Window::new();
         window.set_default_size(800, 600);
@@ -1398,10 +1770,14 @@ next}";
             window.close();
             return;
         }
-        for chars in [10_000usize, 50_000, 100_000] {
-            if which != "1" && which != chars.to_string() {
-                continue;
-            }
+        let sizes: Vec<usize> = if which.is_empty() || which == "1" {
+            vec![10_000, 50_000, 100_000]
+        } else if let Ok(n) = which.parse() {
+            vec![n]
+        } else {
+            vec![10_000, 50_000, 100_000]
+        };
+        for chars in sizes {
             time_open(&ed, &context, "uniform", &uniform(chars));
             time_open(&ed, &context, "alternating", &toggled(chars));
             time_open(&ed, &context, "line", &one_line(chars));

@@ -218,8 +218,9 @@ fn missing_item(uuid: &str) -> Error {
 
 /// Words compiled from `draft`, counting each document once.
 ///
-/// The draft folder's own count is included. A child counts only when it
-/// is included in compile, and an excluded folder hides its children.
+/// The count starts at the Draft folder's children, as [`crate::compile::gather`]
+/// does. The folder's own text is not a chapter. A child counts only when
+/// it is included in compile, and an excluded folder hides its children.
 /// Rows that share a UUID are one document.
 pub fn compile_words(draft: &Item, counts: &HashMap<String, usize>) -> usize {
     fn add(
@@ -242,7 +243,42 @@ pub fn compile_words(draft: &Item, counts: &HashMap<String, usize>) -> usize {
         }
         total
     }
-    add(draft, counts, &mut HashSet::new(), false)
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    for child in &draft.children {
+        total += add(child, counts, &mut seen, true);
+    }
+    total
+}
+
+/// Characters in the paragraph after trimming the joined runs. One short
+/// run does not decide this. The count is characters, not bytes.
+fn paragraph_trimmed_chars(par: &rtf::Paragraph) -> usize {
+    par.text().trim().chars().count()
+}
+
+/// The character style that covers the most characters. A tie keeps the
+/// earlier style. A short lead-in is not the result when a later run is longer.
+fn dominant_char_style(par: &rtf::Paragraph) -> rtf::CharStyle {
+    let mut totals: Vec<(rtf::CharStyle, usize)> = Vec::new();
+    for run in &par.runs {
+        let n = run.text.chars().count();
+        if n == 0 {
+            continue;
+        }
+        if let Some((_, total)) = totals.iter_mut().find(|(style, _)| style == &run.style) {
+            *total += n;
+        } else {
+            totals.push((run.style.clone(), n));
+        }
+    }
+    let mut best: Option<(rtf::CharStyle, usize)> = None;
+    for (style, n) in totals {
+        if best.as_ref().is_none_or(|pair| n > pair.1) {
+            best = Some((style, n));
+        }
+    }
+    best.map(|(style, _)| style).unwrap_or_default()
 }
 
 /// Word counts and lowercase search text, one entry per binder id.
@@ -989,8 +1025,12 @@ impl Project {
                 .filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok())
                 .collect();
             let t = rtf::parse(&bytes);
-            if let Some(p) = t.paragraphs.iter().find(|p| !p.runs.is_empty()) {
-                return Some((p.style.clone(), p.runs[0].style.clone()));
+            if let Some(p) = t
+                .paragraphs
+                .iter()
+                .find(|p| p.runs.iter().any(|r| !r.text.is_empty()))
+            {
+                return Some((p.style.clone(), dominant_char_style(p)));
             }
         }
         // A shared id is one file. Aliases of one short document are parsed
@@ -1009,9 +1049,9 @@ impl Project {
                     && let Some(par) = t
                         .paragraphs
                         .iter()
-                        .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
+                        .find(|par| paragraph_trimmed_chars(par) > 20)
                 {
-                    return Some((par.style.clone(), par.runs[0].style.clone()));
+                    return Some((par.style.clone(), dominant_char_style(par)));
                 }
                 if let Some(found) = search(p, &i.children, seen) {
                     return Some(found);
@@ -1903,6 +1943,18 @@ mod tests {
     }
 
     #[test]
+    fn compile_words_starts_at_the_draft_children() {
+        let draft_id = "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD";
+        let child_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000011";
+        let child = item(child_id, Kind::Text, Vec::new());
+        let draft = item(draft_id, Kind::Draft, vec![child]);
+        let mut counts = HashMap::new();
+        counts.insert(draft_id.to_string(), 1_000);
+        counts.insert(child_id.to_string(), 5);
+        assert_eq!(compile_words(&draft, &counts), 5);
+    }
+
+    #[test]
     fn binder_index_releases_each_body() {
         let (path, mut project) = temp_project("release");
         let draft = project.root_folder(Kind::Draft).unwrap().uuid;
@@ -2175,6 +2227,95 @@ mod tests {
         assert_eq!(style.0.align, rtf::Align::Center);
         assert!(style.1.italic);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_uses_the_paragraph_and_its_dominant_run() {
+        let (runs_path, mut project) = temp_project("style-runs");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let first = project.add_item(Kind::Text, "Runs", &draft, None).unwrap();
+        let mut paragraph = rtf::Paragraph::default();
+        paragraph.style.align = rtf::Align::Center;
+        for i in 0..6 {
+            paragraph.runs.push(rtf::Run {
+                text: "abcdefghij".into(),
+                style: rtf::CharStyle {
+                    bold: i % 2 == 0,
+                    italic: i % 2 == 1,
+                    ..rtf::CharStyle::default()
+                },
+            });
+        }
+        project
+            .set_text(
+                &first,
+                &RichText {
+                    paragraphs: vec![paragraph],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        let later = project.add_item(Kind::Text, "Later", &draft, None).unwrap();
+        let mut later_par = rtf::Paragraph::default();
+        later_par.style.align = rtf::Align::Left;
+        later_par.runs.push(rtf::Run {
+            text: "This later sentence is longer than twenty characters.".into(),
+            style: rtf::CharStyle::default(),
+        });
+        project
+            .set_text(
+                &later,
+                &RichText {
+                    paragraphs: vec![later_par],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&runs_path).unwrap();
+        let style = project
+            .default_style()
+            .expect("six 10-character runs are one 60-character paragraph");
+        assert_eq!(style.0.align, rtf::Align::Center);
+        assert!(style.1.bold);
+        assert!(!style.1.italic);
+
+        let (lead_path, mut project) = temp_project("style-lead");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        let mut paragraph = rtf::Paragraph::default();
+        paragraph.style.align = rtf::Align::Right;
+        paragraph.runs.push(rtf::Run {
+            text: "Go ".into(),
+            style: rtf::CharStyle {
+                bold: true,
+                ..rtf::CharStyle::default()
+            },
+        });
+        paragraph.runs.push(rtf::Run {
+            text: "This sentence is the body of the paragraph.".into(),
+            style: rtf::CharStyle {
+                italic: true,
+                ..rtf::CharStyle::default()
+            },
+        });
+        project
+            .set_text(
+                &scene,
+                &RichText {
+                    paragraphs: vec![paragraph],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&lead_path).unwrap();
+        let style = project.default_style().expect("the lead-in paragraph");
+        assert_eq!(style.0.align, rtf::Align::Right);
+        assert!(style.1.italic);
+        assert!(!style.1.bold);
+        let _ = std::fs::remove_dir_all(runs_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(lead_path.parent().unwrap());
     }
 
     #[test]

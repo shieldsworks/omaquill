@@ -257,7 +257,7 @@ impl Win {
         let stored = omaquill::project::is_uuid(&item.uuid);
         i.synopsis.set_editable(stored);
         self.notes.set_editing(stored);
-        self.notes.load(&notes);
+        self.notes.load(notes);
         self.dirty_notes.set(false);
         self.dirty_synopsis.set(false);
         i.filling.set(false);
