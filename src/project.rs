@@ -941,6 +941,23 @@ impl Project {
         self.read_rtf(uuid, "content.rtf")
     }
 
+    /// One parse of a document, then a clone for every later row with that
+    /// id. The key is the uppercase id, matching the `Files/Data` folder.
+    /// [`text`] itself stays uncached, so a save cannot hand back this copy.
+    pub fn text_shared(
+        &self,
+        uuid: &str,
+        cache: &mut HashMap<String, RichText>,
+    ) -> Result<RichText> {
+        let key = uuid.to_ascii_uppercase();
+        if let Some(text) = cache.get(&key) {
+            return Ok(text.clone());
+        }
+        let text = self.text(uuid)?;
+        cache.insert(key, text.clone());
+        Ok(text)
+    }
+
     pub fn notes(&self, uuid: &str) -> Result<RichText> {
         self.read_rtf(uuid, "notes.rtf")
     }

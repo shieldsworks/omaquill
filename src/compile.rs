@@ -15,6 +15,7 @@ use crate::rtf::{
 };
 use crate::xml::escape;
 use crate::zip::ZipWriter;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,16 +105,79 @@ pub struct Section {
 
 // ------------------------------------------------------------- gathering
 
+/// What `omaquill check` counted. One shared id is parsed once; each binder
+/// row still adds its own document and word count.
+pub struct Survey {
+    pub docs: usize,
+    pub words: usize,
+    pub lossy: Vec<String>,
+}
+
+/// Reads every document, checks that a rewrite survives, and fills `cache`
+/// so a following [`gather_cached`] does not parse those files again.
+pub fn survey(project: &Project, cache: &mut HashMap<String, RichText>) -> Result<Survey> {
+    let mut survey = Survey {
+        docs: 0,
+        words: 0,
+        lossy: Vec::new(),
+    };
+    fn walk(
+        project: &Project,
+        items: &[Item],
+        cache: &mut HashMap<String, RichText>,
+        survey: &mut Survey,
+    ) -> Result<()> {
+        for item in items {
+            if item.kind.has_text() {
+                let key = item.uuid.to_ascii_uppercase();
+                let fresh = !cache.contains_key(&key);
+                let text = project.text_shared(&item.uuid, cache)?;
+                if fresh {
+                    let again = rtf::parse(rtf::write(&text).as_bytes());
+                    if again.paragraphs != text.paragraphs {
+                        return Err(crate::project::Error::Invalid(format!(
+                            "{} ({}) doesn't survive a rewrite",
+                            item.title, item.uuid
+                        )));
+                    }
+                }
+                survey.docs += 1;
+                survey.words += rtf::word_count(&text.plain_text());
+                if !text.lossy.is_empty() {
+                    survey
+                        .lossy
+                        .push(format!("  {} has {}", item.title, text.lossy.join(", ")));
+                }
+            }
+            walk(project, &item.children, cache, survey)?;
+        }
+        Ok(())
+    }
+    walk(project, &project.items(), cache, &mut survey)?;
+    Ok(survey)
+}
+
 /// What gets compiled, in order: walks the Draft folder, skipping items
 /// with `include_in_compile == false` (and their children).
 pub fn gather(project: &Project, opts: &Options) -> Result<Vec<Section>> {
+    let mut cache = HashMap::new();
+    gather_cached(project, opts, &mut cache)
+}
+
+/// [`gather`] with a caller-owned cache, so `omaquill check` can reuse the
+/// documents [`survey`] already parsed.
+pub fn gather_cached(
+    project: &Project,
+    opts: &Options,
+    cache: &mut HashMap<String, RichText>,
+) -> Result<Vec<Section>> {
     let Some(draft) = project.root_folder(Kind::Draft) else {
         return Ok(Vec::new());
     };
     let mut sections = Vec::new();
     for item in draft.children.iter().filter(|i| i.include_in_compile) {
         let mut scenes = Vec::new();
-        collect_scenes(project, item, &mut scenes)?;
+        collect_scenes(project, item, &mut scenes, cache)?;
         let heading = match opts.headings {
             Headings::Numbered => Some(format!("Chapter {}", number_words(sections.len() + 1))),
             Headings::Titles => Some(item.title.clone()),
@@ -126,9 +190,14 @@ pub fn gather(project: &Project, opts: &Options) -> Result<Vec<Section>> {
 
 /// A folder's own text first, then its descendants depth-first: nested
 /// folders flatten into the chapter they sit in.
-fn collect_scenes(project: &Project, item: &Item, scenes: &mut Vec<RichText>) -> Result<()> {
+fn collect_scenes(
+    project: &Project,
+    item: &Item,
+    scenes: &mut Vec<RichText>,
+    cache: &mut HashMap<String, RichText>,
+) -> Result<()> {
     if item.kind.has_text() {
-        let mut text = project.text(&item.uuid)?;
+        let mut text = project.text_shared(&item.uuid, cache)?;
         // Blank lines at either end would show up as gaps around separators.
         while text.paragraphs.last().is_some_and(is_blank) {
             text.paragraphs.pop();
@@ -140,7 +209,7 @@ fn collect_scenes(project: &Project, item: &Item, scenes: &mut Vec<RichText>) ->
         }
     }
     for child in item.children.iter().filter(|c| c.include_in_compile) {
-        collect_scenes(project, child, scenes)?;
+        collect_scenes(project, child, scenes, cache)?;
     }
     Ok(())
 }
@@ -1102,5 +1171,99 @@ mod tests {
         let t = utc_now();
         assert_eq!(t.len(), 20);
         assert!(t.ends_with('Z') && t.as_bytes()[10] == b'T');
+    }
+
+    #[test]
+    fn check_and_compile_parse_a_shared_uuid_once() {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-shared-compile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Aliases.scriv");
+        let mut project = crate::project::Project::create(&path).unwrap();
+        let draft = project
+            .root_folder(crate::project::Kind::Draft)
+            .unwrap()
+            .uuid;
+        let shared = project
+            .add_item(crate::project::Kind::Text, "The Lamp", &draft, None)
+            .unwrap();
+        let body = "lamp ".repeat(32);
+        project
+            .set_text(&shared, &RichText::from_plain(&body))
+            .unwrap();
+        let mut aliases = Vec::new();
+        for n in 0..100 {
+            aliases.push(
+                project
+                    .add_item(
+                        crate::project::Kind::Text,
+                        &format!("Alias {n}"),
+                        &draft,
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        let scrivx = std::fs::read_dir(&path)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.extension()
+                    .is_some_and(|ext| ext == "scrivx")
+                    .then_some(path)
+            })
+            .unwrap();
+        let mut xml = std::fs::read_to_string(&scrivx).unwrap();
+        for alias in &aliases {
+            let from = format!("UUID=\"{alias}\"");
+            assert!(xml.contains(&from), "{alias}");
+            xml = xml.replacen(&from, &format!("UUID=\"{shared}\""), 1);
+        }
+        std::fs::write(&scrivx, xml).unwrap();
+        let project = crate::project::Project::open(&path).unwrap();
+        let opts = Options::for_project(&project);
+        crate::rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let sections = gather(&project, &opts).unwrap();
+        let compile_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let compile_parses = crate::rtf::parses();
+        let scenes: Vec<_> = sections
+            .iter()
+            .flat_map(|section| &section.scenes)
+            .collect();
+        assert_eq!(scenes.len(), 101, "each included row stays a scene");
+        assert!(scenes.iter().all(|scene| scene.plain_text() == body));
+        assert!(
+            compile_parses <= 1,
+            "compile parsed the shared file {compile_parses} times"
+        );
+
+        crate::rtf::reset_parses();
+        let mut cache = std::collections::HashMap::new();
+        let started = std::time::Instant::now();
+        let report = survey(&project, &mut cache).unwrap();
+        let again = gather_cached(&project, &opts, &mut cache).unwrap();
+        let check_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let check_parses = crate::rtf::parses();
+        // The new-project template adds the Draft folder, the Research
+        // folder, and an empty chapter. None of those has a file, so they
+        // do not parse on read. Each distinct id is rewritten once, and the
+        // shared file is read once.
+        assert_eq!(report.docs, 104);
+        assert_eq!(report.words, 101 * 32);
+        assert_eq!(
+            again.iter().flat_map(|section| &section.scenes).count(),
+            101
+        );
+        assert_eq!(
+            check_parses, 5,
+            "check parsed {check_parses} times for one shared file"
+        );
+        eprintln!(
+            "aliases=100 compile_parses={compile_parses} ms={compile_ms:.1}; check_parses={check_parses} ms={check_ms:.1}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
