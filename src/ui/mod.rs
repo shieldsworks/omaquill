@@ -1072,34 +1072,11 @@ impl Win {
         }
     }
 
-    /// Reads every text once: word counts and search text.
+    /// Reads every distinct document once: word counts and search text.
     fn index_project(&self, project: &Project) {
-        let mut counts = HashMap::new();
-        let mut search = HashMap::new();
-        fn walk(
-            p: &Project,
-            items: &[Item],
-            counts: &mut HashMap<String, usize>,
-            search: &mut HashMap<String, String>,
-        ) {
-            for i in items {
-                let mut text = format!("{}\n{}\n", i.title, p.synopsis(&i.uuid));
-                if i.kind.has_text() {
-                    let body = p.text(&i.uuid).map(|t| t.plain_text()).unwrap_or_default();
-                    counts.insert(i.uuid.clone(), rtf::word_count(&body));
-                    text.push_str(&body);
-                }
-                if let Ok(n) = p.notes(&i.uuid) {
-                    text.push('\n');
-                    text.push_str(&n.plain_text());
-                }
-                search.insert(i.uuid.clone(), text.to_lowercase());
-                walk(p, &i.children, counts, search);
-            }
-        }
-        walk(project, &project.items(), &mut counts, &mut search);
-        *self.counts.borrow_mut() = counts;
-        *self.search_text.borrow_mut() = search;
+        let indexed = project.binder_index();
+        *self.counts.borrow_mut() = indexed.counts;
+        *self.search_text.borrow_mut() = indexed.search;
     }
 
     /// Words in everything the manuscript compiles.

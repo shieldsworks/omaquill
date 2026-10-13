@@ -13,7 +13,24 @@
 //! contains a tab. A project replace skips a lossy file. The editor names
 //! the same list and does not replace.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::fmt::Write as _;
+
+#[cfg(test)]
+thread_local! {
+    static PARSES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_parses() {
+    PARSES.with(|n| n.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn parses() -> u64 {
+    PARSES.with(|n| n.get())
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RichText {
@@ -260,6 +277,8 @@ struct Reader<'a> {
 }
 
 pub fn parse(src: &[u8]) -> RichText {
+    #[cfg(test)]
+    PARSES.with(|n| n.set(n.get() + 1));
     let mut r = Reader {
         src,
         pos: 0,

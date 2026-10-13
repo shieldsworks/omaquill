@@ -17,7 +17,7 @@
 use crate::rtf::{self, RichText};
 use crate::xml::{self, Element};
 use crate::{sha1, zip};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -147,6 +147,70 @@ fn missing_item(uuid: &str) -> Error {
         Error::Invalid("binder item has no id".into())
     } else {
         Error::NoSuchItem(uuid.to_string())
+    }
+}
+
+/// Word counts and lowercase search text, one entry per binder id.
+pub struct BinderIndex {
+    pub counts: HashMap<String, usize>,
+    pub search: HashMap<String, String>,
+}
+
+struct IndexedDoc {
+    synopsis: String,
+    /// Loaded the first time a row with this id has text.
+    body: String,
+    body_loaded: bool,
+    /// `None` when the notes file could not be read. A missing file is
+    /// `Some("")`, matching `notes`.
+    notes: Option<String>,
+}
+
+struct IndexSlot {
+    title: String,
+    /// The last row with this id has a text body.
+    has_text: bool,
+    /// Some row with this id had a text body, so the count stays.
+    saw_text: bool,
+}
+
+fn index_items(
+    project: &Project,
+    items: &[Item],
+    docs: &mut HashMap<String, IndexedDoc>,
+    slots: &mut HashMap<String, IndexSlot>,
+) {
+    for item in items {
+        if is_uuid(&item.uuid) {
+            let key = item.uuid.to_ascii_uppercase();
+            let doc = docs.entry(key).or_insert_with(|| IndexedDoc {
+                synopsis: project.synopsis(&item.uuid),
+                body: String::new(),
+                body_loaded: false,
+                notes: match project.notes(&item.uuid) {
+                    Ok(text) => Some(text.plain_text()),
+                    Err(_) => None,
+                },
+            });
+            if item.kind.has_text() && !doc.body_loaded {
+                doc.body = project
+                    .text(&item.uuid)
+                    .map(|text| text.plain_text())
+                    .unwrap_or_default();
+                doc.body_loaded = true;
+            }
+        }
+        let slot = slots.entry(item.uuid.clone()).or_insert(IndexSlot {
+            title: String::new(),
+            has_text: false,
+            saw_text: false,
+        });
+        slot.title.clone_from(&item.title);
+        slot.has_text = item.kind.has_text();
+        if item.kind.has_text() {
+            slot.saw_text = true;
+        }
+        index_items(project, &item.children, docs, slots);
     }
 }
 
@@ -757,6 +821,12 @@ impl Project {
     }
 
     fn read_rtf(&self, uuid: &str, file: &str) -> Result<RichText> {
+        // A binder row is a document only when its id is a Scrivener UUID.
+        // The files live in `Files/Data/<UUID>/`. An empty or missing id has
+        // no folder; joining it would read `Files/Data/` itself.
+        if !is_uuid(uuid) {
+            return Ok(RichText::from_plain(""));
+        }
         match read_inside(&self.root, &self.data_dir(uuid).join(file)) {
             Ok(bytes) => Ok(rtf::parse(&bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RichText::from_plain("")),
@@ -818,14 +888,54 @@ impl Project {
     }
 
     pub fn synopsis(&self, uuid: &str) -> String {
+        if !is_uuid(uuid) {
+            return String::new();
+        }
         read_inside(&self.root, &self.data_dir(uuid).join("synopsis.txt"))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default()
     }
 
+    /// Word counts and the binder search text.
+    ///
+    /// Scrivener keeps a document's files in `Files/Data/<UUID>/`. Rows that
+    /// share a UUID share that folder, and a row with no UUID has no folder.
+    /// Each distinct UUID is read once. The search entry still follows the
+    /// last row that used that id, which is what a per-row walk stored.
+    pub fn binder_index(&self) -> BinderIndex {
+        let mut docs: HashMap<String, IndexedDoc> = HashMap::new();
+        let mut slots: HashMap<String, IndexSlot> = HashMap::new();
+        index_items(self, &self.items(), &mut docs, &mut slots);
+        let mut counts = HashMap::new();
+        let mut search = HashMap::new();
+        for (uuid, slot) in slots {
+            let doc = is_uuid(&uuid)
+                .then(|| docs.get(&uuid.to_ascii_uppercase()))
+                .flatten();
+            let synopsis = doc.map(|d| d.synopsis.as_str()).unwrap_or("");
+            let mut text = format!("{}\n{synopsis}\n", slot.title);
+            if slot.has_text {
+                text.push_str(doc.map(|d| d.body.as_str()).unwrap_or(""));
+            }
+            if slot.saw_text {
+                let body = doc.map(|d| d.body.as_str()).unwrap_or("");
+                counts.insert(uuid.clone(), rtf::word_count(body));
+            }
+            if doc.is_none_or(|d| d.notes.is_some()) {
+                text.push('\n');
+                text.push_str(doc.and_then(|d| d.notes.as_deref()).unwrap_or(""));
+            }
+            search.insert(uuid, text.to_lowercase());
+        }
+        BinderIndex { counts, search }
+    }
+
     /// Writes (or, for empty content, removes) one of an item's files, and
     /// keeps the checksum list in step.
     fn write_file(&mut self, uuid: &str, file: &str, bytes: Option<&[u8]>) -> Result<()> {
+        if !is_uuid(uuid) {
+            return Err(missing_item(uuid));
+        }
         let dir = self.data_dir(uuid);
         let path = dir.join(file);
         let key = format!("{}/{file}", uuid.to_lowercase());
@@ -1397,4 +1507,207 @@ pub fn timestamp() -> String {
         off.abs() / 60,
         off.abs() % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtf::RichText;
+    use crate::xml::Node;
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    fn temp_project(name: &str) -> (std::path::PathBuf, Project) {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-index-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.scriv"));
+        let project = Project::create(&path).unwrap();
+        (path, project)
+    }
+
+    fn naive_index(project: &Project) -> BinderIndex {
+        let mut counts = HashMap::new();
+        let mut search = HashMap::new();
+        fn walk(
+            project: &Project,
+            items: &[Item],
+            counts: &mut HashMap<String, usize>,
+            search: &mut HashMap<String, String>,
+        ) {
+            for item in items {
+                let mut text = format!("{}\n{}\n", item.title, project.synopsis(&item.uuid));
+                if item.kind.has_text() {
+                    let body = project
+                        .text(&item.uuid)
+                        .map(|text| text.plain_text())
+                        .unwrap_or_default();
+                    counts.insert(item.uuid.clone(), rtf::word_count(&body));
+                    text.push_str(&body);
+                }
+                if let Ok(notes) = project.notes(&item.uuid) {
+                    text.push('\n');
+                    text.push_str(&notes.plain_text());
+                }
+                search.insert(item.uuid.clone(), text.to_lowercase());
+                walk(project, &item.children, counts, search);
+            }
+        }
+        walk(project, &project.items(), &mut counts, &mut search);
+        BinderIndex { counts, search }
+    }
+
+    fn rewrite_ids(path: &Path, aliases: &HashSet<String>, bare: &HashSet<String>, shared: &str) {
+        let scrivx = std::fs::read_dir(path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "scrivx"))
+            .unwrap()
+            .path();
+        let mut doc = xml::parse(&std::fs::read_to_string(&scrivx).unwrap()).unwrap();
+        fn walk(
+            el: &mut xml::Element,
+            aliases: &HashSet<String>,
+            bare: &HashSet<String>,
+            shared: &str,
+        ) {
+            if el.name == "BinderItem" {
+                let uuid = el.attr("UUID").unwrap_or_default();
+                if aliases.contains(&uuid) {
+                    el.set_attr("UUID", shared);
+                } else if bare.contains(&uuid) {
+                    el.attrs.retain(|(key, _)| key != "UUID");
+                }
+            }
+            for child in &mut el.children {
+                if let Node::Element(el) = child {
+                    walk(el, aliases, bare, shared);
+                }
+            }
+        }
+        walk(&mut doc.root, aliases, bare, shared);
+        std::fs::write(scrivx, doc.to_xml()).unwrap();
+    }
+
+    #[test]
+    fn binder_index_matches_a_per_row_read_of_lighthouse() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Lighthouse.scriv");
+        let project = Project::open(&path).unwrap();
+        let indexed = project.binder_index();
+        let naive = naive_index(&project);
+        assert_eq!(indexed.counts, naive.counts);
+        assert_eq!(indexed.search, naive.search);
+        assert!(indexed.search.values().any(|text| text.contains("storm")));
+    }
+
+    #[test]
+    fn binder_index_reads_each_document_once() {
+        let (distinct_path, mut project) = temp_project("distinct");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let mut distinct = Vec::new();
+        for n in 0..32 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain(&format!("words of scene {n}")))
+                .unwrap();
+            distinct.push(id);
+        }
+        project.save().unwrap();
+        let project = Project::open(&distinct_path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let indexed = project.binder_index();
+        let distinct_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let distinct_parses = rtf::parses();
+        assert_eq!(
+            distinct_parses, 32,
+            "32 documents parsed {distinct_parses} times"
+        );
+        assert_eq!(
+            indexed.counts.get(&distinct[3]).copied(),
+            Some(rtf::word_count("words of scene 3"))
+        );
+
+        let (path, mut project) = temp_project("aliases");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let shared = project
+            .add_item(Kind::Text, "The Lamp", &draft, None)
+            .unwrap();
+        project
+            .set_text(&shared, &RichText::from_plain("The lamp stays lit."))
+            .unwrap();
+        let mut aliases = HashSet::new();
+        for n in 0..400 {
+            aliases.insert(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        let mut bare = HashSet::new();
+        for n in 0..40 {
+            bare.insert(
+                project
+                    .add_item(Kind::Text, &format!("Bare {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        rewrite_ids(&path, &aliases, &bare, &shared);
+        std::fs::write(
+            path.join("Files/Data/content.rtf"),
+            br"{\rtf1\ansi BAIT bait bait}",
+        )
+        .unwrap();
+        let project = Project::open(&path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let indexed = project.binder_index();
+        let alias_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let alias_parses = rtf::parses();
+        let rows = 401 + 40;
+        assert!(
+            alias_parses <= 1,
+            "{rows} rows parsed {alias_parses} times; one shared document"
+        );
+        assert!(
+            indexed.search.values().all(|text| !text.contains("bait")),
+            "an id-less row must not read Files/Data/content.rtf"
+        );
+        let found = indexed.search.get(&shared).unwrap();
+        assert!(found.contains("the lamp stays lit"), "{found}");
+        assert!(indexed.counts.get(&shared).copied().unwrap_or(0) > 0);
+        eprintln!(
+            "distinct docs=32 parses={distinct_parses} ms={distinct_ms:.1}; aliases={rows} parses={alias_parses} ms={alias_ms:.1}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(distinct_path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_row_with_no_id_is_not_a_document() {
+        let (path, mut project) = temp_project("noid");
+        let err = project
+            .set_text("", &RichText::from_plain("nope"))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "binder item has no id");
+        assert!(!path.join("Files/Data/content.rtf").exists());
+        let err = project
+            .set_notes("", &RichText::from_plain("nope"))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "binder item has no id");
+        let err = project.set_synopsis("", "nope").unwrap_err();
+        assert_eq!(err.to_string(), "binder item has no id");
+        std::fs::write(path.join("Files/Data/content.rtf"), br"{\rtf1 BAIT}").unwrap();
+        std::fs::write(path.join("Files/Data/synopsis.txt"), b"BAIT synopsis").unwrap();
+        rtf::reset_parses();
+        assert_eq!(project.text("").unwrap().plain_text(), "");
+        assert_eq!(project.notes("").unwrap().plain_text(), "");
+        assert_eq!(project.synopsis(""), "");
+        assert_eq!(rtf::parses(), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }
