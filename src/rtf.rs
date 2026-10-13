@@ -1495,7 +1495,7 @@ mod tests {
             if i % 2 == 0 {
                 src.push_str("\\b a\\b0 ");
             } else {
-                src.push_str("a");
+                src.push('a');
             }
         }
         src.push_str("}}}");
@@ -1526,10 +1526,10 @@ mod tests {
         let mut bytes = 0usize;
         for paragraph in &text.paragraphs {
             for run in &paragraph.runs {
-                if let Some(link) = &run.style.link {
-                    if seen.insert(link.as_ptr()) {
-                        bytes += link.len();
-                    }
+                if let Some(link) = &run.style.link
+                    && seen.insert(link.as_ptr())
+                {
+                    bytes += link.len();
                 }
             }
         }

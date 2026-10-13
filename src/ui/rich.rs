@@ -516,7 +516,7 @@ pub(crate) mod tests {
             if i % 2 == 0 {
                 src.push_str("\\b a\\b0 ");
             } else {
-                src.push_str("a");
+                src.push('a');
             }
         }
         src.push_str("}}}");
