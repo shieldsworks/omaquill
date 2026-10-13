@@ -68,9 +68,37 @@ fn open_element_mut(stack: &mut [Element]) -> &mut Element {
         .expect("parser stack is non-empty until the root element returns")
 }
 
+struct BangDecl {
+    opens_subset: bool,
+    gt: Option<usize>,
+    examined: usize,
+}
+
+fn bang_decl(rest: &str) -> BangDecl {
+    let Some(g) = rest.find('>') else {
+        return BangDecl {
+            opens_subset: false,
+            gt: None,
+            examined: rest.len(),
+        };
+    };
+    let bracket = rest[..g].find('[');
+    let bracket_walk = match bracket {
+        Some(i) => i + 1,
+        None => g,
+    };
+    BangDecl {
+        opens_subset: bracket.is_some(),
+        gt: Some(g),
+        examined: g + 1 + bracket_walk,
+    }
+}
+
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
+    /// Bytes walked by searches from the current position.
+    scanned: u64,
 }
 
 impl<'a> Parser<'a> {
@@ -85,8 +113,54 @@ impl<'a> Parser<'a> {
         &self.src[self.pos..]
     }
 
+    fn note(&mut self, n: usize) {
+        self.scanned += u64::try_from(n).expect("a byte length fits in u64");
+    }
+
+    /// How far a search that stopped at `at` walked. `at == rest.len()`
+    /// means the needle was absent and the whole suffix was walked.
+    fn note_boundary(&mut self, at: usize) {
+        let extra = if at < self.rest().len() {
+            self.rest()[at..]
+                .chars()
+                .next()
+                .expect("index from a str search is a char boundary")
+                .len_utf8()
+        } else {
+            0
+        };
+        let examined = if extra == 0 {
+            self.rest().len()
+        } else {
+            at + extra
+        };
+        self.note(examined);
+    }
+
+    fn find_char(&mut self, needle: char) -> Option<usize> {
+        let rest_len = self.rest().len();
+        let found = self.rest().find(needle);
+        let read = match found {
+            Some(i) => i + needle.len_utf8(),
+            None => rest_len,
+        };
+        self.note(read);
+        found
+    }
+
+    fn find_str(&mut self, needle: &str) -> Option<usize> {
+        let rest_len = self.rest().len();
+        let found = self.rest().find(needle);
+        let read = match found {
+            Some(i) => i + needle.len(),
+            None => rest_len,
+        };
+        self.note(read);
+        found
+    }
+
     fn take_until(&mut self, end: &str) -> Result<&'a str, Error> {
-        match self.rest().find(end) {
+        match self.find_str(end) {
             Some(i) => {
                 let s = &self.src[self.pos..self.pos + i + end.len()];
                 self.pos += i + end.len();
@@ -96,21 +170,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_ws(&mut self) {
+    /// Byte length of the leading whitespace. Counts the bytes the scan walks.
+    fn leading_ws(&mut self) -> usize {
         let n = self.rest().len() - self.rest().trim_start().len();
-        self.pos += n;
+        self.note_boundary(n);
+        n
+    }
+
+    fn skip_ws(&mut self) {
+        self.pos += self.leading_ws();
     }
 
     fn name(&mut self) -> Result<String, Error> {
-        let rest = self.rest();
-        let n = rest
+        let n = self
+            .rest()
             .find(|c: char| c.is_whitespace() || matches!(c, '/' | '>' | '='))
-            .unwrap_or(rest.len());
+            .unwrap_or(self.rest().len());
+        self.note_boundary(n);
         if n == 0 {
             return self.err("expected a name");
         }
+        let name = self.rest()[..n].to_string();
         self.pos += n;
-        Ok(rest[..n].to_string())
+        Ok(name)
     }
 
     /// Parses `<name attrs>` or `<name attrs/>`; `self.pos` is on the `<`.
@@ -154,7 +236,7 @@ impl<'a> Parser<'a> {
                 _ => return self.err("attribute value is not quoted"),
             };
             self.pos += 1;
-            let end = match self.rest().find(quote) {
+            let end = match self.find_char(quote) {
                 Some(i) => i,
                 None => return self.err("unterminated attribute value"),
             };
@@ -169,23 +251,28 @@ impl<'a> Parser<'a> {
     }
 
     fn misc(&mut self) -> Result<Option<Node>, Error> {
-        let rest = self.rest();
-        let raw = if rest.starts_with("<?") {
+        let raw = if self.rest().starts_with("<?") {
             self.take_until("?>")?
-        } else if rest.starts_with("<!--") {
+        } else if self.rest().starts_with("<!--") {
             self.take_until("-->")?
-        } else if rest.starts_with("<![CDATA[") {
+        } else if self.rest().starts_with("<![CDATA[") {
             self.take_until("]]>")?
-        } else if rest.starts_with("<!") {
+        } else if self.rest().starts_with("<!") {
             // A DOCTYPE's internal subset `[...]` can hold '>'.
-            match (rest.find('['), rest.find('>')) {
-                (Some(b), Some(g)) if b < g => {
-                    let start = self.pos;
-                    self.take_until("]")?;
-                    self.take_until(">")?;
-                    &self.src[start..self.pos]
-                }
-                _ => self.take_until(">")?,
+            let bang = bang_decl(self.rest());
+            self.note(bang.examined);
+            if bang.opens_subset {
+                let start = self.pos;
+                self.take_until("]")?;
+                self.take_until(">")?;
+                &self.src[start..self.pos]
+            } else if let Some(g) = bang.gt {
+                let end = self.pos + g + 1;
+                let raw = &self.src[self.pos..end];
+                self.pos = end;
+                raw
+            } else {
+                return self.err("unterminated, expected \">\"");
             }
         } else {
             return Ok(None);
@@ -200,14 +287,20 @@ impl<'a> Parser<'a> {
         }
         let mut stack = vec![first];
         loop {
-            let rest = self.rest();
-            if rest.is_empty() {
+            if self.rest().is_empty() {
                 let name = open_element(&stack).name.clone();
                 return self.err(format!("<{name}> is never closed"));
             }
-            if !rest.starts_with('<') {
-                let n = rest.find('<').unwrap_or(rest.len());
-                let text = rest[..n].to_string();
+            if !self.rest().starts_with('<') {
+                let (n, examined) = match self.rest().find('<') {
+                    Some(i) => (i, i + 1),
+                    None => {
+                        let n = self.rest().len();
+                        (n, n)
+                    }
+                };
+                self.note(examined);
+                let text = self.rest()[..n].to_string();
                 open_element_mut(&mut stack).children.push(Node::Text(text));
                 self.pos += n;
                 continue;
@@ -216,7 +309,7 @@ impl<'a> Parser<'a> {
                 open_element_mut(&mut stack).children.push(node);
                 continue;
             }
-            if rest.starts_with("</") {
+            if self.rest().starts_with("</") {
                 self.pos += 2;
                 let name = self.name()?;
                 self.skip_ws();
@@ -251,45 +344,59 @@ impl<'a> Parser<'a> {
 }
 
 pub fn parse(src: &str) -> Result<Document, Error> {
+    parse_scanned(src).0
+}
+
+fn parse_scanned(src: &str) -> (Result<Document, Error>, u64) {
     let bom = src.starts_with('\u{feff}');
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
-    let mut p = Parser { src, pos: 0 };
-    let mut prolog = Vec::new();
-    loop {
-        let rest = p.rest();
-        let ws = rest.len() - rest.trim_start().len();
-        if ws > 0 {
-            prolog.push(Node::Text(rest[..ws].to_string()));
-            p.pos += ws;
+    let mut p = Parser {
+        src,
+        pos: 0,
+        scanned: 0,
+    };
+    let result = p.finish(bom);
+    (result, p.scanned)
+}
+
+impl<'a> Parser<'a> {
+    fn finish(&mut self, bom: bool) -> Result<Document, Error> {
+        let mut prolog = Vec::new();
+        loop {
+            let ws = self.leading_ws();
+            if ws > 0 {
+                prolog.push(Node::Text(self.rest()[..ws].to_string()));
+                self.pos += ws;
+            }
+            match self.misc()? {
+                Some(node) => prolog.push(node),
+                None => break,
+            }
         }
-        match p.misc()? {
-            Some(node) => prolog.push(node),
-            None => break,
+        if !self.rest().starts_with('<') {
+            return self.err("no root element");
         }
+        let root = self.element()?;
+        let epilog = self.rest().to_string();
+        // Only whitespace, comments and processing instructions may follow.
+        loop {
+            self.skip_ws();
+            if self.rest().is_empty() {
+                break;
+            }
+            if self.rest().starts_with("<!--") || self.rest().starts_with("<?") {
+                self.misc()?;
+            } else {
+                return self.err("content after the root element");
+            }
+        }
+        Ok(Document {
+            prolog,
+            root,
+            epilog,
+            bom,
+        })
     }
-    if !p.rest().starts_with('<') {
-        return p.err("no root element");
-    }
-    let root = p.element()?;
-    let epilog = p.rest().to_string();
-    // Only whitespace, comments and processing instructions may follow.
-    loop {
-        p.skip_ws();
-        if p.rest().is_empty() {
-            break;
-        }
-        if p.rest().starts_with("<!--") || p.rest().starts_with("<?") {
-            p.misc()?;
-        } else {
-            return p.err("content after the root element");
-        }
-    }
-    Ok(Document {
-        prolog,
-        root,
-        epilog,
-        bom,
-    })
 }
 
 impl Document {
@@ -861,5 +968,275 @@ mod tests {
     fn unclosed_element_names_the_open_tag() {
         let err = parse("<chapter><scene>text").unwrap_err();
         assert_eq!(err.message, "<scene> is never closed");
+    }
+
+    fn bang_declarations(n: usize) -> (u64, u64) {
+        let mut xml = "<!x>".repeat(n);
+        xml.push_str("<r/>");
+        let (doc, scanned) = parse_scanned(&xml);
+        assert_eq!(doc.unwrap().to_xml(), xml);
+        (scanned, u64::try_from(xml.len()).unwrap())
+    }
+
+    /// Many short `<!x>` declarations and no `[` anywhere. Each declaration
+    /// used to search the whole remaining suffix for that bracket.
+    #[test]
+    fn bang_declarations_without_a_bracket_scan_linearly() {
+        let (small, _) = bang_declarations(1_000);
+        let (large, large_len) = bang_declarations(10_000);
+        let growth = large / small.max(1);
+        assert!(
+            large < small.saturating_mul(30),
+            "10x declarations walked {large} bytes after {small} ({growth}x), limit 30x"
+        );
+        let limit = large_len * 8;
+        assert!(
+            large <= limit,
+            "walked {large} bytes of a {large_len}-byte file, limit {limit}"
+        );
+    }
+
+    fn assert_linear_parse(label: &str, small: &str, large: &str) {
+        let cost = |xml: &str| {
+            let (doc, scanned) = parse_scanned(xml);
+            assert_eq!(doc.unwrap().to_xml(), xml, "{label}");
+            (scanned, u64::try_from(xml.len()).unwrap())
+        };
+        let (small_n, _) = cost(small);
+        let (large_n, large_len) = cost(large);
+        let growth = large_n / small_n.max(1);
+        assert!(
+            large_n < small_n.saturating_mul(30),
+            "{label}: 10x input walked {large_n} bytes after {small_n} ({growth}x), limit 30x"
+        );
+        let limit = large_len * 8;
+        assert!(
+            large_n <= limit,
+            "{label}: walked {large_n} bytes of a {large_len}-byte file, limit {limit}"
+        );
+    }
+
+    fn repeat_before_root(token: &str, n: usize) -> String {
+        let mut xml = token.repeat(n);
+        xml.push_str("<r/>");
+        xml
+    }
+
+    #[test]
+    fn prolog_constructs_scan_linearly() {
+        assert_linear_parse(
+            "doctype",
+            &repeat_before_root("<!DOCTYPE a>", 1_000),
+            &repeat_before_root("<!DOCTYPE a>", 10_000),
+        );
+        assert_linear_parse(
+            "doctype subset",
+            &repeat_before_root("<!DOCTYPE a [x]>", 1_000),
+            &repeat_before_root("<!DOCTYPE a [x]>", 10_000),
+        );
+        assert_linear_parse(
+            "comment",
+            &repeat_before_root("<!--x-->", 1_000),
+            &repeat_before_root("<!--x-->", 10_000),
+        );
+        assert_linear_parse(
+            "cdata",
+            &repeat_before_root("<![CDATA[x]]>", 1_000),
+            &repeat_before_root("<![CDATA[x]]>", 10_000),
+        );
+        assert_linear_parse(
+            "pi",
+            &repeat_before_root("<?x?>", 1_000),
+            &repeat_before_root("<?x?>", 10_000),
+        );
+        let elements = |n: usize| {
+            let mut xml = String::from("<r>");
+            xml.push_str(&"<a/>".repeat(n));
+            xml.push_str("</r>");
+            xml
+        };
+        assert_linear_parse("empty elements", &elements(1_000), &elements(10_000));
+        assert_linear_parse(
+            "text",
+            &format!("<r>{}</r>", "x".repeat(1_000)),
+            &format!("<r>{}</r>", "x".repeat(10_000)),
+        );
+        assert_linear_parse(
+            "entities",
+            &format!("<r>{}</r>", "&amp;".repeat(1_000)),
+            &format!("<r>{}</r>", "&amp;".repeat(10_000)),
+        );
+    }
+
+    #[test]
+    fn scrivx_shapes_round_trip_byte_for_byte() {
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/Lighthouse.scriv/Lighthouse.scrivx"
+        ))
+        .unwrap();
+        assert_eq!(parse(&fixture).unwrap().to_xml(), fixture);
+
+        let shapes = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE ScrivenerProject [<!ENTITY e \"quoted &amp; text\">]>\n\
+<!-- keep -->\n\
+<?omaquill note?>\n\
+<ScrivenerProject>\n\
+    <Title>Fish &amp; Chips</Title>\n\
+    <Style><![CDATA[{\\rtf1 hi}]]></Style>\n\
+    <Note>a &lt; b &gt; c &quot;d&quot; &apos;e&apos;</Note>\n\
+</ScrivenerProject>\n";
+        let doc = parse(shapes).unwrap();
+        assert_eq!(doc.to_xml(), shapes);
+        assert_eq!(
+            parse("<!DOCTYPE").unwrap_err().message,
+            "unterminated, expected \">\""
+        );
+        assert_eq!(
+            doc.root.child_text("Title").as_deref(),
+            Some("Fish & Chips")
+        );
+        assert_eq!(
+            doc.root.child_text("Note").as_deref(),
+            Some("a < b > c \"d\" 'e'")
+        );
+        assert_eq!(doc.root.child_text("Style").as_deref(), Some("{\\rtf1 hi}"));
+    }
+
+    fn legacy_bracket_before_gt(rest: &str) -> bool {
+        matches!(
+            (rest.find('['), rest.find('>')),
+            (Some(b), Some(g)) if b < g
+        )
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn bang_decl_matches_the_old_bracket_search() {
+        let mut state = 0xA5A5_1234_F00D_7788u64;
+        for _ in 0..5_000 {
+            let len = (xorshift(&mut state) as usize) % 48;
+            let mut body = String::new();
+            for _ in 0..len {
+                let b = (xorshift(&mut state) % 95) as u8 + 32;
+                body.push(b as char);
+            }
+            if xorshift(&mut state).is_multiple_of(3) {
+                body.push('[');
+            }
+            if xorshift(&mut state).is_multiple_of(3) {
+                body.push('>');
+            }
+            if xorshift(&mut state).is_multiple_of(5) {
+                body.push('<');
+            }
+            let src = format!("<!{body}");
+            assert_eq!(
+                bang_decl(&src).opens_subset,
+                legacy_bracket_before_gt(&src),
+                "{src:?}"
+            );
+            let doc_src = format!("{src}<r/>");
+            assert_eq!(
+                bang_decl(&doc_src).opens_subset,
+                legacy_bracket_before_gt(&doc_src),
+                "{doc_src:?}"
+            );
+            if let Ok(doc) = parse(&doc_src) {
+                assert_eq!(doc.to_xml(), doc_src, "{doc_src:?}");
+            }
+        }
+
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        for _ in 0..2_000 {
+            let mut src = String::from("<?xml version=\"1.0\"?>");
+            let pieces = (xorshift(&mut state) % 6) as usize;
+            for _ in 0..pieces {
+                let piece = match xorshift(&mut state) % 6 {
+                    0 => "<!--x-->",
+                    1 => "<![CDATA[z]]>",
+                    2 => "<?pi?>",
+                    3 => "<!x>",
+                    4 => "<!DOCTYPE a [b]>",
+                    _ => "<!DOCTYPE a>",
+                };
+                src.push_str(piece);
+            }
+            src.push_str("<r>");
+            let texts = (xorshift(&mut state) % 8) as usize;
+            for _ in 0..texts {
+                let piece = match xorshift(&mut state) % 4 {
+                    0 => "Fish &amp; Chips",
+                    1 => "a&lt;b",
+                    2 => "x",
+                    _ => "<e/>",
+                };
+                src.push_str(piece);
+            }
+            src.push_str("</r>");
+            assert_eq!(parse(&src).unwrap().to_xml(), src);
+        }
+    }
+
+    #[test]
+    #[ignore = "one million tokens of each construct"]
+    fn million_token_constructs_stay_linear() {
+        let n = 1_000_000;
+        let cases = [
+            ("bang", {
+                let mut xml = "<!x>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("doctype", {
+                let mut xml = "<!DOCTYPE a>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("doctype subset", {
+                let mut xml = "<!DOCTYPE a [x]>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("comment", {
+                let mut xml = "<!--x-->".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("cdata", {
+                let mut xml = "<![CDATA[x]]>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("pi", {
+                let mut xml = "<?x?>".repeat(n);
+                xml.push_str("<r/>");
+                xml
+            }),
+            ("elements", format!("<r>{}</r>", "<a/>".repeat(n))),
+            ("text", format!("<r>{}</r>", "x".repeat(n))),
+            ("entities", format!("<r>{}</r>", "&amp;".repeat(n))),
+        ];
+        for (label, xml) in cases {
+            let len = u64::try_from(xml.len()).unwrap();
+            let started = std::time::Instant::now();
+            let (doc, scanned) = parse_scanned(&xml);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(doc.unwrap().to_xml(), xml, "{label}");
+            let limit = len * 8;
+            assert!(
+                scanned <= limit,
+                "{label} walked {scanned} of {len}, limit {limit}"
+            );
+            eprintln!("{label} len={len} scanned={scanned} ms={ms:.1}");
+        }
     }
 }
