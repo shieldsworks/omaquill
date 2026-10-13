@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 thread_local! {
     static STYLE_VISITS: Cell<u64> = const { Cell::new(0) };
     static EMIT_VISITS: Cell<u64> = const { Cell::new(0) };
+    static SLICE_VISITS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn note_visits(n: usize) {
@@ -34,6 +35,23 @@ fn reset_emit_visits() {
 #[cfg(test)]
 fn emit_visits() -> u64 {
     EMIT_VISITS.with(|visits| visits.get())
+}
+
+fn note_slice(n: usize) {
+    #[cfg(test)]
+    SLICE_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_slice_visits() {
+    SLICE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn slice_visits() -> u64 {
+    SLICE_VISITS.with(|visits| visits.get())
 }
 
 #[cfg(test)]
@@ -667,12 +685,13 @@ pub fn apply_at(
     for group in &preview.groups {
         let current = read_field(project, group.id()).map_err(ApplyError::Read)?;
         let plain = current.plain_text();
+        let mut place = PlainCursor::default();
         let mut edits = Vec::new();
         for row in group.rows() {
             if !chosen.contains(&row.id()) {
                 continue;
             }
-            match plain_slice(&plain, row.edit().range()) {
+            match plain_slice(&plain, &mut place, row.edit().range()) {
                 Some(slice) if slice == row.edit().matched() => edits.push(row.edit().clone()),
                 _ => missed += 1,
             }
@@ -1228,12 +1247,31 @@ fn edits_of(found: &[Found]) -> Vec<Edit> {
         .collect()
 }
 
-fn plain_slice(plain: &str, range: CharRange) -> Option<String> {
-    let slice: String = plain
-        .chars()
-        .skip(range.start())
-        .take(range.len())
-        .collect();
+#[derive(Default)]
+struct PlainCursor {
+    chars: usize,
+    byte: usize,
+}
+
+fn plain_slice(plain: &str, cursor: &mut PlainCursor, range: CharRange) -> Option<String> {
+    if range.start() < cursor.chars || cursor.byte > plain.len() {
+        cursor.chars = 0;
+        cursor.byte = 0;
+    }
+    while cursor.chars < range.start() {
+        let ch = plain[cursor.byte..].chars().next()?;
+        cursor.byte += ch.len_utf8();
+        cursor.chars += 1;
+        note_slice(1);
+    }
+    let from = cursor.byte;
+    while cursor.chars < range.end() {
+        let ch = plain[cursor.byte..].chars().next()?;
+        cursor.byte += ch.len_utf8();
+        cursor.chars += 1;
+        note_slice(1);
+    }
+    let slice = plain[from..cursor.byte].to_string();
     (slice.chars().count() == range.len()).then_some(slice)
 }
 
@@ -1769,5 +1807,27 @@ mod tests {
             "visited {visits} of {chars}"
         );
         eprintln!("render visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn chosen_matches_are_sliced_from_a_carried_offset() {
+        let n = 4_000usize;
+        let plain = "ab ".repeat(n);
+        let mut place = PlainCursor::default();
+        reset_slice_visits();
+        let started = std::time::Instant::now();
+        for i in 0..n {
+            let start = i * 3;
+            let range = CharRange::try_bounds(start, start + 1).unwrap();
+            assert_eq!(plain_slice(&plain, &mut place, range).as_deref(), Some("a"));
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let visits = slice_visits();
+        let chars = u64::try_from(plain.chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("slice visits={visits} chars={chars} ms={ms:.1}");
     }
 }
