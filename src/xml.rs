@@ -71,6 +71,8 @@ fn open_element_mut(stack: &mut [Element]) -> &mut Element {
 struct Parser<'a> {
     src: &'a str,
     pos: usize,
+    /// Bytes walked by searches from the current position.
+    scanned: u64,
 }
 
 impl<'a> Parser<'a> {
@@ -85,8 +87,54 @@ impl<'a> Parser<'a> {
         &self.src[self.pos..]
     }
 
+    fn note(&mut self, n: usize) {
+        self.scanned += u64::try_from(n).expect("a byte length fits in u64");
+    }
+
+    /// How far a search that stopped at `at` walked. `at == rest.len()`
+    /// means the needle was absent and the whole suffix was walked.
+    fn note_boundary(&mut self, at: usize) {
+        let extra = if at < self.rest().len() {
+            self.rest()[at..]
+                .chars()
+                .next()
+                .expect("index from a str search is a char boundary")
+                .len_utf8()
+        } else {
+            0
+        };
+        let examined = if extra == 0 {
+            self.rest().len()
+        } else {
+            at + extra
+        };
+        self.note(examined);
+    }
+
+    fn find_char(&mut self, needle: char) -> Option<usize> {
+        let rest_len = self.rest().len();
+        let found = self.rest().find(needle);
+        let read = match found {
+            Some(i) => i + needle.len_utf8(),
+            None => rest_len,
+        };
+        self.note(read);
+        found
+    }
+
+    fn find_str(&mut self, needle: &str) -> Option<usize> {
+        let rest_len = self.rest().len();
+        let found = self.rest().find(needle);
+        let read = match found {
+            Some(i) => i + needle.len(),
+            None => rest_len,
+        };
+        self.note(read);
+        found
+    }
+
     fn take_until(&mut self, end: &str) -> Result<&'a str, Error> {
-        match self.rest().find(end) {
+        match self.find_str(end) {
             Some(i) => {
                 let s = &self.src[self.pos..self.pos + i + end.len()];
                 self.pos += i + end.len();
@@ -96,21 +144,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_ws(&mut self) {
+    /// Byte length of the leading whitespace. Counts the bytes the scan walks.
+    fn leading_ws(&mut self) -> usize {
         let n = self.rest().len() - self.rest().trim_start().len();
-        self.pos += n;
+        self.note_boundary(n);
+        n
+    }
+
+    fn skip_ws(&mut self) {
+        self.pos += self.leading_ws();
     }
 
     fn name(&mut self) -> Result<String, Error> {
-        let rest = self.rest();
-        let n = rest
+        let n = self
+            .rest()
             .find(|c: char| c.is_whitespace() || matches!(c, '/' | '>' | '='))
-            .unwrap_or(rest.len());
+            .unwrap_or(self.rest().len());
+        self.note_boundary(n);
         if n == 0 {
             return self.err("expected a name");
         }
+        let name = self.rest()[..n].to_string();
         self.pos += n;
-        Ok(rest[..n].to_string())
+        Ok(name)
     }
 
     /// Parses `<name attrs>` or `<name attrs/>`; `self.pos` is on the `<`.
@@ -154,7 +210,7 @@ impl<'a> Parser<'a> {
                 _ => return self.err("attribute value is not quoted"),
             };
             self.pos += 1;
-            let end = match self.rest().find(quote) {
+            let end = match self.find_char(quote) {
                 Some(i) => i,
                 None => return self.err("unterminated attribute value"),
             };
@@ -169,16 +225,17 @@ impl<'a> Parser<'a> {
     }
 
     fn misc(&mut self) -> Result<Option<Node>, Error> {
-        let rest = self.rest();
-        let raw = if rest.starts_with("<?") {
+        let raw = if self.rest().starts_with("<?") {
             self.take_until("?>")?
-        } else if rest.starts_with("<!--") {
+        } else if self.rest().starts_with("<!--") {
             self.take_until("-->")?
-        } else if rest.starts_with("<![CDATA[") {
+        } else if self.rest().starts_with("<![CDATA[") {
             self.take_until("]]>")?
-        } else if rest.starts_with("<!") {
+        } else if self.rest().starts_with("<!") {
             // A DOCTYPE's internal subset `[...]` can hold '>'.
-            match (rest.find('['), rest.find('>')) {
+            let b = self.find_char('[');
+            let g = self.find_char('>');
+            match (b, g) {
                 (Some(b), Some(g)) if b < g => {
                     let start = self.pos;
                     self.take_until("]")?;
@@ -200,14 +257,20 @@ impl<'a> Parser<'a> {
         }
         let mut stack = vec![first];
         loop {
-            let rest = self.rest();
-            if rest.is_empty() {
+            if self.rest().is_empty() {
                 let name = open_element(&stack).name.clone();
                 return self.err(format!("<{name}> is never closed"));
             }
-            if !rest.starts_with('<') {
-                let n = rest.find('<').unwrap_or(rest.len());
-                let text = rest[..n].to_string();
+            if !self.rest().starts_with('<') {
+                let (n, examined) = match self.rest().find('<') {
+                    Some(i) => (i, i + 1),
+                    None => {
+                        let n = self.rest().len();
+                        (n, n)
+                    }
+                };
+                self.note(examined);
+                let text = self.rest()[..n].to_string();
                 open_element_mut(&mut stack).children.push(Node::Text(text));
                 self.pos += n;
                 continue;
@@ -216,7 +279,7 @@ impl<'a> Parser<'a> {
                 open_element_mut(&mut stack).children.push(node);
                 continue;
             }
-            if rest.starts_with("</") {
+            if self.rest().starts_with("</") {
                 self.pos += 2;
                 let name = self.name()?;
                 self.skip_ws();
@@ -251,45 +314,59 @@ impl<'a> Parser<'a> {
 }
 
 pub fn parse(src: &str) -> Result<Document, Error> {
+    parse_scanned(src).0
+}
+
+fn parse_scanned(src: &str) -> (Result<Document, Error>, u64) {
     let bom = src.starts_with('\u{feff}');
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
-    let mut p = Parser { src, pos: 0 };
-    let mut prolog = Vec::new();
-    loop {
-        let rest = p.rest();
-        let ws = rest.len() - rest.trim_start().len();
-        if ws > 0 {
-            prolog.push(Node::Text(rest[..ws].to_string()));
-            p.pos += ws;
+    let mut p = Parser {
+        src,
+        pos: 0,
+        scanned: 0,
+    };
+    let result = p.finish(bom);
+    (result, p.scanned)
+}
+
+impl<'a> Parser<'a> {
+    fn finish(&mut self, bom: bool) -> Result<Document, Error> {
+        let mut prolog = Vec::new();
+        loop {
+            let ws = self.leading_ws();
+            if ws > 0 {
+                prolog.push(Node::Text(self.rest()[..ws].to_string()));
+                self.pos += ws;
+            }
+            match self.misc()? {
+                Some(node) => prolog.push(node),
+                None => break,
+            }
         }
-        match p.misc()? {
-            Some(node) => prolog.push(node),
-            None => break,
+        if !self.rest().starts_with('<') {
+            return self.err("no root element");
         }
+        let root = self.element()?;
+        let epilog = self.rest().to_string();
+        // Only whitespace, comments and processing instructions may follow.
+        loop {
+            self.skip_ws();
+            if self.rest().is_empty() {
+                break;
+            }
+            if self.rest().starts_with("<!--") || self.rest().starts_with("<?") {
+                self.misc()?;
+            } else {
+                return self.err("content after the root element");
+            }
+        }
+        Ok(Document {
+            prolog,
+            root,
+            epilog,
+            bom,
+        })
     }
-    if !p.rest().starts_with('<') {
-        return p.err("no root element");
-    }
-    let root = p.element()?;
-    let epilog = p.rest().to_string();
-    // Only whitespace, comments and processing instructions may follow.
-    loop {
-        p.skip_ws();
-        if p.rest().is_empty() {
-            break;
-        }
-        if p.rest().starts_with("<!--") || p.rest().starts_with("<?") {
-            p.misc()?;
-        } else {
-            return p.err("content after the root element");
-        }
-    }
-    Ok(Document {
-        prolog,
-        root,
-        epilog,
-        bom,
-    })
 }
 
 impl Document {
@@ -861,5 +938,31 @@ mod tests {
     fn unclosed_element_names_the_open_tag() {
         let err = parse("<chapter><scene>text").unwrap_err();
         assert_eq!(err.message, "<scene> is never closed");
+    }
+
+    fn bang_declarations(n: usize) -> (u64, u64) {
+        let mut xml = "<!x>".repeat(n);
+        xml.push_str("<r/>");
+        let (doc, scanned) = parse_scanned(&xml);
+        assert_eq!(doc.unwrap().to_xml(), xml);
+        (scanned, u64::try_from(xml.len()).unwrap())
+    }
+
+    /// Many short `<!x>` declarations and no `[` anywhere. Each declaration
+    /// used to search the whole remaining suffix for that bracket.
+    #[test]
+    fn bang_declarations_without_a_bracket_scan_linearly() {
+        let (small, _) = bang_declarations(1_000);
+        let (large, large_len) = bang_declarations(10_000);
+        let growth = large / small.max(1);
+        assert!(
+            large < small.saturating_mul(30),
+            "10x declarations walked {large} bytes after {small} ({growth}x), limit 30x"
+        );
+        let limit = large_len * 8;
+        assert!(
+            large <= limit,
+            "walked {large} bytes of a {large_len}-byte file, limit {limit}"
+        );
     }
 }
