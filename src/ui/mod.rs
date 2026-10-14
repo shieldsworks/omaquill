@@ -1985,6 +1985,208 @@ fn a_long_line_names_the_line() {
 }
 
 #[cfg(test)]
+fn menu_labels(view: &gtk::TextView) -> Vec<String> {
+    let Some(model) = view.extra_menu() else {
+        return Vec::new();
+    };
+    let Ok(menu) = model.downcast::<gio::Menu>() else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    for i in 0..menu.n_items() {
+        if let Some(label) = menu
+            .item_attribute_value(i, gio::MENU_ATTRIBUTE_LABEL, None)
+            .and_then(|value| value.get::<String>())
+        {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+#[cfg(test)]
+fn pump_layout(win: &Win) {
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..60 {
+        if win.window.is_mapped()
+            && win
+                .editor
+                .view
+                .iter_location(&win.editor.buffer.start_iter())
+                .height()
+                > 0
+        {
+            return;
+        }
+        if !context.iteration(true) {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+fn click_on(view: &gtk::TextView, at: &gtk::TextIter) -> (f64, f64) {
+    let loc = view.iter_location(at);
+    assert!(loc.height() > 0, "the word was not on screen");
+    let (x, y) = view.buffer_to_window_coords(
+        gtk::TextWindowType::Widget,
+        loc.x() + 1,
+        loc.y() + loc.height() / 2,
+    );
+    (f64::from(x), f64::from(y))
+}
+
+#[cfg(test)]
+fn a_held_suggestion_does_not_reach_the_file() {
+    let dir = std::env::temp_dir().join(format!("omaquill-suggest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Suggest.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
+    project
+        .set_text(&short, &rtf::RichText::from_plain("helo storm"))
+        .unwrap();
+    let held = project.add_item(Kind::Text, "Held", &draft, None).unwrap();
+    project
+        .set_text(
+            &held,
+            &rtf::RichText::from_plain(&format!("helo {}", "a".repeat(10_000))),
+        )
+        .unwrap();
+    project.save().unwrap();
+    let held_rtf = project.data_dir(&held).join("content.rtf");
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Suggest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.window.present();
+    pump_layout(&win);
+    if win.spell.has_dictionary() {
+        win.select(&short);
+        pump_layout(&win);
+        let at = win.editor.buffer.iter_at_offset(2);
+        let (x, y) = click_on(&win.editor.view, &at);
+        win.spell.prepare_click(x, y);
+        let labels = menu_labels(&win.editor.view);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case("hello")),
+            "a right-click on helo installed no suggestion: {labels:?}"
+        );
+        assert!(
+            win.editor.view.activate_action("spell.s0", None).is_ok(),
+            "the short document's suggestion could not be activated"
+        );
+    } else {
+        eprintln!("no spelling dictionary; the held click is still checked");
+    }
+    win.select(&held);
+    pump_layout(&win);
+    assert!(win.editor.is_too_formatted());
+    assert!(!win.editor.view.is_editable());
+    let before = std::fs::read(&held_rtf).unwrap();
+    let at = win.editor.buffer.iter_at_offset(2);
+    let (x, y) = click_on(&win.editor.view, &at);
+    win.spell.prepare_click(x, y);
+    let labels = menu_labels(&win.editor.view);
+    assert!(
+        labels.is_empty(),
+        "a held document offered suggestions: {labels:?}"
+    );
+    assert!(win.editor.view.extra_menu().is_none());
+    assert!(
+        win.editor.view.activate_action("spell.s0", None).is_err(),
+        "a held document ran a suggestion"
+    );
+    assert!(win.save_now());
+    assert_eq!(
+        std::fs::read(&held_rtf).unwrap(),
+        before,
+        "a suggestion click wrote the held file"
+    );
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+fn a_failed_open_keeps_the_typed_text() {
+    let dir = std::env::temp_dir().join(format!("omaquill-typed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Typed.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let note = project.add_item(Kind::Text, "Note", &draft, None).unwrap();
+    project
+        .set_text(&note, &rtf::RichText::from_plain("Hello"))
+        .unwrap();
+    let bad = project
+        .add_item(Kind::Text, "Broken", &draft, None)
+        .unwrap();
+    project
+        .set_text(&bad, &rtf::RichText::from_plain("retry me"))
+        .unwrap();
+    project.save().unwrap();
+    let note_rtf = project.data_dir(&note).join("content.rtf");
+    let rtf_path = project.data_dir(&bad).join("content.rtf");
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Typed")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.window.present();
+    pump_layout(&win);
+    win.select(&note);
+    pump_layout(&win);
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "Hello");
+    let mut end = win.editor.buffer.end_iter();
+    win.editor.buffer.insert(&mut end, " there");
+    assert_eq!(win.editor.plain_text(), "Hello there");
+    assert!(
+        win.dirty_text.get(),
+        "typing did not mark the document dirty"
+    );
+    std::fs::remove_file(&rtf_path).unwrap();
+    std::fs::create_dir(&rtf_path).unwrap();
+    win.select(&bad);
+    assert!(win.window.is_mapped());
+    assert_eq!(win.stack.visible_child_name().as_deref(), Some("editor"));
+    assert_eq!(win.current.borrow().as_deref(), Some(note.as_str()));
+    assert_eq!(win.editor_uuid.borrow().as_deref(), Some(note.as_str()));
+    assert_eq!(win.title.subtitle().as_str(), "Note");
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "Hello there");
+    let (start, end) = win.editor.buffer.bounds();
+    assert_eq!(
+        win.editor.buffer.text(&start, &end, false).as_str(),
+        "Hello there"
+    );
+    let bytes = std::fs::read(&note_rtf).unwrap();
+    assert!(
+        bytes
+            .windows(b"Hello there".len())
+            .any(|window| window == b"Hello there"),
+        "the typed text was not in the original file"
+    );
+    let told = win.last_toast.borrow().clone();
+    assert!(
+        told.contains("Couldn't read") && told.contains("Broken"),
+        "the error was not shown: {told}"
+    );
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
 fn a_failed_open_can_be_retried() {
     let dir = std::env::temp_dir().join(format!("omaquill-retry-win-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2073,15 +2275,6 @@ fn a_failed_open_can_be_retried() {
         "the error was not shown: {told}"
     );
     assert_eq!(win.banner.title().as_str(), LENGTH_NOTE);
-    win.dirty_text.set(true);
-    assert!(win.save_now());
-    assert_eq!(
-        std::fs::read(&long_rtf).unwrap(),
-        long_bytes,
-        "save_now replaced the held file after the failed open"
-    );
-    let (start, end) = win.editor.buffer.bounds();
-    assert_eq!(win.editor.buffer.text(&start, &end, false).as_str(), shown);
     std::fs::remove_dir(&rtf_path).unwrap();
     std::fs::write(&rtf_path, &bytes).unwrap();
     win.select(&bad);
@@ -2125,6 +2318,8 @@ fn gtk_checks() {
     editor::tests::find_in_a_long_held_line_reaches_the_tail();
     editor::tests::find_across_a_held_page_edge_selects_the_whole_match();
     editor::tests::find_of_a_long_needle_starts_at_the_match();
+    editor::tests::find_next_on_a_long_needle_reaches_the_second_match();
+    editor::tests::find_next_on_the_only_long_needle_wraps();
     editor::tests::select_all_copies_the_held_document();
     editor::tests::a_zero_width_space_survives_edit_and_replace();
     editor::tests::switching_mid_paint_leaves_the_new_document();
@@ -2150,8 +2345,9 @@ fn gtk_checks() {
     spell::tests::leaving_the_word_by_a_jump_marks_it();
     spell::tests::a_paste_marks_every_new_word();
     spell::tests::suggestions_share_the_text_view_menu();
-    spell::tests::a_suggestion_does_not_change_a_held_document();
+    a_held_suggestion_does_not_reach_the_file();
     spell::tests::a_held_document_is_not_spellchecked();
+    a_failed_open_keeps_the_typed_text();
     a_failed_open_can_be_retried();
     spell::tests::a_keystroke_ahead_of_the_scan_does_not_skip();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();

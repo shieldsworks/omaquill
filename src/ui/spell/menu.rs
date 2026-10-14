@@ -8,7 +8,7 @@ use std::rc::Rc;
 use super::{Session, byte_between, chars_before, replace_word, widget_coord};
 
 impl Session {
-    pub(super) fn prepare_click(&self, x: f64, y: f64) {
+    pub(crate) fn prepare_click(&self, x: f64, y: f64) {
         let (bx, by) = self.editor.view.window_to_buffer_coords(
             gtk::TextWindowType::Widget,
             widget_coord(x),

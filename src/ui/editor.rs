@@ -2338,6 +2338,98 @@ next}";
         window.close();
     }
 
+    pub(crate) fn find_next_on_a_long_needle_reaches_the_second_match() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        show_window(&window);
+        let needle = "N".repeat(HELD_WINDOW + 50);
+        let first = HELD_WINDOW - 2;
+        let second = first + needle.chars().count();
+        let mut body = "a".repeat(first);
+        body.push_str(&needle);
+        body.push_str(&needle);
+        body.push_str(&"b".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        assert!(ed.held_bar.is_visible());
+        ed.search_entry.set_text(&needle);
+        ed.find(true);
+        assert_eq!(ed.held_origin.get(), first);
+        assert!(!ed.search_entry.has_css_class("error"));
+        ed.find(true);
+        assert_eq!(
+            ed.held_origin.get(),
+            second,
+            "Find Next stayed inside the first match"
+        );
+        let bar = ed.held_bar.adjustment().value();
+        assert!(
+            (bar - second as f64).abs() < f64::EPSILON,
+            "the scrollbar stayed at {bar}, not the second match at {second}"
+        );
+        assert!(!ed.search_entry.has_css_class("error"));
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        let shown = ed.buffer.text(&buf_start, &buf_end, false);
+        assert!(
+            shown.chars().all(|c| c == 'N'),
+            "the second match was not on screen: {shown}"
+        );
+        window.close();
+    }
+
+    pub(crate) fn find_next_on_the_only_long_needle_wraps() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        show_window(&window);
+        let needle = "N".repeat(HELD_WINDOW + 50);
+        let at = HELD_WINDOW - 2;
+        let mut body = "a".repeat(at);
+        body.push_str(&needle);
+        body.push_str(&"b".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        assert!(ed.held_bar.is_visible());
+        ed.search_entry.set_text(&needle);
+        ed.find(true);
+        assert_eq!(ed.held_origin.get(), at);
+        assert!(!ed.search_entry.has_css_class("error"));
+        ed.find(true);
+        assert_eq!(
+            ed.held_origin.get(),
+            at,
+            "the only match moved instead of wrapping"
+        );
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("the wrap cleared the only match");
+        let selected = ed.buffer.text(&start, &end, false);
+        assert!(
+            selected.chars().all(|c| c == 'N') && selected.chars().count() == HELD_WINDOW,
+            "the wrap dropped the match: {selected}"
+        );
+        assert!(
+            ed.search_entry.has_css_class("error"),
+            "the only long match wrapped onto itself with no mark on the search entry"
+        );
+        ed.load(RichText::from_plain("one unique word"));
+        assert!(!ed.held_bar.is_visible());
+        ed.search_entry.set_text("unique");
+        ed.find(true);
+        ed.find(true);
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("Find Next cleared the only word");
+        assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "unique");
+        assert!(
+            ed.search_entry.has_css_class("error"),
+            "Find Next on the only word wrapped with no mark on the search entry"
+        );
+        window.close();
+    }
     /// Select All copies the held document from the model. The buffer is
     /// one window. A selection made by hand copies that selection.
     pub(crate) fn select_all_copies_the_held_document() {

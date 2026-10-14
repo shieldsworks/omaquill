@@ -827,37 +827,6 @@ pub(crate) mod tests {
         assert!(labels.iter().any(|label| label == "Ignore"));
     }
 
-    pub(crate) fn a_suggestion_does_not_change_a_held_document() {
-        let editor = Editor::new(true);
-        let window = gtk::Window::new();
-        window.set_default_size(800, 600);
-        window.set_child(Some(&editor.root));
-        window.present();
-        let body = format!("helo {}", "a".repeat(10_000));
-        editor.load(omaquill::rtf::RichText::from_plain(&body));
-        assert!(editor.is_too_formatted());
-        let (start, end) = editor.buffer.bounds();
-        let shown = editor.buffer.text(&start, &end, false).to_string();
-        assert!(shown.starts_with("helo "));
-        assert_eq!(shown.chars().count(), 200);
-        let model = editor.plain_text();
-        assert!(model.contains("helo"));
-        let session = Session::new(&editor, &Settings::default());
-        let inside = editor.buffer.iter_at_offset(2);
-        assert!(!session.prepare_at(&inside));
-        assert!(editor.view.extra_menu().is_none());
-        replace_word(&editor, 0, 4, "hello");
-        let (start, end) = editor.buffer.bounds();
-        assert_eq!(
-            editor.buffer.text(&start, &end, false).as_str(),
-            shown,
-            "a suggestion rewrote the held window"
-        );
-        assert_eq!(editor.plain_text(), model);
-        assert_eq!(editor.text().plain_text(), model);
-        window.close();
-    }
-
     /// A held document is not spellchecked. The buffer is one window of the
     /// file, so a mark or Add would keep a fragment cut at that edge. The
     /// scan paints nothing, the text menu has no suggestion, Add, or Ignore,
