@@ -260,25 +260,26 @@ fn paragraph_trimmed_chars(par: &rtf::Paragraph) -> usize {
 /// The character style that covers the most characters. A tie keeps the
 /// earlier style. A short lead-in is not the result when a later run is longer.
 fn dominant_char_style(par: &rtf::Paragraph) -> rtf::CharStyle {
-    let mut totals: Vec<(rtf::CharStyle, usize)> = Vec::new();
+    let mut totals: Vec<(&rtf::CharStyle, usize)> = Vec::new();
+    let mut slots: HashMap<&rtf::CharStyle, usize> = HashMap::new();
     for run in &par.runs {
         let n = run.text.chars().count();
         if n == 0 {
             continue;
         }
-        if let Some((_, total)) = totals.iter_mut().find(|(style, _)| style == &run.style) {
-            *total += n;
-        } else {
-            totals.push((run.style.clone(), n));
-        }
+        let slot = *slots.entry(&run.style).or_insert_with(|| {
+            totals.push((&run.style, 0));
+            totals.len() - 1
+        });
+        totals[slot].1 += n;
     }
-    let mut best: Option<(rtf::CharStyle, usize)> = None;
+    let mut best: Option<(&rtf::CharStyle, usize)> = None;
     for (style, n) in totals {
-        if best.as_ref().is_none_or(|pair| n > pair.1) {
+        if best.is_none_or(|pair| n > pair.1) {
             best = Some((style, n));
         }
     }
-    best.map(|(style, _)| style).unwrap_or_default()
+    best.map(|(style, _)| style.clone()).unwrap_or_default()
 }
 
 /// Word counts and lowercase search text, one entry per binder id.
@@ -2227,6 +2228,59 @@ mod tests {
         assert_eq!(style.0.align, rtf::Align::Center);
         assert!(style.1.italic);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_is_linear_in_distinct_runs() {
+        let mut paragraph = rtf::Paragraph::default();
+        for i in 0..100_000 {
+            paragraph.runs.push(rtf::Run {
+                text: "x".into(),
+                style: rtf::CharStyle {
+                    font: Some(format!("Face{i}")),
+                    ..rtf::CharStyle::default()
+                },
+            });
+        }
+        let text = RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        let (body_path, mut project) = temp_project("style-distinct-body");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Runs", &draft, None).unwrap();
+        project.set_text(&scene, &text).unwrap();
+        project.save().unwrap();
+        let project = Project::open(&body_path).unwrap();
+        let started = std::time::Instant::now();
+        let style = project
+            .default_style()
+            .expect("a 100,000-character paragraph");
+        let body_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(style.1.font.as_deref(), Some("Face0"));
+
+        let (prefs_path, project) = temp_project("style-distinct-prefs");
+        let hex: String = rtf::write(&text)
+            .bytes()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        std::fs::create_dir_all(prefs_path.join("Settings")).unwrap();
+        std::fs::write(
+            prefs_path.join("Settings/projectpreferences.xml"),
+            format!(
+                "<Preferences><UseProjectPreferences>Yes</UseProjectPreferences>\
+                 <TextFormatRTFData>{hex}</TextFormatRTFData></Preferences>"
+            ),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let style = project.default_style().expect("the preferences paragraph");
+        let prefs_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(style.1.font.as_deref(), Some("Face0"));
+        eprintln!("100,000 distinct runs: body ms={body_ms:.1}; preferences ms={prefs_ms:.1}");
+        assert!(body_ms < 5_000.0 && prefs_ms < 5_000.0);
+        let _ = std::fs::remove_dir_all(body_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(prefs_path.parent().unwrap());
     }
 
     #[test]
