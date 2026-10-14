@@ -39,6 +39,26 @@ bash .cursor/skills/verify-omaquill/drive-find-replace.sh
 - **Second view.** Quit with `Ctrl+Q`. Run `omaquill check` on the copy. Exit code 0, and stdout still contains `62 words` and `every document reads fully`. Replacing `lamp` with `lantern` does not change the word count. Run `omaquill compile "$run/Lighthouse.scriv" "$run/artifacts/verify/find-replace/lighthouse.txt" --format txt`. The file contains `Mara lit the lantern` and `By morning the sea had gone flat`. It does not contain `lamp oil`.
 - **Proof.** The helper writes `editor.txt`, `toast.txt`, `after-click.png`, `saved.png`, `check.txt`, `lighthouse.txt`, and `storm-after.rtf` under `$run/artifacts/verify/find-replace/`.
 
+A run of the helper on 2026-10-14 exited 0. Doctor printed `omaquill 0.2.0`, `pid 8483 alive`, and `window Lighthouse — omaquill`. The pid changes every launch. `editor.txt` was:
+
+```
+The storm came in off the point at dusk. Mara lit the lantern and counted the seconds between the flashes, the way her father had taught her.
+
+Twelve, she thought. “Always twelve.”
+```
+
+`toast.txt` was `Replaced 1`. `check.txt` was:
+
+```
+Lighthouse
+  7 documents, 62 words in all
+  manuscript: 1 chapters, 51 words compile
+  binder: 3 items in Manuscript
+  every document reads fully
+```
+
+`lighthouse.txt` contained `Mara lit the lantern` and `By morning the sea had gone flat and gray`. `storm-after.rtf` contained `lantern` and did not contain `lamp`. The other three `content.rtf` hashes matched the pre-drive file. After the script exited, `after-click.png` and `editor.txt` were still in that directory.
+
 `find-document` and `find-project` are not part of that helper. Drive them from the same launch if the change touches `Ctrl+F` or `Ctrl+Shift+F`. For project search, `Ctrl+Shift+F` focuses the box whose placeholder is `Search project`. The query `lamp` on an unmodified copy lists The Storm and Keeper's Log. The query `lantern` lists nothing until the replace above.
 
 ## Gotchas
