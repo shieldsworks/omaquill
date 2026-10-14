@@ -2283,6 +2283,70 @@ next}";
             "EDXY",
             "copy took the clipped selection"
         );
+        let origin = (HELD_WINDOW - 2) as f64;
+        let bar = ed.held_bar.adjustment().value();
+        assert!(
+            (bar - origin).abs() < f64::EPSILON,
+            "find left the bar at {bar}, not the window origin {origin}"
+        );
+        ed.held_bar.adjustment().set_value(bar + 0.4);
+        assert_eq!(
+            ed.held_origin.get(),
+            HELD_WINDOW - 2,
+            "a drag inside the same character refilled the window"
+        );
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("the drag cleared the match");
+        assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "EDXY");
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        let shown = ed.buffer.text(&buf_start, &buf_end, false);
+        assert!(
+            shown.starts_with("EDXY"),
+            "the drag refilled from the start of the file: {shown}"
+        );
+        window.close();
+    }
+
+    /// A needle longer than the window starts past the page boundary.
+    /// The buffer starts at the match. The selection is the visible
+    /// prefix, not the two characters that sat on the first page.
+    pub(crate) fn find_of_a_long_needle_starts_at_the_match() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        show_window(&window);
+        let needle = "N".repeat(HELD_WINDOW + 50);
+        let mut body = "a".repeat(HELD_WINDOW - 2);
+        body.push_str(&needle);
+        body.push_str(&"b".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        assert!(ed.held_bar.is_visible());
+        ed.search_entry.set_text(&needle);
+        ed.find(true);
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        let shown = ed.buffer.text(&buf_start, &buf_end, false);
+        assert_eq!(shown.chars().count(), HELD_WINDOW);
+        assert!(
+            shown.chars().all(|c| c == 'N'),
+            "the long needle was clipped at the page edge: {shown}"
+        );
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("find missed the long needle");
+        let selected = ed.buffer.text(&start, &end, false);
+        assert_eq!(
+            selected.chars().count(),
+            HELD_WINDOW,
+            "the selection kept the page-edge clip {selected:?}"
+        );
+        assert!(
+            selected.chars().all(|c| c == 'N'),
+            "the selection was not the needle: {selected}"
+        );
         window.close();
     }
 
@@ -2319,6 +2383,18 @@ next}";
             body,
             "Select All copied the visible window, not the document"
         );
+
+        let (start, end) = ed.buffer.bounds();
+        ed.buffer.select_range(&start, &end);
+        ed.view.emit_copy_clipboard();
+        let again = clipboard_text(&ed.view);
+        assert_eq!(
+            again.chars().count(),
+            HELD_WINDOW,
+            "selecting the window again after Select All copied {} characters",
+            again.chars().count()
+        );
+        assert_ne!(again, body);
 
         let from = ed.buffer.iter_at_offset(0);
         let to = ed.buffer.iter_at_offset(5);

@@ -827,27 +827,39 @@ pub(crate) mod tests {
         assert!(labels.iter().any(|label| label == "Ignore"));
     }
 
-    /// A suggestion replaces the buffer even when the view is not editable,
-    /// unless the held state refuses it. `text()` would still return the
-    /// source, so the buffer and the file would disagree.
+    /// A suggestion on a held document is offered at a word in the window.
+    /// The buffer is that window. Replacing there would show `hello` and
+    /// leave the file on `helo`. The menu is not installed, and the
+    /// replacement leaves both the window and the file.
     pub(crate) fn a_suggestion_does_not_change_a_held_document() {
-        let mut paragraph = omaquill::rtf::Paragraph::default();
-        paragraph.runs.push(omaquill::rtf::Run {
-            text: format!("{} helo", "a".repeat(10_000)),
-            style: omaquill::rtf::CharStyle::default(),
-        });
-        let text = omaquill::rtf::RichText {
-            paragraphs: vec![paragraph],
-            lossy: Vec::new(),
-        };
         let editor = Editor::new(true);
-        editor.load(text);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&editor.root));
+        window.present();
+        let body = format!("helo {}", "a".repeat(10_000));
+        editor.load(omaquill::rtf::RichText::from_plain(&body));
         assert!(editor.is_too_formatted());
-        let plain = editor.plain_text();
-        let at = i32::try_from(plain.find("helo").expect("helo")).unwrap_or(0);
-        replace_word(&editor, at, at + 4, "hello");
-        assert_eq!(editor.plain_text(), plain);
-        assert_eq!(editor.text().plain_text(), plain);
+        let (start, end) = editor.buffer.bounds();
+        let shown = editor.buffer.text(&start, &end, false).to_string();
+        assert!(shown.starts_with("helo "));
+        assert_eq!(shown.chars().count(), 200);
+        let model = editor.plain_text();
+        assert!(model.contains("helo"));
+        let session = Session::new(&editor, &Settings::default());
+        let inside = editor.buffer.iter_at_offset(2);
+        assert!(!session.prepare_at(&inside));
+        assert!(editor.view.extra_menu().is_none());
+        replace_word(&editor, 0, 4, "hello");
+        let (start, end) = editor.buffer.bounds();
+        assert_eq!(
+            editor.buffer.text(&start, &end, false).as_str(),
+            shown,
+            "a suggestion rewrote the held window"
+        );
+        assert_eq!(editor.plain_text(), model);
+        assert_eq!(editor.text().plain_text(), model);
+        window.close();
     }
 
     /// A held document is not spellchecked. The buffer is one window of the
@@ -864,29 +876,31 @@ pub(crate) mod tests {
         let ignore = dir.join("ignored");
 
         let editor = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&editor.root));
+        window.present();
         let mut settings = Settings::default();
         // The word under the caret is not marked. Hide that exception so a
         // scan that does run has to mark `helo`.
         settings.spell_hide_current = false;
         let session = Session::new(&editor, &settings);
-        if !session.has_dictionary() {
-            eprintln!("no spelling dictionary; held-document check skipped");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
         *session.dictionary.borrow_mut() = state::load_words(&dict);
         *session.dictionary_file.borrow_mut() = dict.clone();
         *session.ignore_path.borrow_mut() = Some(ignore.clone());
-
-        editor.load(omaquill::rtf::RichText::from_plain("helo storm"));
-        editor.buffer.place_cursor(&editor.buffer.end_iter());
-        session.rescan();
-        drain(&session);
-        let marked = marked_words(&editor.buffer);
-        assert!(
-            marked.iter().any(|word| word == "helo"),
-            "the dictionary did not mark helo ({marked:?}); an empty held list would not show that the scan was skipped"
-        );
+        if session.has_dictionary() {
+            editor.load(omaquill::rtf::RichText::from_plain("helo storm"));
+            editor.buffer.place_cursor(&editor.buffer.end_iter());
+            session.rescan();
+            drain(&session);
+            let marked = marked_words(&editor.buffer);
+            assert!(
+                marked.iter().any(|word| word == "helo"),
+                "the dictionary did not mark helo ({marked:?}); an empty held list would not show that the scan was skipped"
+            );
+        } else {
+            eprintln!("no spelling dictionary; the held window is still checked");
+        }
 
         let body = format!("helo {}", "a".repeat(10_000));
         editor.load(omaquill::rtf::RichText::from_plain(&body));
@@ -928,6 +942,25 @@ pub(crate) mod tests {
         assert!(!session.dictionary.borrow().contains(&fragment));
         assert_eq!(std::fs::read(&dict).unwrap(), before);
         assert!(!ignore.exists(), "Ignore wrote {}", ignore.display());
+
+        // The same window, menu, and file checks with no dictionary installed.
+        *session.broker.borrow_mut() = None;
+        assert!(!session.has_dictionary());
+        editor.load(omaquill::rtf::RichText::from_plain(&body));
+        let (start, end) = editor.buffer.bounds();
+        let shown = editor.buffer.text(&start, &end, false).to_string();
+        assert!(shown.starts_with("helo "));
+        assert!(shown.chars().count() < body.chars().count());
+        session.rescan();
+        drain(&session);
+        let inside = editor.buffer.iter_at_offset(2);
+        assert!(!session.prepare_at(&inside));
+        assert!(editor.view.extra_menu().is_none());
+        session.remember("helo", true);
+        session.remember("helo", false);
+        assert_eq!(std::fs::read(&dict).unwrap(), before);
+        assert!(!ignore.exists(), "Ignore wrote {}", ignore.display());
+        window.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

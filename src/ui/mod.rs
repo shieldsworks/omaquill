@@ -54,6 +54,8 @@ pub struct Win {
     /// saved here, never to `current`, so a failed load or save can't send
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
+    /// The last sentence passed to the toast overlay.
+    last_toast: RefCell<String>,
     dirty_text: Cell<bool>,
     backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
     dirty_notes: Cell<bool>,
@@ -564,6 +566,7 @@ impl Win {
             project: RefCell::new(None),
             current: RefCell::new(None),
             editor_uuid: RefCell::new(None),
+            last_toast: RefCell::new(String::new()),
             dirty_text: Cell::new(false),
             backup_job: RefCell::new(None),
             dirty_notes: Cell::new(false),
@@ -937,6 +940,7 @@ impl Win {
     }
 
     pub fn toast(&self, text: &str) {
+        *self.last_toast.borrow_mut() = text.to_string();
         // Toast titles are markup; titles can hold '&' and '<'.
         self.toasts
             .add_toast(adw::Toast::new(&glib::markup_escape_text(text)));
@@ -1961,9 +1965,9 @@ fn a_long_line_names_the_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A read error must not stick. `show_item` records the id before the
-/// file is read; leaving that id makes the next click return. The error
-/// is the banner, and the binder can select the row again.
+/// A read error leaves the document that was already open. A held
+/// predecessor stays read-only, under its own title, and `save_now`
+/// does not replace its file. The broken row can be opened again.
 #[cfg(test)]
 fn a_failed_open_can_be_retried() {
     let dir = std::env::temp_dir().join(format!("omaquill-retry-win-{}", std::process::id()));
@@ -1972,6 +1976,12 @@ fn a_failed_open_can_be_retried() {
     let path = dir.join("Retry.scriv");
     let mut project = Project::create(&path).unwrap();
     let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let long = project
+        .add_item(Kind::Text, "Long", &draft, None)
+        .unwrap();
+    project
+        .set_text(&long, &rtf::RichText::from_plain(&"a".repeat(10_000)))
+        .unwrap();
     let bad = project
         .add_item(Kind::Text, "Broken", &draft, None)
         .unwrap();
@@ -1979,6 +1989,8 @@ fn a_failed_open_can_be_retried() {
         .set_text(&bad, &rtf::RichText::from_plain("retry me"))
         .unwrap();
     project.save().unwrap();
+    let long_rtf = project.data_dir(&long).join("content.rtf");
+    let long_bytes = std::fs::read(&long_rtf).unwrap();
     let rtf_path = project.data_dir(&bad).join("content.rtf");
     let bytes = std::fs::read(&rtf_path).unwrap();
     drop(project);
@@ -1988,36 +2000,81 @@ fn a_failed_open_can_be_retried() {
     app.register(None::<&gio::Cancellable>).unwrap();
     let win = Win::new(&app);
     win.open_project(&path);
+    win.window.present();
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..30 {
+        if win.window.is_mapped() {
+            break;
+        }
+        if !context.iteration(true) {
+            break;
+        }
+    }
+    win.select(&long);
+    assert!(win.editor.is_too_formatted());
+    assert!(!win.editor.view.is_editable());
+    assert_eq!(win.editor_uuid.borrow().as_deref(), Some(long.as_str()));
+    let (start, end) = win.editor.buffer.bounds();
+    let shown = win.editor.buffer.text(&start, &end, false).to_string();
+    assert_eq!(shown.chars().count(), 200);
+    assert!(shown.chars().all(|c| c == 'a'));
+    assert_eq!(win.title.subtitle().as_str(), "Long");
     // A directory where the document file should be. `read` returns
     // EISDIR, including when the process can read a chmod 000 file.
     std::fs::remove_file(&rtf_path).unwrap();
     std::fs::create_dir(&rtf_path).unwrap();
     win.select(&bad);
-    assert_ne!(
+    assert_eq!(
         win.stack.visible_child_name().as_deref(),
-        Some("empty"),
-        "a failed open showed the empty binder page"
+        Some("editor"),
+        "a failed open left the editor"
     );
-    assert!(
-        win.current.borrow().as_deref() != Some(bad.as_str()),
-        "a failed open left current on {bad}, so the next click does not retry"
+    assert_eq!(
+        win.current.borrow().as_deref(),
+        Some(long.as_str()),
+        "a failed open switched off the document that was open"
     );
+    assert_eq!(
+        win.editor_uuid.borrow().as_deref(),
+        Some(long.as_str()),
+        "a failed open dropped the document save would write"
+    );
+    assert_eq!(win.title.subtitle().as_str(), "Long");
     assert!(
         win.binder.selected().as_deref() != Some(bad.as_str()),
-        "the broken row stayed selected, so clicking it again does not retry"
+        "the broken row stayed selected"
     );
-    assert!(win.banner.is_revealed());
-    let title = win.banner.title();
+    assert!(!win.editor.view.is_editable());
+    assert!(win.editor.is_too_formatted());
+    let (start, end) = win.editor.buffer.bounds();
+    assert_eq!(
+        win.editor.buffer.text(&start, &end, false).as_str(),
+        shown,
+        "a failed open cleared the held window"
+    );
+    assert_eq!(std::fs::read(&long_rtf).unwrap(), long_bytes);
+    let told = win.last_toast.borrow().clone();
     assert!(
-        title.contains("Couldn't read") && title.contains("Broken"),
-        "the error was not shown: {title}"
+        told.contains("Couldn't read") && told.contains("Broken"),
+        "the error was not shown: {told}"
     );
+    assert_eq!(win.banner.title().as_str(), LENGTH_NOTE);
+    win.dirty_text.set(true);
+    assert!(win.save_now());
+    assert_eq!(
+        std::fs::read(&long_rtf).unwrap(),
+        long_bytes,
+        "save_now replaced the held file after the failed open"
+    );
+    let (start, end) = win.editor.buffer.bounds();
+    assert_eq!(win.editor.buffer.text(&start, &end, false).as_str(), shown);
     std::fs::remove_dir(&rtf_path).unwrap();
     std::fs::write(&rtf_path, &bytes).unwrap();
     win.select(&bad);
     assert_eq!(win.current.borrow().as_deref(), Some(bad.as_str()));
     assert_eq!(win.stack.visible_child_name().as_deref(), Some("editor"));
     assert_eq!(win.editor.plain_text(), "retry me");
+    assert!(win.editor.view.is_editable());
     win.join_backup_reader();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2048,6 +2105,7 @@ fn gtk_checks() {
     editor::tests::a_held_long_line_wraps_on_characters();
     editor::tests::find_in_a_long_held_line_reaches_the_tail();
     editor::tests::find_across_a_held_page_edge_selects_the_whole_match();
+    editor::tests::find_of_a_long_needle_starts_at_the_match();
     editor::tests::select_all_copies_the_held_document();
     editor::tests::a_zero_width_space_survives_edit_and_replace();
     editor::tests::switching_mid_paint_leaves_the_new_document();
