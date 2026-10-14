@@ -3378,27 +3378,141 @@ next}";
             Some(&[(2, 3, false), (2, 3, false)]),
         );
 
+        // GTK breaks a line on `\n`, `\r`, `\r\n`, and U+2029. It splits the
+        // needle only on `\n`. These three classes are the misses from the
+        // re-audit. `\r\n` is the two-character break in that same model.
+        let crossed = with_hold("a\nb\na\nb");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &crossed,
+                needle: "a\nb",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[(0, 3, false), (4, 7, false), (0, 3, false)]),
+        );
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &crossed,
+                needle: "a\nb",
+                forward: false,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[(4, 7, false), (0, 3, false), (4, 7, false)]),
+        );
+
+        let cr = with_hold("a\rb\ra\rb");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &cr,
+                needle: "a\rb",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(0, 0, true), (0, 0, true)]),
+        );
+        let para = with_hold("a\u{2029}b\u{2029}a\u{2029}b");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &para,
+                needle: "a\u{2029}b",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(0, 0, true), (0, 0, true)]),
+        );
+
+        let fffc_cr = with_hold("\u{FFFC}\rZ");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc_cr,
+                needle: "Z",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(2, 3, false), (2, 3, false)]),
+        );
+        let fffc_para = with_hold("\u{FFFC}\u{2029}Z");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc_para,
+                needle: "Z",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(2, 3, false), (2, 3, false)]),
+        );
+
+        let crlf = with_hold("a\r\nb\r\na\r\nb");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &crlf,
+                needle: "a\r\nb",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[(0, 4, false), (6, 10, false), (0, 4, false)]),
+        );
+        let fffc_crlf = with_hold("\u{FFFC}\r\nZ");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc_crlf,
+                needle: "Z",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(3, 4, false), (3, 4, false)]),
+        );
+
         drop(window);
     }
 
     /// Sequences of Find Next and Find Previous on random Unicode, including
     /// the end of the file and a held window edge, follow GTK.
+    /// The alphabet includes `\n`, `\r`, U+2029, and U+FFFC so a needle can
+    /// cross a GTK line or sit after an object character.
     pub(crate) fn held_find_sequences_match_gtk() {
         let (ed, window) = presented_editor();
         let letters = [
-            'a', 'Z', ' ', '\n', 's', 'S', 'e', 'E', 'f', '\u{00df}', '\u{00e9}', '\u{0301}',
-            '\u{fb00}', '\u{FFFC}', '\u{2014}',
+            'a', 'Z', ' ', '\n', '\r', '\u{2029}', '\u{2028}', '\u{0085}', 's', 'S', 'e', 'E', 'f',
+            '\u{00df}', '\u{00e9}', '\u{0301}', '\u{fb00}', '\u{FFFC}', '\u{2014}',
         ];
+        let shaped = ["a\nb", "a\rb", "a\u{2029}b", "a\r\nb", "Z"];
         let mut state = 0x0a11_u64;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             state
         };
-        for case in 0..8 {
-            let len = 1 + (next() as usize % 40);
+        let mut comparisons = 0usize;
+        let mut misses = 0usize;
+        let mut failures = Vec::new();
+        for case in 0..24 {
+            let len = 8 + (next() as usize % 33);
             let mut body = String::new();
             for _ in 0..len {
                 body.push(letters[next() as usize % letters.len()]);
+            }
+            match case % 4 {
+                0 => body.insert_str(0, "a\nb\na\nb"),
+                1 => body.insert_str(0, "a\rb\ra\rb"),
+                2 => body.insert_str(0, "\u{FFFC}\rZ"),
+                _ => body.insert_str(0, "\u{FFFC}\u{2029}Z"),
             }
             if case % 2 == 0 {
                 body.push('\u{00df}');
@@ -3407,33 +3521,57 @@ next}";
             }
             let text = with_hold(&body);
             let total = text.chars().count();
-            let Some(first) = body.chars().next() else {
-                continue;
+            let chars: Vec<char> = body.chars().collect();
+            let first = chars[0].to_string();
+            let pair = if chars.len() >= 2 {
+                let at = next() as usize % (chars.len() - 1);
+                chars[at..=at + 1].iter().collect()
+            } else {
+                first.clone()
             };
-            let needles = [
-                first.to_string(),
-                letters[next() as usize % letters.len()].to_string(),
-            ];
-            let carets = [0usize, HELD_WINDOW, total];
+            let needles = [first, pair, shaped[case % shaped.len()].to_string()];
+            let after_break = chars
+                .iter()
+                .position(|c| matches!(c, '\n' | '\r' | '\u{2029}'))
+                .map(|at| at + 1)
+                .unwrap_or(0);
+            let carets = [0usize, after_break, HELD_WINDOW, total];
             for needle in &needles {
                 for caret in carets {
                     for forward in [true, false] {
-                        assert_walk(
-                            &ed,
-                            &Walk {
-                                text: &text,
-                                needle,
-                                forward,
-                                caret,
-                                steps: 4,
-                            },
-                            None,
-                        );
+                        let walk = Walk {
+                            text: &text,
+                            needle,
+                            forward,
+                            caret,
+                            steps: 4,
+                        };
+                        let gtk = gtk_marks(&walk);
+                        let held = held_marks(&ed, &walk);
+                        comparisons += walk.steps;
+                        for (got, want) in held.iter().zip(gtk.iter()) {
+                            if got != want {
+                                misses += 1;
+                            }
+                        }
+                        if held != gtk && failures.len() < 8 {
+                            let preview: String = body.chars().take(48).collect();
+                            failures.push(format!(
+                                "needle {needle:?} caret {caret} forward {forward} text {preview:?}\n  held {held:?}\n  gtk  {gtk:?}"
+                            ));
+                        }
                     }
                 }
             }
         }
+        eprintln!("held find fuzz: comparisons={comparisons} misses={misses}");
         drop(window);
+        assert!(
+            failures.is_empty(),
+            "{} misses in {comparisons} comparisons\n{}",
+            misses,
+            failures.join("\n")
+        );
     }
 
     /// Case folding follows GTK. `ß` matches `ss`, and a composed accent
