@@ -1335,28 +1335,45 @@ fn span_end(chars: &[char], lens: &[usize], start: usize, parts: &[Vec<char>]) -
     walk_chars(chars, lens, start, count, true)
 }
 
-/// Later pieces of a forward needle. Each must be a non-empty prefix of the
-/// next full line. GTK does not check a combining mark on these lines, and
-/// it does not try another hit on the line the first piece came from.
-fn forward_rest(
-    chars: &[char],
-    lines: &[(usize, usize)],
-    line_i: usize,
-    parts: &[Vec<char>],
-) -> bool {
-    for (step, part) in parts.iter().enumerate().skip(1) {
-        if part.is_empty() {
-            return true;
-        }
-        let Some(&(start, end)) = lines.get(line_i + step) else {
-            return false;
-        };
-        let folded = fold_chars(&chars[start..end]);
-        if folded.is_empty() || !folded.starts_with(part) {
-            return false;
-        }
+/// End of the line that contains `cursor`. GTK's `forward_line` stops at the
+/// next line, or at the buffer end on the last line. A cursor already at the
+/// end does not move.
+fn forward_line_end(lines: &[(usize, usize)], cursor: usize, len: usize) -> Option<usize> {
+    if cursor >= len {
+        return None;
     }
-    true
+    lines
+        .iter()
+        .find_map(|&(start, end)| (cursor >= start && cursor < end).then_some(end))
+}
+
+/// Match end after every piece, each one resumed where the previous walk stopped.
+///
+/// `forward_chars_with_skipping` skips U+FFFC without counting it, so the
+/// iterator can sit past the start of the next line. The next piece is a
+/// prefix of the text from that iterator to the next line, not of the whole
+/// line. An empty piece ends the match there. GTK does not try another hit
+/// on the line the first piece came from.
+fn resume_parts(
+    chars: &[char],
+    lens: &[usize],
+    lines: &[(usize, usize)],
+    parts: &[Vec<char>],
+    origin: usize,
+) -> Option<usize> {
+    let mut cursor = walk_chars(chars, lens, origin, parts[0].len(), true);
+    for part in &parts[1..] {
+        if part.is_empty() {
+            return Some(cursor);
+        }
+        let seg_end = forward_line_end(lines, cursor, chars.len())?;
+        let folded = fold_chars(&chars[cursor..seg_end]);
+        if folded.is_empty() || !folded.starts_with(part) {
+            return None;
+        }
+        cursor = walk_chars(chars, lens, cursor, part.len(), true);
+    }
+    Some(cursor)
 }
 
 fn find_forward(
@@ -1378,9 +1395,9 @@ fn find_forward(
         let (line_start, line_end) = lines[line_i];
         let region = clip.take().unwrap_or(line_start).max(line_start);
         if let Some(start) = part_at(chars, lens, region, line_end, &parts[0], true)
-            && forward_rest(chars, lines, line_i, parts)
+            && let Some(end) = resume_parts(chars, lens, lines, parts, start)
         {
-            return Some((start, span_end(chars, lens, start, parts)));
+            return Some((start, end));
         }
         line_i += 1;
     }
