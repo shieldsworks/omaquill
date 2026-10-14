@@ -70,8 +70,9 @@ const HELD_WINDOW: usize = 200;
 /// `pending()` is false in the gap after map. That draw then lands on
 /// the next turn. On the x86_64 xvfb runner it was the 101.9 ms turn in
 /// `time_styled_paragraph_open` at `82d82ea`. A held line on a view that
-/// had already been painted took 0.5 ms in the same run. Map queues an
-/// idle that runs until one tick, so the draw belongs to the map.
+/// had already been painted took 0.5 ms in the same run. A timeout that
+/// waited for the tick again was the 126.7 ms aarch64 turn at `f63b914`.
+/// The map idle runs until one tick and leaves no later source.
 fn queue_first_paint(view: &gtk::TextView) {
     let armed = Rc::new(Cell::new(false));
     let watched = view.clone();
@@ -80,18 +81,23 @@ fn queue_first_paint(view: &gtk::TextView) {
             return;
         }
         let weak = watched.downgrade();
-        glib::idle_add_local_once(move || begin_first_paint(weak));
+        glib::idle_add_local_once(move || paint_when_mapped(weak));
     });
 }
 
-fn paint_busy() -> &'static std::thread::LocalKey<Cell<bool>> {
-    thread_local! {
-        static PUMPING: Cell<bool> = const { Cell::new(false) };
-    }
-    &PUMPING
+thread_local! {
+    static PUMPING: Cell<bool> = const { Cell::new(false) };
+    static WAITING: RefCell<Vec<glib::WeakRef<gtk::TextView>>> = const { RefCell::new(Vec::new()) };
 }
 
-fn begin_first_paint(weak: glib::WeakRef<gtk::TextView>) {
+fn paint_when_mapped(weak: glib::WeakRef<gtk::TextView>) {
+    if PUMPING.with(Cell::get) {
+        // The page and the notes view map together. This idle is running
+        // inside the other view's frame wait. Remember it for that wait
+        // to paint, instead of starting a second one.
+        WAITING.with(|queue| queue.borrow_mut().push(weak));
+        return;
+    }
     let Some(view) = weak.upgrade() else {
         return;
     };
@@ -99,27 +105,29 @@ fn begin_first_paint(weak: glib::WeakRef<gtk::TextView>) {
     if !view.is_mapped() {
         return;
     }
-    // The page and the notes view map together. A ready idle for the second
-    // would be dispatched instead of the first view's frame.
-    if paint_busy().with(Cell::get) {
-        let again = view.downgrade();
-        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
-            begin_first_paint(again.clone());
-            glib::ControlFlow::Break
-        });
-        return;
-    }
     pump_first_paint(&view);
+    loop {
+        let next = WAITING.with(|queue| queue.borrow_mut().pop());
+        let Some(next) = next else {
+            break;
+        };
+        let Some(view) = next.upgrade() else {
+            continue;
+        };
+        if view.is_mapped() {
+            pump_first_paint(&view);
+        }
+    }
 }
 
 fn pump_first_paint(view: &gtk::TextView) {
     struct End;
     impl Drop for End {
         fn drop(&mut self) {
-            paint_busy().with(|flag| flag.set(false));
+            PUMPING.with(|flag| flag.set(false));
         }
     }
-    paint_busy().with(|flag| flag.set(true));
+    PUMPING.with(|flag| flag.set(true));
     let _end = End;
     let done = Rc::new(Cell::new(false));
     let timed_out = Rc::new(Cell::new(false));
