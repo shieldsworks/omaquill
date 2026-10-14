@@ -296,7 +296,13 @@ impl Editor {
 
     /// `text` moves in. A held document keeps that value for a later save.
     pub fn load(&self, text: RichText) {
-        self.release_plain();
+        // Drop the previous hold without changing wrap mode or the bar.
+        // Restoring word-char wrap, hiding the bar, and writing the buffer
+        // again queues a layout of a line this load is about to replace.
+        // On aarch64 xvfb that layout was the 132.4 ms turn in
+        // `time_styled_paragraph_open` at `1e2cc98`.
+        self.painted_source.borrow_mut().take();
+        self.held_origin.set(0);
         *self.lossy.borrow_mut() = text.lossy.clone();
         self.loading.set(true);
         let edit = self.edit_when_ready.get();
@@ -305,7 +311,8 @@ impl Editor {
         // that line out, blocked the UI thread for longer than a slice
         // can hide.
         if !rich::needs_plain_view(&text) {
-            self.view.set_wrap_mode(gtk::WrapMode::WordChar);
+            self.set_wrap(gtk::WrapMode::WordChar);
+            self.held_bar.set_visible(false);
             let mut paint = rich::Paint::begin(&self.buffer, &text);
             while !paint.pump(&self.buffer, f64::MAX) {}
             paint.finish(&self.buffer);
@@ -320,7 +327,7 @@ impl Editor {
         // characters and no others. A held document longer than
         // [`HELD_WINDOW`] is shown one window at a time. Wrapping 10,000
         // unspaced characters in the first frame exceeded 100 ms under xvfb.
-        self.view.set_wrap_mode(gtk::WrapMode::Char);
+        self.set_wrap(gtk::WrapMode::Char);
         let plain = text.plain_text();
         let total = plain.chars().count();
         self.painted_source.borrow_mut().replace(text);
@@ -388,10 +395,16 @@ impl Editor {
         self.held_bar.set_visible(false);
         self.loading.set(false);
         if held {
-            self.view.set_wrap_mode(gtk::WrapMode::WordChar);
+            self.set_wrap(gtk::WrapMode::WordChar);
             let edit = self.edit_when_ready.get();
             self.view.set_editable(edit);
             self.view.set_cursor_visible(edit);
+        }
+    }
+
+    fn set_wrap(&self, mode: gtk::WrapMode) {
+        if self.view.wrap_mode() != mode {
+            self.view.set_wrap_mode(mode);
         }
     }
 
@@ -408,6 +421,10 @@ impl Editor {
         };
         let origin = self.held_origin.get();
         let slice: String = plain.chars().skip(origin).take(HELD_WINDOW).collect();
+        let (start, end) = self.buffer.bounds();
+        if self.buffer.text(&start, &end, false).as_str() == slice {
+            return;
+        }
         let was_loading = self.loading.get();
         self.loading.set(true);
         self.buffer.begin_irreversible_action();
@@ -430,7 +447,10 @@ impl Editor {
         let max = (pages as f64 - 1.0).max(0.0);
         adj.set_value((page as f64).min(max));
         self.held_adjusting.set(false);
-        self.held_bar.set_visible(pages > 1);
+        let show = pages > 1;
+        if self.held_bar.is_visible() != show {
+            self.held_bar.set_visible(show);
+        }
     }
 
     /// The formatting for text typed into an empty document.
