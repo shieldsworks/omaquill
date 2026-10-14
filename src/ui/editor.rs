@@ -53,6 +53,9 @@ pub struct Editor {
     held_origin: Cell<usize>,
     /// The bar is changing the buffer, so its own signal does not run again.
     held_adjusting: Cell<bool>,
+    /// Select All asked for the whole held document. The buffer is one
+    /// window, so Copy reads the model until the selection changes.
+    copy_whole_model: Cell<bool>,
 }
 
 /// Characters of a held document placed in the buffer at once.
@@ -245,6 +248,7 @@ impl Editor {
             held_bar,
             held_origin: Cell::new(0),
             held_adjusting: Cell::new(false),
+            copy_whole_model: Cell::new(false),
         });
         ed.wire();
         ed
@@ -316,11 +320,20 @@ impl Editor {
             }
         });
         let weak = Rc::downgrade(self);
-        self.buffer.connect_mark_set(move |_, _, mark| {
-            if let Some(ed) = weak.upgrade()
-                && mark.name().as_deref() == Some("insert")
-                && !ed.inserting.get()
-            {
+        self.buffer.connect_mark_set(move |buffer, _, mark| {
+            let Some(ed) = weak.upgrade() else {
+                return;
+            };
+            let name = mark.name();
+            let caret = name.as_deref() == Some("insert");
+            // A selection that is not the whole window is the visible
+            // text. Select All's own mark changes run before its
+            // after-handler sets the flag, and a full-window selection
+            // does not clear it.
+            if (caret || name.as_deref() == Some("selection_bound")) && !selection_covers(buffer) {
+                ed.copy_whole_model.set(false);
+            }
+            if caret && !ed.inserting.get() {
                 ed.pending.borrow_mut().clear();
                 ed.report();
                 if !ed.loading.get() {
@@ -330,6 +343,44 @@ impl Editor {
                 }
             }
         });
+        let weak = Rc::downgrade(self);
+        self.view.connect_copy_clipboard(move |view| {
+            let Some(ed) = weak.upgrade() else {
+                return;
+            };
+            if !ed.copy_whole_model.get() {
+                return;
+            }
+            let Some(text) = ed
+                .painted_source
+                .borrow()
+                .as_ref()
+                .map(|source| source.plain_text())
+            else {
+                return;
+            };
+            let Ok(shown) = usize::try_from(ed.buffer.char_count()) else {
+                return;
+            };
+            if text.chars().count() <= shown {
+                return;
+            }
+            view.clipboard().set_text(&text);
+            view.stop_signal_emission_by_name("copy-clipboard");
+        });
+        // After the default handler, so the flag survives the mark changes
+        // that Select All makes while it selects the window.
+        let weak = Rc::downgrade(self);
+        self.view.connect_closure(
+            "select-all",
+            true,
+            glib::closure_local!(move |_view: gtk::TextView, select: bool| {
+                let Some(ed) = weak.upgrade() else {
+                    return;
+                };
+                ed.copy_whole_model.set(select && ed.model_outruns_buffer());
+            }),
+        );
         let weak = Rc::downgrade(self);
         self.held_bar
             .adjustment()
@@ -516,6 +567,22 @@ impl Editor {
         }
     }
 
+    /// The held file is longer than the characters in the buffer.
+    fn model_outruns_buffer(&self) -> bool {
+        let Some(text) = self
+            .painted_source
+            .borrow()
+            .as_ref()
+            .map(|source| source.plain_text())
+        else {
+            return false;
+        };
+        let Ok(shown) = usize::try_from(self.buffer.char_count()) else {
+            return false;
+        };
+        text.chars().count() > shown
+    }
+
     fn set_wrap(&self, mode: gtk::WrapMode) {
         if self.view.wrap_mode() != mode {
             self.view.set_wrap_mode(mode);
@@ -543,8 +610,6 @@ impl Editor {
         let slice: String = plain.chars().skip(origin).take(HELD_WINDOW).collect();
         let was_loading = self.loading.get();
         self.loading.set(true);
-        let (start, end) = self.buffer.bounds();
-        self.buffer.remove_all_tags(&start, &end);
         self.buffer.begin_irreversible_action();
         self.buffer.set_text(&slice);
         self.buffer.end_irreversible_action();
@@ -972,10 +1037,21 @@ impl Editor {
         };
         let window_end = origin + HELD_WINDOW;
         if start < origin || end > window_end {
-            let next = start / HELD_WINDOW * HELD_WINDOW;
-            self.held_origin.set(next);
-            self.fill_held_window();
-            self.place_held_bar(total, next);
+            let page = start / HELD_WINDOW * HELD_WINDOW;
+            let match_len = end.saturating_sub(start);
+            // A page-aligned window clips a match that crosses its edge.
+            // The buffer then ends before the match, and copy takes the
+            // visible prefix. Slide to the match when it fits in one window.
+            let next = if match_len <= HELD_WINDOW && end > page + HELD_WINDOW {
+                start
+            } else {
+                page
+            };
+            if next != origin {
+                self.held_origin.set(next);
+                self.fill_held_window();
+                self.place_held_bar(total, next);
+            }
         }
         let origin = self.held_origin.get();
         let s = self
@@ -989,6 +1065,13 @@ impl Editor {
         let mut s = s;
         self.view.scroll_to_iter(&mut s, 0.1, true, 0.0, 0.35);
     }
+}
+
+fn selection_covers(buffer: &gtk::TextBuffer) -> bool {
+    let Some((start, end)) = buffer.selection_bounds() else {
+        return false;
+    };
+    start.is_start() && end.is_end() && buffer.char_count() > 0
 }
 
 fn bar_chars(value: f64) -> usize {
@@ -1107,7 +1190,7 @@ fn paint_new_lines(
 pub(crate) mod tests {
     use super::*;
     use omaquill::rtf::{self, Align, CharStyle, ParaStyle, Paragraph, RichText, Run};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     fn type_at(ed: &Editor, offset: i32, text: &str) {
@@ -1831,13 +1914,37 @@ next}";
         }
     }
 
-    fn time_open(
-        ed: &Editor,
-        context: &gtk::glib::MainContext,
-        label: &str,
-        text: &RichText,
-        cold: Option<&gtk::Window>,
-    ) {
+    /// Blocks until the frame clock's after-paint signal. The update tick
+    /// fires before the frame is drawn.
+    fn stop_after_paint(view: &gtk::TextView, context: &gtk::glib::MainContext, label: &str) {
+        let done = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&done);
+        let clock = view
+            .frame_clock()
+            .unwrap_or_else(|| panic!("{label} has no frame clock"));
+        let id = clock.connect_after_paint(move |_| flag.set(true));
+        clock.request_phase(gtk::gdk::FrameClockPhase::AFTER_PAINT);
+        view.queue_draw();
+        let mut max_iter_ms = 0.0f64;
+        for _ in 0..60 {
+            if done.get() {
+                break;
+            }
+            let step = std::time::Instant::now();
+            if !context.iteration(true) {
+                break;
+            }
+            max_iter_ms = max_iter_ms.max(step.elapsed().as_secs_f64() * 1000.0);
+        }
+        clock.disconnect(id);
+        assert!(done.get(), "{label} did not paint");
+        assert!(
+            max_iter_ms < 100.0,
+            "{label} main-loop turn blocked {max_iter_ms:.1} ms"
+        );
+    }
+
+    fn time_open(ed: &Editor, context: &gtk::glib::MainContext, label: &str, text: &RichText) {
         let plain = text.plain_text();
         let chars = plain.chars().count();
         let head: String = plain.chars().take(HELD_WINDOW).collect();
@@ -1851,18 +1958,9 @@ next}";
         let owned = text.clone();
         let started = std::time::Instant::now();
         ed.load(owned);
-        // The first open presents the window. The tick is the first paint
-        // of this document, and it is part of the timed turn.
-        let paint = cold.map(|window| {
-            let flag = Rc::new(Cell::new(false));
-            let watched = flag.clone();
-            ed.view.add_tick_callback(move |_view, _clock| {
-                watched.set(true);
-                glib::ControlFlow::Break
-            });
-            window.present();
-            flag
-        });
+        // The window is already on screen. This wait is the paint of the
+        // new text, and the open bound includes it.
+        stop_after_paint(&ed.view, context, label);
         let open_ms = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(
             buffer_string(ed),
@@ -1873,46 +1971,11 @@ next}";
         assert!(ed.is_too_formatted());
         assert!(!ed.view.is_editable());
         assert!(!ed.loading.get());
-        let mut max_iter_ms = 0.0f64;
-        // Asking where the line ends lays it out on this thread, so the
-        // query is part of the timed turn. A cold open also blocks until
-        // the frame clock paints that line.
-        let mut wrapped = false;
-        let mut painted_ms = None;
-        for _ in 0..40 {
-            let step = std::time::Instant::now();
-            let wait_for_paint = paint.as_ref().is_some_and(|flag| !flag.get());
-            let _ran = context.iteration(wait_for_paint);
-            if paint.as_ref().is_some_and(|flag| flag.get()) && painted_ms.is_none() {
-                painted_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
-            }
-            let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
-            let mut last = ed.buffer.end_iter();
-            if last.backward_char() {
-                let end_y = ed.view.iter_location(&last).y();
-                if end_y > start_y {
-                    wrapped = true;
-                }
-            }
-            max_iter_ms = max_iter_ms.max(step.elapsed().as_secs_f64() * 1000.0);
-            let frame_done = paint.as_ref().is_none_or(|flag| flag.get());
-            if wrapped && frame_done && !context.pending() {
-                break;
-            }
-        }
-        if let Some(flag) = &paint {
-            assert!(flag.get(), "{label} cold open did not paint");
-            let paint_ms = painted_ms.expect("the cold frame was timed");
-            eprintln!(
-                "gtk plain cold={label} chars={chars} open_ms={open_ms:.1} cold_paint_ms={paint_ms:.1} max_iter_ms={max_iter_ms:.1}"
-            );
-            assert!(
-                paint_ms < 100.0,
-                "{label} cold open-to-first-paint blocked {paint_ms:.1} ms at {chars}"
-            );
-        }
+        let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
+        let mut last = ed.buffer.end_iter();
+        let wrapped = last.backward_char() && ed.view.iter_location(&last).y() > start_y;
         eprintln!(
-            "gtk plain shape={label} chars={chars} buf={} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} wrapped={wrapped} bar={}",
+            "gtk plain shape={label} chars={chars} buf={} lines={} open_ms={open_ms:.1} wrapped={wrapped} bar={}",
             ed.buffer.char_count(),
             ed.buffer.line_count(),
             ed.held_bar.is_visible()
@@ -1920,10 +1983,6 @@ next}";
         assert!(
             open_ms < 100.0,
             "{label} open blocked {open_ms:.1} ms at {chars}"
-        );
-        assert!(
-            max_iter_ms < 100.0,
-            "{label} main-loop turn blocked {max_iter_ms:.1} ms at {chars}"
         );
         assert!(wrapped, "{label} did not wrap the new line");
         assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::Char);
@@ -1965,43 +2024,22 @@ next}";
             let adj = ed.held_bar.adjustment();
             let started = std::time::Instant::now();
             adj.set_value(adj.upper());
+            let scroll_label = format!("{label} scroll");
+            stop_after_paint(&ed.view, context, &scroll_label);
             let scroll_ms = started.elapsed().as_secs_f64() * 1000.0;
             assert_eq!(
                 buffer_string(ed),
                 expected,
                 "{label} scroll did not write the last window"
             );
-            let mut scroll_iter = 0.0f64;
-            // set_text invalidates the layout. The next position query
-            // lays the new page out on this thread.
-            let mut tail_wrapped = false;
-            for _ in 0..40 {
-                let step = std::time::Instant::now();
-                let _ran = context.iteration(false);
-                let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
-                let mut last = ed.buffer.end_iter();
-                if last.backward_char() {
-                    let end_y = ed.view.iter_location(&last).y();
-                    if end_y > start_y {
-                        tail_wrapped = true;
-                    }
-                }
-                scroll_iter = scroll_iter.max(step.elapsed().as_secs_f64() * 1000.0);
-                if tail_wrapped && !context.pending() {
-                    break;
-                }
-            }
+            let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
+            let mut last = ed.buffer.end_iter();
+            let tail_wrapped = last.backward_char() && ed.view.iter_location(&last).y() > start_y;
             assert!(tail_wrapped, "{label} did not wrap the scrolled page");
-            eprintln!(
-                "gtk plain scroll={label} chars={chars} scroll_ms={scroll_ms:.1} max_iter_ms={scroll_iter:.1}"
-            );
+            eprintln!("gtk plain scroll={label} chars={chars} scroll_ms={scroll_ms:.1}");
             assert!(
                 scroll_ms < 100.0,
                 "{label} scroll blocked {scroll_ms:.1} ms at {chars}"
-            );
-            assert!(
-                scroll_iter < 100.0,
-                "{label} scroll turn blocked {scroll_iter:.1} ms at {chars}"
             );
             assert_eq!(expected.chars().count(), last_len);
         } else {
@@ -2198,6 +2236,121 @@ next}";
         assert_eq!(saved.as_bytes(), rtf::write(&expected).as_bytes());
     }
 
+    /// A match that starts on the current page and ends past it. The window
+    /// moves so the whole match is on screen, and copy takes that match.
+    pub(crate) fn find_across_a_held_page_edge_selects_the_whole_match() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        show_window(&window);
+        // Two characters of the match sit on the first page. The rest
+        // starts the next page, so a page-aligned window clips them.
+        let mut body = "a".repeat(HELD_WINDOW - 2);
+        body.push_str("EDXY");
+        body.push_str(&"b".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        assert!(ed.is_too_formatted());
+        assert!(ed.held_bar.is_visible());
+        let (start, end) = ed.buffer.bounds();
+        let shown = ed.buffer.text(&start, &end, false);
+        assert_eq!(shown.chars().count(), HELD_WINDOW);
+        assert!(
+            shown.ends_with("ED"),
+            "the first page should end on the start of the match, got {shown:?}"
+        );
+        ed.search_entry.set_text("EDXY");
+        ed.find(true);
+        let (start, end) = ed
+            .buffer
+            .selection_bounds()
+            .expect("find missed the match that crosses the page");
+        let selected = ed.buffer.text(&start, &end, false);
+        assert_eq!(
+            selected.as_str(),
+            "EDXY",
+            "a match across the page edge was clipped to {selected:?}"
+        );
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        let shown = ed.buffer.text(&buf_start, &buf_end, false);
+        assert!(
+            shown.contains("EDXY"),
+            "the window did not move to show the whole match: {shown:?}"
+        );
+        ed.view.emit_copy_clipboard();
+        assert_eq!(
+            clipboard_text(&ed.view),
+            "EDXY",
+            "copy took the clipped selection"
+        );
+        window.close();
+    }
+
+    /// Select All copies the held document from the model. The buffer is
+    /// one window. A selection made by hand copies that selection.
+    pub(crate) fn select_all_copies_the_held_document() {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        show_window(&window);
+        let body = format!("Hello {}", "a".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        assert!(ed.is_too_formatted());
+        assert_eq!(buffer_string(&ed).chars().count(), HELD_WINDOW);
+        ed.view.grab_focus();
+
+        let (start, end) = ed.buffer.bounds();
+        ed.buffer.select_range(&start, &end);
+        ed.view.emit_copy_clipboard();
+        let visible = clipboard_text(&ed.view);
+        assert_eq!(
+            visible.chars().count(),
+            HELD_WINDOW,
+            "a hand selection of the window copied {} characters",
+            visible.chars().count()
+        );
+        assert_ne!(visible, body);
+
+        ed.view.emit_select_all(true);
+        ed.view.emit_copy_clipboard();
+        assert_eq!(
+            clipboard_text(&ed.view),
+            body,
+            "Select All copied the visible window, not the document"
+        );
+
+        let from = ed.buffer.iter_at_offset(0);
+        let to = ed.buffer.iter_at_offset(5);
+        ed.buffer.select_range(&from, &to);
+        ed.view.emit_copy_clipboard();
+        assert_eq!(clipboard_text(&ed.view), "Hello");
+        window.close();
+    }
+
+    fn clipboard_text(view: &gtk::TextView) -> String {
+        let got = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&got);
+        view.clipboard()
+            .read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
+                let text = result
+                    .expect("clipboard read")
+                    .unwrap_or_default()
+                    .to_string();
+                *slot.borrow_mut() = Some(text);
+            });
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..50 {
+            if got.borrow().is_some() {
+                break;
+            }
+            if !context.iteration(true) {
+                break;
+            }
+        }
+        got.borrow().clone().expect("the clipboard did not answer")
+    }
+
     /// A match past the first window moves that window. The selected text is
     /// the file's own characters.
     pub(crate) fn find_in_a_long_held_line_reaches_the_tail() {
@@ -2223,11 +2376,112 @@ next}";
         window.close();
     }
 
+    /// The first window in a fresh process, stopped on after-paint.
+    /// `role` is `plain` (a 32-character sentence) or `held`.
+    pub(crate) fn cold_open_ms(role: &str) -> f64 {
+        let sentence = "The lamp at the point stays lit.";
+        assert_eq!(sentence.chars().count(), 32);
+        let text = match role {
+            "plain" => RichText::from_plain(sentence),
+            "held" => one_line(10_000),
+            other => panic!("unknown cold role {other}"),
+        };
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        assert!(!window.is_mapped(), "a fresh window was already on screen");
+        let painted = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&painted);
+        // Realize runs before map. The first frame's after-paint is the
+        // end of this open, including inside the map handler's frame wait.
+        ed.view.connect_realize(move |view| {
+            let Some(clock) = view.frame_clock() else {
+                return;
+            };
+            let flag = Rc::clone(&flag);
+            clock.connect_after_paint(move |_| flag.set(true));
+            clock.request_phase(gtk::gdk::FrameClockPhase::AFTER_PAINT);
+        });
+        let started = std::time::Instant::now();
+        ed.load(text);
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..90 {
+            if painted.get() {
+                break;
+            }
+            if !context.iteration(true) {
+                break;
+            }
+        }
+        assert!(painted.get(), "{role} cold open did not finish a paint");
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if role == "held" {
+            assert!(ed.is_too_formatted());
+            assert_eq!(buffer_string(&ed).chars().count(), HELD_WINDOW);
+        } else {
+            assert!(!ed.is_too_formatted());
+            assert_eq!(buffer_string(&ed), sentence);
+        }
+        window.close();
+        ms
+    }
+
+    /// A fresh process pays for the first window whether the text is one
+    /// sentence or a held document. The difference is the held open.
+    ///
+    /// A single first-window sample moves by more than that difference.
+    /// The median of three fresh processes is the open, and the bound is
+    /// on the medians.
+    fn held_cold_open_matches_a_short_sentence() {
+        let plain = median_cold_ms("plain");
+        let held = median_cold_ms("held");
+        let delta = held - plain;
+        eprintln!("gtk cold plain_ms={plain:.1} held_ms={held:.1} delta_ms={delta:.1}");
+        assert!(
+            delta < 20.0,
+            "held cold open was {delta:.1} ms slower than a 32-character sentence (plain {plain:.1}, held {held:.1})"
+        );
+    }
+
+    fn median_cold_ms(role: &str) -> f64 {
+        let mut samples = [
+            fresh_cold_ms(role),
+            fresh_cold_ms(role),
+            fresh_cold_ms(role),
+        ];
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("cold times are numbers"));
+        eprintln!(
+            "gtk cold role={role} samples={:.1},{:.1},{:.1} median={:.1}",
+            samples[0], samples[1], samples[2], samples[1]
+        );
+        samples[1]
+    }
+
+    fn fresh_cold_ms(role: &str) -> f64 {
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args(["ui::gtk_checks", "--exact", "--nocapture"])
+            .env("OMAQUILL_GTK_COLD", role)
+            .output()
+            .expect("spawn cold open");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "cold {role} failed\n{text}\n{err}");
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix("OMAQUILL_COLD_MS="))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("cold {role} did not report a time\n{text}\n{err}"))
+    }
+
     /// Open times for one paragraph. Uniform runs, alternating runs, and
     /// one unspaced line, at 10k, 50k, and 100k. Each page has its own
     /// letters and its own tags, so every timed load and every scroll
-    /// writes the buffer. The first open is cold: the window is presented
-    /// inside the timer, and that timer includes the first paint.
+    /// writes the buffer. Those opens are warm: the window is already
+    /// painted, and each timer stops on after-paint. The cold comparison
+    /// is a fresh process for a 32-character sentence and a fresh process
+    /// for a held document.
     /// Set OMAQUILL_GTK_OPEN to one of those counts to time only that size.
     /// Set it to `probe` to time word-char layout under the cap. A held
     /// paragraph stays one buffer line and wraps on characters.
@@ -2246,6 +2500,10 @@ next}";
             window.close();
             return;
         }
+        held_cold_open_matches_a_short_sentence();
+        show_window(&window);
+        assert!(window.is_mapped(), "the warm window did not map");
+        paint_editor(&ed);
         let sizes: Vec<usize> = if which.is_empty() || which == "1" {
             vec![10_000, 50_000, 100_000]
         } else if let Ok(n) = which.parse() {
@@ -2254,7 +2512,6 @@ next}";
             vec![10_000, 50_000, 100_000]
         };
         let mut seen = std::collections::HashSet::new();
-        let mut first = true;
         for (size_tag, chars) in sizes.iter().copied().enumerate() {
             for (kind, label) in [(0u8, "uniform"), (1, "alternating"), (2, "line")] {
                 let text = timed_document(chars, kind, size_tag);
@@ -2283,14 +2540,7 @@ next}";
                     page += 1;
                 }
                 let name = format!("{label} {chars}");
-                let cold = if first {
-                    assert!(!window.is_mapped(), "the cold open was already on screen");
-                    first = false;
-                    Some(&window)
-                } else {
-                    None
-                };
-                time_open(&ed, &context, &name, &text, cold);
+                time_open(&ed, &context, &name, &text);
             }
         }
         // Three shapes and three lengths. Every page is its own window.

@@ -1303,9 +1303,19 @@ impl Win {
             Ok(None) => {}
             Err(e) => {
                 // Never leave another document's text editable here.
+                // `show_item` stored this id before the read. Leaving it,
+                // or leaving the row selected, makes the next click return
+                // without trying again. The empty page says to pick
+                // something; the banner is the read error.
                 *self.editor_uuid.borrow_mut() = None;
-                self.stack.set_visible_child_name("empty");
-                self.toast(&format!("Couldn't read {}: {e}", item.title));
+                *self.current.borrow_mut() = None;
+                self.binder.select_quietly(None);
+                let message = format!("Couldn't read {}: {e}", item.title);
+                self.banner.set_title(&message);
+                self.banner.set_revealed(true);
+                self.format_bar.set_visible(false);
+                self.stack.set_visible_child_name("editor");
+                self.toast(&message);
             }
         }
     }
@@ -1951,6 +1961,67 @@ fn a_long_line_names_the_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A read error must not stick. `show_item` records the id before the
+/// file is read; leaving that id makes the next click return. The error
+/// is the banner, and the binder can select the row again.
+#[cfg(test)]
+fn a_failed_open_can_be_retried() {
+    let dir = std::env::temp_dir().join(format!("omaquill-retry-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Retry.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let bad = project
+        .add_item(Kind::Text, "Broken", &draft, None)
+        .unwrap();
+    project
+        .set_text(&bad, &rtf::RichText::from_plain("retry me"))
+        .unwrap();
+    project.save().unwrap();
+    let rtf_path = project.data_dir(&bad).join("content.rtf");
+    let bytes = std::fs::read(&rtf_path).unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Retry")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    // A directory where the document file should be. `read` returns
+    // EISDIR, including when the process can read a chmod 000 file.
+    std::fs::remove_file(&rtf_path).unwrap();
+    std::fs::create_dir(&rtf_path).unwrap();
+    win.select(&bad);
+    assert_ne!(
+        win.stack.visible_child_name().as_deref(),
+        Some("empty"),
+        "a failed open showed the empty binder page"
+    );
+    assert!(
+        win.current.borrow().as_deref() != Some(bad.as_str()),
+        "a failed open left current on {bad}, so the next click does not retry"
+    );
+    assert!(
+        win.binder.selected().as_deref() != Some(bad.as_str()),
+        "the broken row stayed selected, so clicking it again does not retry"
+    );
+    assert!(win.banner.is_revealed());
+    let title = win.banner.title();
+    assert!(
+        title.contains("Couldn't read") && title.contains("Broken"),
+        "the error was not shown: {title}"
+    );
+    std::fs::remove_dir(&rtf_path).unwrap();
+    std::fs::write(&rtf_path, &bytes).unwrap();
+    win.select(&bad);
+    assert_eq!(win.current.borrow().as_deref(), Some(bad.as_str()));
+    assert_eq!(win.stack.visible_child_name().as_deref(), Some("editor"));
+    assert_eq!(win.editor.plain_text(), "retry me");
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
 /// that started it, and each #[test] gets its own thread. Needs a display.
 /// xvfb provides one. Without a display the test returns.
@@ -1959,6 +2030,12 @@ fn a_long_line_names_the_line() {
 fn gtk_checks() {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
         eprintln!("no display; GTK checks skipped");
+        return;
+    }
+    if let Ok(role) = std::env::var("OMAQUILL_GTK_COLD") {
+        adw::init().unwrap();
+        let ms = editor::tests::cold_open_ms(&role);
+        println!("OMAQUILL_COLD_MS={ms:.3}");
         return;
     }
     adw::init().unwrap();
@@ -1970,6 +2047,8 @@ fn gtk_checks() {
     editor::tests::a_long_uniform_line_opens_plain();
     editor::tests::a_held_long_line_wraps_on_characters();
     editor::tests::find_in_a_long_held_line_reaches_the_tail();
+    editor::tests::find_across_a_held_page_edge_selects_the_whole_match();
+    editor::tests::select_all_copies_the_held_document();
     editor::tests::a_zero_width_space_survives_edit_and_replace();
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();
@@ -1996,6 +2075,7 @@ fn gtk_checks() {
     spell::tests::suggestions_share_the_text_view_menu();
     spell::tests::a_suggestion_does_not_change_a_held_document();
     spell::tests::a_held_document_is_not_spellchecked();
+    a_failed_open_can_be_retried();
     spell::tests::a_keystroke_ahead_of_the_scan_does_not_skip();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
     spell::tests::activating_spellcheck_flips_its_state();
