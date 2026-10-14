@@ -1535,23 +1535,29 @@ next}";
         assert!(!ed.view.is_editable());
         assert!(!ed.loading.get());
         let mut max_iter_ms = 0.0f64;
-        let mut shown = false;
+        // "Hello" from the warmup paint already has a line height. The new
+        // line is laid out when its end sits below its start. Asking for
+        // that position lays the line out on this thread, so the query is
+        // part of the timed turn.
+        let mut wrapped = false;
         for _ in 0..40 {
             let step = std::time::Instant::now();
-            let ran = context.iteration(false);
-            let iter_ms = step.elapsed().as_secs_f64() * 1000.0;
-            if ran {
-                max_iter_ms = max_iter_ms.max(iter_ms);
+            let _ran = context.iteration(false);
+            let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
+            let mut last = ed.buffer.end_iter();
+            if last.backward_char() {
+                let end_y = ed.view.iter_location(&last).y();
+                if end_y > start_y {
+                    wrapped = true;
+                }
             }
-            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
-                shown = true;
-            }
-            if shown && !context.pending() {
+            max_iter_ms = max_iter_ms.max(step.elapsed().as_secs_f64() * 1000.0);
+            if wrapped && !context.pending() {
                 break;
             }
         }
         eprintln!(
-            "gtk plain shape={label} chars={chars} buf={} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} shown={shown} bar={}",
+            "gtk plain shape={label} chars={chars} buf={} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} wrapped={wrapped} bar={}",
             ed.buffer.char_count(),
             ed.buffer.line_count(),
             ed.held_bar.is_visible()
@@ -1564,7 +1570,7 @@ next}";
             max_iter_ms < 100.0,
             "{label} main-loop turn blocked {max_iter_ms:.1} ms at {chars}"
         );
-        assert!(shown, "{label} did not get a line height");
+        assert!(wrapped, "{label} did not wrap the new line");
         assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::Char);
         let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
         let mut last = ed.buffer.end_iter();
@@ -1591,13 +1597,26 @@ next}";
             adj.set_value(adj.upper());
             let scroll_ms = started.elapsed().as_secs_f64() * 1000.0;
             let mut scroll_iter = 0.0f64;
-            for _ in 0..20 {
+            // set_text invalidates the layout. The next position query
+            // lays the new page out on this thread.
+            let mut tail_wrapped = false;
+            for _ in 0..40 {
                 let step = std::time::Instant::now();
-                if !context.iteration(false) && !context.pending() {
-                    break;
+                let _ran = context.iteration(false);
+                let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
+                let mut last = ed.buffer.end_iter();
+                if last.backward_char() {
+                    let end_y = ed.view.iter_location(&last).y();
+                    if end_y > start_y {
+                        tail_wrapped = true;
+                    }
                 }
                 scroll_iter = scroll_iter.max(step.elapsed().as_secs_f64() * 1000.0);
+                if tail_wrapped && !context.pending() {
+                    break;
+                }
             }
+            assert!(tail_wrapped, "{label} did not wrap the scrolled page");
             eprintln!(
                 "gtk plain scroll={label} chars={chars} scroll_ms={scroll_ms:.1} max_iter_ms={scroll_iter:.1}"
             );
@@ -1671,17 +1690,20 @@ next}";
     }
 
     /// The first painted frame of a newly mapped text view is the window
-    /// coming on screen. On `1f42f62` that frame was 126.9 ms on x86_64 and
-    /// 165.8 ms on aarch64 when the held line was the first text in the
-    /// view. A document opens into a view that has already been painted.
+    /// coming on screen. On `9b7b2d6` the held line, loaded into a view
+    /// that had already been painted, took 0.2 ms. The next window's first
+    /// timed turn was 104.6 ms on x86_64 because this paint had not finished.
+    /// `pending()` is false until the frame is ready, so the wait blocks.
     fn paint_editor(ed: &Editor) {
         let context = gtk::glib::MainContext::default();
         ed.view.set_wrap_mode(gtk::WrapMode::WordChar);
         ed.buffer.set_text("Hello");
         ed.buffer.place_cursor(&ed.buffer.start_iter());
-        for _ in 0..40 {
-            context.iteration(false);
+        for _ in 0..30 {
             if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 && !context.pending() {
+                return;
+            }
+            if !context.iteration(true) {
                 return;
             }
         }
@@ -1723,31 +1745,26 @@ next}";
             HELD_WINDOW
         );
         let mut max_iter = 0.0f64;
-        let mut shown = false;
+        let mut wrapped = false;
         for _ in 0..40 {
             let step = std::time::Instant::now();
-            let ran = context.iteration(false);
-            if ran {
-                max_iter = max_iter.max(step.elapsed().as_secs_f64() * 1000.0);
+            let _ran = context.iteration(false);
+            let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
+            let mut last = ed.buffer.end_iter();
+            if last.backward_char() {
+                let end_y = ed.view.iter_location(&last).y();
+                if end_y > start_y {
+                    wrapped = true;
+                }
             }
-            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 {
-                shown = true;
-            }
-            if shown && !context.pending() {
+            max_iter = max_iter.max(step.elapsed().as_secs_f64() * 1000.0);
+            if wrapped && !context.pending() {
                 break;
             }
         }
-        assert!(shown, "the line was not allocated");
+        assert!(wrapped, "the line did not wrap");
         eprintln!("gtk held wrap open_ms={open_ms:.1} max_iter_ms={max_iter:.1}");
         assert!(max_iter < 100.0, "main-loop turn blocked {max_iter:.1} ms");
-        let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
-        let mut last = ed.buffer.end_iter();
-        assert!(last.backward_char());
-        let end_y = ed.view.iter_location(&last).y();
-        assert!(
-            end_y > start_y,
-            "the line did not wrap, start {start_y} end {end_y}"
-        );
         ed.search_entry.set_text(&"a".repeat(100));
         ed.find(true);
         let (start, end) = ed.buffer.selection_bounds().expect("find missed the run");
