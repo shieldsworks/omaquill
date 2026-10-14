@@ -64,6 +64,97 @@ pub struct Editor {
 /// one window at a time.
 const HELD_WINDOW: usize = 200;
 
+/// The first draw of a mapped text view.
+///
+/// The frame clock is not a ready source until the frame time, so
+/// `pending()` is false in the gap after map. That draw then lands on
+/// the next turn. On the x86_64 xvfb runner it was the 101.9 ms turn in
+/// `time_styled_paragraph_open` at `82d82ea`. A held line on a view that
+/// had already been painted took 0.5 ms in the same run. Map queues an
+/// idle that runs until one tick, so the draw belongs to the map.
+fn queue_first_paint(view: &gtk::TextView) {
+    let armed = Rc::new(Cell::new(false));
+    let watched = view.clone();
+    view.connect_map(move |_| {
+        if armed.replace(true) {
+            return;
+        }
+        let weak = watched.downgrade();
+        glib::idle_add_local_once(move || begin_first_paint(weak));
+    });
+}
+
+fn paint_busy() -> &'static std::thread::LocalKey<Cell<bool>> {
+    thread_local! {
+        static PUMPING: Cell<bool> = const { Cell::new(false) };
+    }
+    &PUMPING
+}
+
+fn begin_first_paint(weak: glib::WeakRef<gtk::TextView>) {
+    let Some(view) = weak.upgrade() else {
+        return;
+    };
+    // A closed window's idle runs after unmap. There is no frame to wait for.
+    if !view.is_mapped() {
+        return;
+    }
+    // The page and the notes view map together. A ready idle for the second
+    // would be dispatched instead of the first view's frame.
+    if paint_busy().with(Cell::get) {
+        let again = view.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
+            begin_first_paint(again.clone());
+            glib::ControlFlow::Break
+        });
+        return;
+    }
+    pump_first_paint(&view);
+}
+
+fn pump_first_paint(view: &gtk::TextView) {
+    struct End;
+    impl Drop for End {
+        fn drop(&mut self) {
+            paint_busy().with(|flag| flag.set(false));
+        }
+    }
+    paint_busy().with(|flag| flag.set(true));
+    let _end = End;
+    let done = Rc::new(Cell::new(false));
+    let timed_out = Rc::new(Cell::new(false));
+    let flag = done.clone();
+    view.add_tick_callback(move |_view, _clock| {
+        flag.set(true);
+        glib::ControlFlow::Break
+    });
+    if let Some(clock) = view.frame_clock() {
+        clock.request_phase(gtk::gdk::FrameClockPhase::PAINT);
+    }
+    view.queue_draw();
+    let cap = glib::timeout_add_local(std::time::Duration::from_millis(200), {
+        let flag = done.clone();
+        let timed_out = timed_out.clone();
+        move || {
+            timed_out.set(true);
+            flag.set(true);
+            glib::ControlFlow::Break
+        }
+    });
+    let context = glib::MainContext::default();
+    for _ in 0..30 {
+        if done.get() {
+            break;
+        }
+        if !context.iteration(true) {
+            break;
+        }
+    }
+    if !timed_out.get() {
+        cap.remove();
+    }
+}
+
 impl Editor {
     /// `page` is the main editor: centered column, find bar. Otherwise a
     /// compact editor for notes.
@@ -75,6 +166,7 @@ impl Editor {
             .accepts_tab(true)
             .build();
         view.add_css_class("omaquill-text");
+        queue_first_paint(&view);
         let clamp = adw::Clamp::builder()
             .maximum_size(760)
             .tightening_threshold(600)
