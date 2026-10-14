@@ -979,18 +979,30 @@ impl Editor {
             (i, i)
         });
         let flags = gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY;
-        let found = if forward {
-            sel_end
-                .forward_search(&needle, flags, None)
-                .or_else(|| buffer.start_iter().forward_search(&needle, flags, None))
+        let (found, wrapped) = if forward {
+            match sel_end.forward_search(&needle, flags, None) {
+                Some(hit) => (Some(hit), false),
+                None => (
+                    buffer.start_iter().forward_search(&needle, flags, None),
+                    true,
+                ),
+            }
         } else {
-            sel_start
-                .backward_search(&needle, flags, None)
-                .or_else(|| buffer.end_iter().backward_search(&needle, flags, None))
+            match sel_start.backward_search(&needle, flags, None) {
+                Some(hit) => (Some(hit), false),
+                None => (
+                    buffer.end_iter().backward_search(&needle, flags, None),
+                    true,
+                ),
+            }
         };
         match found {
             Some((s, e)) => {
-                self.search_entry.remove_css_class("error");
+                if wrapped {
+                    self.search_entry.add_css_class("error");
+                } else {
+                    self.search_entry.remove_css_class("error");
+                }
                 buffer.select_range(&s, &e);
                 let mut s = s;
                 self.view.scroll_to_iter(&mut s, 0.1, true, 0.0, 0.35);
@@ -1016,19 +1028,24 @@ impl Editor {
             let i = self.buffer.iter_at_mark(&self.buffer.get_insert());
             (i, i)
         });
+        let start_off = text_index(sel_start.offset());
+        let end_off = text_index(sel_end.offset());
+        let model_start = origin + start_off;
         let from = if forward {
-            origin + sel_end.offset().max(0) as usize
+            match_end(&plain, model_start, needle.as_str()).unwrap_or(origin + end_off)
         } else {
-            origin + sel_start.offset().max(0) as usize
+            model_start
         };
-        let hit = find_ci(&plain, needle.as_str(), forward, from).or_else(|| {
-            let wrap = if forward { 0 } else { total };
-            find_ci(&plain, needle.as_str(), forward, wrap)
-        });
-        let Some((start, end)) = hit else {
+        let wrap_at = if forward { 0 } else { total };
+        let (hit, wrapped) = if let Some(hit) = find_ci(&plain, needle.as_str(), forward, from) {
+            (hit, false)
+        } else if let Some(hit) = find_ci(&plain, needle.as_str(), forward, wrap_at) {
+            (hit, true)
+        } else {
             self.search_entry.add_css_class("error");
             return;
         };
+        let (start, end) = hit;
         let window_end = origin + HELD_WINDOW;
         if start < origin || end > window_end {
             let page = start / HELD_WINDOW * HELD_WINDOW;
@@ -1050,7 +1067,11 @@ impl Editor {
         let e = self
             .buffer
             .iter_at_offset(text_offset(end.saturating_sub(origin)));
-        self.search_entry.remove_css_class("error");
+        if wrapped {
+            self.search_entry.add_css_class("error");
+        } else {
+            self.search_entry.remove_css_class("error");
+        }
         self.buffer.select_range(&s, &e);
         let mut s = s;
         self.view.scroll_to_iter(&mut s, 0.1, true, 0.0, 0.35);
@@ -1122,6 +1143,26 @@ fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(
         .rev()
         .find(|&i| matches(i))
         .map(|i| (i, i + needle.len()))
+}
+
+fn text_index(offset: i32) -> usize {
+    usize::try_from(offset.max(0)).expect("a text offset is non-negative")
+}
+
+fn match_end(hay: &str, at: usize, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut rest = hay.chars().skip(at);
+    let mut matched = 0usize;
+    for n in needle.chars() {
+        let c = rest.next()?;
+        if !eq_ci(c, n) {
+            return None;
+        }
+        matched += 1;
+    }
+    Some(at + matched)
 }
 
 fn text_offset(n: usize) -> i32 {
@@ -2430,6 +2471,7 @@ next}";
         );
         window.close();
     }
+
     /// Select All copies the held document from the model. The buffer is
     /// one window. A selection made by hand copies that selection.
     pub(crate) fn select_all_copies_the_held_document() {
@@ -2534,7 +2576,7 @@ next}";
 
     /// The first window in a fresh process, stopped on after-paint.
     /// `role` is `plain` (a 32-character sentence) or `held`.
-    pub(crate) fn cold_open_ms(role: &str, started: std::time::Instant) -> f64 {
+    pub(crate) fn cold_open_paint(role: &str) {
         let sentence = "The lamp at the point stays lit.";
         assert_eq!(sentence.chars().count(), 32);
         let text = match role {
@@ -2571,7 +2613,8 @@ next}";
             }
         }
         assert!(painted.get(), "{role} cold open did not finish a paint");
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!("OMAQUILL_COLD_PAINT");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         if role == "held" {
             assert!(ed.is_too_formatted());
             assert_eq!(buffer_string(&ed).chars().count(), HELD_WINDOW);
@@ -2580,13 +2623,13 @@ next}";
             assert_eq!(buffer_string(&ed), sentence);
         }
         window.close();
-        ms
     }
 
     /// A fresh process pays for the first window whether the text is one
     /// sentence or a held document. The difference is the held open.
     fn held_cold_open_matches_a_short_sentence() {
-        let mut deltas = [0.0; 3];
+        const PAIRS: usize = 7;
+        let mut deltas = [0.0; PAIRS];
         for (i, delta) in deltas.iter_mut().enumerate() {
             let plain = fresh_cold_ms("plain");
             let held = fresh_cold_ms("held");
@@ -2596,44 +2639,54 @@ next}";
                 *delta
             );
         }
-        let mean = (deltas[0] + deltas[1] + deltas[2]) / 3.0;
-        let mut slowest = deltas[0];
-        let mut fastest = deltas[0];
-        for delta in deltas {
-            slowest = slowest.max(delta);
-            fastest = fastest.min(delta);
-        }
+        let mut ordered = deltas;
+        ordered.sort_by(|a, b| a.total_cmp(b));
+        let median = ordered[PAIRS / 2];
+        let fastest = ordered[0];
+        let slowest = ordered[PAIRS - 1];
         eprintln!(
-            "gtk cold pairs=3 mean_delta_ms={mean:.1} min_delta_ms={fastest:.1} max_delta_ms={slowest:.1}"
+            "gtk cold pairs={PAIRS} median_delta_ms={median:.1} min_delta_ms={fastest:.1} max_delta_ms={slowest:.1}"
         );
         assert!(
-            mean < 20.0,
-            "held cold open mean was {mean:.1} ms slower than a 32-character sentence (deltas {deltas:.1?}, slowest {slowest:.1})"
+            median < 20.0,
+            "held cold open median was {median:.1} ms slower than a 32-character sentence (deltas {deltas:.1?}, slowest {slowest:.1})"
         );
     }
 
     fn fresh_cold_ms(role: &str) -> f64 {
         let exe = std::env::current_exe().expect("the test binary");
-        let output = std::process::Command::new(exe)
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new(exe)
             .args(["ui::gtk_checks", "--exact", "--nocapture"])
             .env("OMAQUILL_GTK_COLD", role)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
             .expect("spawn cold open");
-        let text = String::from_utf8_lossy(&output.stdout);
-        let err = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "cold {role} failed\n{text}\n{err}");
-        text.lines()
-            .find_map(|line| line.trim().strip_prefix("OMAQUILL_COLD_MS="))
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| panic!("cold {role} did not report a time\n{text}\n{err}"))
+        let stdout = child.stdout.take().expect("cold stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let mut ms = None;
+        loop {
+            line.clear();
+            let n = std::io::BufRead::read_line(&mut reader, &mut line).expect("read cold stdout");
+            if n == 0 {
+                break;
+            }
+            if ms.is_none() && line.trim() == "OMAQUILL_COLD_PAINT" {
+                ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        let status = child.wait().expect("wait cold open");
+        assert!(status.success(), "cold {role} failed ({status})");
+        ms.unwrap_or_else(|| panic!("cold {role} exited without a paint line"))
     }
 
     /// Open times for one paragraph. Uniform runs, alternating runs, and
     /// one unspaced line, at 10k, 50k, and 100k. Each page has its own
     /// letters and its own tags, so every timed load and every scroll
     /// writes the buffer. Those opens are warm: the window is already
-    /// painted, and each timer stops on after-paint. The cold comparison
-    /// is three plain-then-held pairs.
+    /// painted, and each timer stops on after-paint.
     /// Set OMAQUILL_GTK_OPEN to one of those counts to time only that size.
     /// Set it to `probe` to time word-char layout under the cap. A held
     /// paragraph stays one buffer line and wraps on characters.

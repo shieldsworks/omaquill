@@ -2293,14 +2293,12 @@ fn a_failed_open_can_be_retried() {
 #[test]
 fn gtk_checks() {
     if let Ok(role) = std::env::var("OMAQUILL_GTK_COLD") {
-        let started = std::time::Instant::now();
         if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
             eprintln!("no display; GTK checks skipped");
             return;
         }
         adw::init().unwrap();
-        let ms = editor::tests::cold_open_ms(&role, started);
-        println!("OMAQUILL_COLD_MS={ms:.3}");
+        editor::tests::cold_open_paint(&role);
         return;
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
