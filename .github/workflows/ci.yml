@@ -32,7 +32,7 @@ jobs:
       - name: GTK 4, libadwaita, and Enchant
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            libgtk-4-dev libadwaita-1-dev libenchant-2-2 hunspell-en-us
+            libgtk-4-dev libadwaita-1-dev libenchant-2-2 hunspell-en-us xvfb
           ldconfig -p | grep -q 'libenchant-2\.so\.2'
           test -f /usr/share/hunspell/en_US.dic
           test -f /usr/share/hunspell/en_US.aff
@@ -47,6 +47,6 @@ jobs:
       - name: Lint
         run: mise lint
       - name: Test
-        run: mise test
+        run: xvfb-run -a --server-args="-screen 0 1280x1024x24" mise test
       - name: Release build
         run: cargo build --release --locked
