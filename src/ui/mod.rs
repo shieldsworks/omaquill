@@ -1953,8 +1953,7 @@ fn a_long_line_names_the_line() {
 
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
 /// that started it, and each #[test] gets its own thread. Needs a display.
-/// CI starts xvfb, so the 10k, 50k, and 100k opens run there. Without a
-/// display the test returns.
+/// xvfb provides one. Without a display the test returns.
 #[cfg(test)]
 #[test]
 fn gtk_checks() {
@@ -1975,6 +1974,7 @@ fn gtk_checks() {
     editor::tests::switching_mid_paint_leaves_the_new_document();
     editor::tests::identical_runs_open_without_an_idle_pass();
     editor::tests::many_plain_paragraphs_stay_editable();
+    editor::tests::a_held_load_clears_the_previous_tags_and_selection();
     editor::tests::time_styled_paragraph_open();
     a_long_line_names_the_line();
     spell::tests::one_paragraph_is_one_spelling_line();

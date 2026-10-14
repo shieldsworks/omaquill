@@ -487,18 +487,32 @@ impl Editor {
             .is_some_and(|text| rich::breakless_chars(text) > rich::SYNC_BREAKLESS_CHARS)
     }
 
-    /// Drops a plain-only hold. The next [`Self::load`] replaces the buffer.
+    /// Drops a plain-only hold and clears the buffer.
+    ///
+    /// The held window can be the same characters as the document that was
+    /// open before it. Leaving those characters, or their tags, would keep
+    /// that document's bold, links, and paragraph formatting. The next
+    /// [`Self::load`] writes the document being opened.
     pub fn release_plain(&self) {
         let held = self.painted_source.borrow().is_some();
         self.painted_source.borrow_mut().take();
         self.held_origin.set(0);
         self.held_bar.set_visible(false);
-        self.loading.set(false);
         if held {
+            // `blocks_signal` stops delete and insert while a hold is
+            // read-only. The clear is the release, so it runs as a load.
+            self.loading.set(true);
+            self.buffer.begin_irreversible_action();
+            self.buffer.set_text("");
+            self.buffer.end_irreversible_action();
+            self.buffer.place_cursor(&self.buffer.start_iter());
+            self.loading.set(false);
             self.set_wrap(gtk::WrapMode::WordChar);
             let edit = self.edit_when_ready.get();
             self.view.set_editable(edit);
             self.view.set_cursor_visible(edit);
+        } else {
+            self.loading.set(false);
         }
     }
 
@@ -510,6 +524,12 @@ impl Editor {
 
     /// The buffer shows one window of a long held document. The characters
     /// are the file's, starting at [`Self::held_origin`].
+    ///
+    /// The slice is written even when those characters are already in the
+    /// buffer. The previous document may have been the same letters with
+    /// bold, a link, paragraph formatting, and a selection. Find starts at
+    /// that selection. Replacing the text drops the tags and the selection,
+    /// and the cursor is placed at the start.
     fn fill_held_window(&self) {
         let Some(plain) = self
             .painted_source
@@ -521,12 +541,10 @@ impl Editor {
         };
         let origin = self.held_origin.get();
         let slice: String = plain.chars().skip(origin).take(HELD_WINDOW).collect();
-        let (start, end) = self.buffer.bounds();
-        if self.buffer.text(&start, &end, false).as_str() == slice {
-            return;
-        }
         let was_loading = self.loading.get();
         self.loading.set(true);
+        let (start, end) = self.buffer.bounds();
+        self.buffer.remove_all_tags(&start, &end);
         self.buffer.begin_irreversible_action();
         self.buffer.set_text(&slice);
         self.buffer.end_irreversible_action();
@@ -1088,7 +1106,7 @@ fn paint_new_lines(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use omaquill::rtf::{self, Align, CharStyle, Paragraph, RichText, Run};
+    use omaquill::rtf::{self, Align, CharStyle, ParaStyle, Paragraph, RichText, Run};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1613,23 +1631,6 @@ next}";
         assert_eq!(ed.buffer.line_count(), 2_000);
     }
 
-    fn uniform(runs: usize) -> RichText {
-        let mut paragraph = Paragraph::default();
-        for _ in 0..runs {
-            paragraph.runs.push(Run {
-                text: "a".into(),
-                style: CharStyle {
-                    bold: true,
-                    ..CharStyle::default()
-                },
-            });
-        }
-        RichText {
-            paragraphs: vec![paragraph],
-            lossy: Vec::new(),
-        }
-    }
-
     fn one_line(chars: usize) -> RichText {
         RichText {
             paragraphs: vec![Paragraph {
@@ -1643,27 +1644,248 @@ next}";
         }
     }
 
-    fn time_open(ed: &Editor, context: &gtk::glib::MainContext, label: &str, text: &RichText) {
-        let chars = text.plain_text().chars().count();
+    fn buffer_string(ed: &Editor) -> String {
+        let (start, end) = ed.buffer.bounds();
+        ed.buffer.text(&start, &end, false).to_string()
+    }
+
+    fn applied_tag_names(buffer: &gtk::TextBuffer) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut iter = buffer.start_iter();
+        loop {
+            for name in rich::tag_names(&iter) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            if buffer.char_count() == 0 || !iter.forward_char() {
+                break;
+            }
+        }
+        names
+    }
+
+    /// A styled document whose letters match the held document's first
+    /// window used to stay bold, linked, and selected. The held view is
+    /// plain, Find starts at the cursor, and releasing the hold clears
+    /// the buffer.
+    pub(crate) fn a_held_load_clears_the_previous_tags_and_selection() {
+        let ed = Editor::new(true);
+        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let styled = RichText {
+            paragraphs: vec![Paragraph {
+                style: ParaStyle {
+                    align: Align::Center,
+                    left_indent: 720,
+                    ..ParaStyle::default()
+                },
+                runs: vec![Run {
+                    text: "a".repeat(HELD_WINDOW),
+                    style: CharStyle {
+                        bold: true,
+                        link: Some(Rc::clone(&link)),
+                        ..CharStyle::default()
+                    },
+                }],
+            }],
+            lossy: Vec::new(),
+        };
+        ed.load(styled);
+        assert!(!ed.is_too_formatted());
+        let styled_tags = applied_tag_names(&ed.buffer);
+        assert!(
+            styled_tags.iter().any(|name| name == "c:b"),
+            "the styled open had no bold tag: {styled_tags:?}"
+        );
+        assert!(
+            styled_tags.iter().any(|name| name.starts_with("c:link=")),
+            "the styled open had no link tag: {styled_tags:?}"
+        );
+        assert!(
+            styled_tags.iter().any(|name| name == "p:align=center"),
+            "the styled open had no center tag: {styled_tags:?}"
+        );
+        assert!(
+            styled_tags.iter().any(|name| name == "p:li=720"),
+            "the styled open had no indent tag: {styled_tags:?}"
+        );
+        let from = ed.buffer.iter_at_offset(4);
+        let to = ed.buffer.iter_at_offset(12);
+        ed.buffer.select_range(&from, &to);
+        assert!(ed.buffer.selection_bounds().is_some());
+        assert_ne!(ed.buffer.cursor_position(), 0);
+
+        let mut held_body = "a".repeat(HELD_WINDOW);
+        held_body.push_str(&"b".repeat(10_000));
+        ed.load(RichText::from_plain(&held_body));
+        assert!(ed.is_too_formatted());
+        let (start, end) = ed.buffer.bounds();
+        assert_eq!(
+            ed.buffer.text(&start, &end, false).as_str(),
+            "a".repeat(HELD_WINDOW)
+        );
+        let held_tags = applied_tag_names(&ed.buffer);
+        assert!(
+            held_tags.is_empty(),
+            "a held load kept the previous document's tags: {held_tags:?}"
+        );
+        assert!(
+            ed.buffer.selection_bounds().is_none(),
+            "a held load kept the previous selection"
+        );
+        assert_eq!(
+            ed.buffer.cursor_position(),
+            0,
+            "a held load left the cursor at {}",
+            ed.buffer.cursor_position()
+        );
+
+        ed.release_plain();
+        assert!(!ed.is_too_formatted());
+        assert_eq!(buffer_string(&ed), "");
+        let released = applied_tag_names(&ed.buffer);
+        assert!(released.is_empty(), "release_plain kept tags: {released:?}");
+        assert!(ed.buffer.selection_bounds().is_none());
+        assert_eq!(ed.buffer.cursor_position(), 0);
+        assert_eq!(ed.view.wrap_mode(), gtk::WrapMode::WordChar);
+    }
+
+    /// Letters for one held page. `id` is unique per page, so the first
+    /// letters of the page are unique and the rest do not repeat a
+    /// 26-character cycle.
+    fn append_page(out: &mut String, id: usize, len: usize) {
+        let mut n = id;
+        for i in 0..len {
+            let digit = if i < 6 {
+                let d = (n % 26) as u8;
+                n /= 26;
+                d
+            } else {
+                ((i + id) % 26) as u8
+            };
+            out.push(char::from(b'a' + digit));
+        }
+    }
+
+    fn page_style(kind: u8, page: usize) -> CharStyle {
+        match kind {
+            0 => CharStyle {
+                bold: true,
+                highlight: Some(((page % 200) as u8, (page % 199) as u8, 40)),
+                ..CharStyle::default()
+            },
+            1 => CharStyle {
+                bold: page.is_multiple_of(2),
+                italic: !page.is_multiple_of(2),
+                link: Some(Rc::from(format!("https://example.test/{page}"))),
+                ..CharStyle::default()
+            },
+            _ => CharStyle {
+                underline: page.is_multiple_of(2),
+                strike: !page.is_multiple_of(2),
+                color: Some((20, (page % 200) as u8, 80)),
+                ..CharStyle::default()
+            },
+        }
+    }
+
+    /// One held paragraph. Each page is its own run, with its own letters
+    /// and its own character style. `kind` and `size_tag` keep two
+    /// documents from sharing a page.
+    fn timed_document(chars: usize, kind: u8, size_tag: usize) -> RichText {
+        let mut runs = Vec::new();
+        let mut page = 0usize;
+        let mut done = 0usize;
+        while done < chars {
+            let n = (chars - done).min(HELD_WINDOW);
+            let id = kind as usize * 100_000 + size_tag * 1_000 + page;
+            let mut text = String::with_capacity(n);
+            append_page(&mut text, id, n);
+            runs.push(Run {
+                text,
+                style: page_style(kind, page),
+            });
+            done += n;
+            page += 1;
+        }
+        let style = match kind {
+            0 => ParaStyle {
+                align: Align::Center,
+                left_indent: 360,
+                ..ParaStyle::default()
+            },
+            1 => ParaStyle {
+                align: Align::Justify,
+                space_before: 120,
+                ..ParaStyle::default()
+            },
+            _ => ParaStyle {
+                align: Align::Right,
+                right_indent: 240,
+                ..ParaStyle::default()
+            },
+        };
+        RichText {
+            paragraphs: vec![Paragraph { style, runs }],
+            lossy: Vec::new(),
+        }
+    }
+
+    fn time_open(
+        ed: &Editor,
+        context: &gtk::glib::MainContext,
+        label: &str,
+        text: &RichText,
+        cold: Option<&gtk::Window>,
+    ) {
+        let plain = text.plain_text();
+        let chars = plain.chars().count();
+        let head: String = plain.chars().take(HELD_WINDOW).collect();
+        let before = buffer_string(ed);
+        assert_ne!(
+            before, head,
+            "{label} loaded a window the buffer already showed"
+        );
         // The copy stays here so the timed load matches the window, which
         // moves the document it already owns.
         let owned = text.clone();
         let started = std::time::Instant::now();
         ed.load(owned);
+        // The first open presents the window. The tick is the first paint
+        // of this document, and it is part of the timed turn.
+        let paint = cold.map(|window| {
+            let flag = Rc::new(Cell::new(false));
+            let watched = flag.clone();
+            ed.view.add_tick_callback(move |_view, _clock| {
+                watched.set(true);
+                glib::ControlFlow::Break
+            });
+            window.present();
+            flag
+        });
         let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            buffer_string(ed),
+            head,
+            "{label} did not write its first window"
+        );
         assert_eq!(ed.buffer.line_count(), 1);
         assert!(ed.is_too_formatted());
         assert!(!ed.view.is_editable());
         assert!(!ed.loading.get());
         let mut max_iter_ms = 0.0f64;
-        // "Hello" from the warmup paint already has a line height. The new
-        // line is laid out when its end sits below its start. Asking for
-        // that position lays the line out on this thread, so the query is
-        // part of the timed turn.
+        // Asking where the line ends lays it out on this thread, so the
+        // query is part of the timed turn. A cold open also blocks until
+        // the frame clock paints that line.
         let mut wrapped = false;
+        let mut painted_ms = None;
         for _ in 0..40 {
             let step = std::time::Instant::now();
-            let _ran = context.iteration(false);
+            let wait_for_paint = paint.as_ref().is_some_and(|flag| !flag.get());
+            let _ran = context.iteration(wait_for_paint);
+            if paint.as_ref().is_some_and(|flag| flag.get()) && painted_ms.is_none() {
+                painted_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+            }
             let start_y = ed.view.iter_location(&ed.buffer.start_iter()).y();
             let mut last = ed.buffer.end_iter();
             if last.backward_char() {
@@ -1673,9 +1895,21 @@ next}";
                 }
             }
             max_iter_ms = max_iter_ms.max(step.elapsed().as_secs_f64() * 1000.0);
-            if wrapped && !context.pending() {
+            let frame_done = paint.as_ref().is_none_or(|flag| flag.get());
+            if wrapped && frame_done && !context.pending() {
                 break;
             }
+        }
+        if let Some(flag) = &paint {
+            assert!(flag.get(), "{label} cold open did not paint");
+            let paint_ms = painted_ms.expect("the cold frame was timed");
+            eprintln!(
+                "gtk plain cold={label} chars={chars} open_ms={open_ms:.1} cold_paint_ms={paint_ms:.1} max_iter_ms={max_iter_ms:.1}"
+            );
+            assert!(
+                paint_ms < 100.0,
+                "{label} cold open-to-first-paint blocked {paint_ms:.1} ms at {chars}"
+            );
         }
         eprintln!(
             "gtk plain shape={label} chars={chars} buf={} lines={} open_ms={open_ms:.1} max_iter_ms={max_iter_ms:.1} wrapped={wrapped} bar={}",
@@ -1713,10 +1947,30 @@ next}";
         assert_eq!(shown.chars().count(), chars.min(HELD_WINDOW));
         if chars > HELD_WINDOW {
             assert!(ed.held_bar.is_visible());
+            // The last page starts on a window boundary and holds the
+            // remainder, which is short when the file is not a whole
+            // number of windows.
+            let last_page = chars.saturating_sub(1) / HELD_WINDOW;
+            let last_len = chars - last_page * HELD_WINDOW;
+            let expected: String = plain
+                .chars()
+                .skip(last_page * HELD_WINDOW)
+                .take(last_len)
+                .collect();
+            assert_ne!(
+                buffer_string(ed),
+                expected,
+                "{label} scrolled onto a window the buffer already showed"
+            );
             let adj = ed.held_bar.adjustment();
             let started = std::time::Instant::now();
             adj.set_value(adj.upper());
             let scroll_ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(
+                buffer_string(ed),
+                expected,
+                "{label} scroll did not write the last window"
+            );
             let mut scroll_iter = 0.0f64;
             // set_text invalidates the layout. The next position query
             // lays the new page out on this thread.
@@ -1749,18 +2003,7 @@ next}";
                 scroll_iter < 100.0,
                 "{label} scroll turn blocked {scroll_iter:.1} ms at {chars}"
             );
-            let (tail_start, tail_end) = ed.buffer.bounds();
-            let tail = ed.buffer.text(&tail_start, &tail_end, false);
-            assert!(
-                text.plain_text().ends_with(tail.as_str()),
-                "{label} tail is not the file text"
-            );
-            // The last page starts on a window boundary and holds the
-            // remainder, which is short when the file is not a whole
-            // number of windows.
-            let last_page = chars.saturating_sub(1) / HELD_WINDOW;
-            let last_len = chars - last_page * HELD_WINDOW;
-            assert_eq!(tail.chars().count(), last_len);
+            assert_eq!(expected.chars().count(), last_len);
         } else {
             assert!(!ed.held_bar.is_visible());
         }
@@ -1980,8 +2223,11 @@ next}";
         window.close();
     }
 
-    /// Open times for one paragraph on a visible view. Uniform runs,
-    /// alternating runs, and one unspaced line, at 10k, 50k, and 100k.
+    /// Open times for one paragraph. Uniform runs, alternating runs, and
+    /// one unspaced line, at 10k, 50k, and 100k. Each page has its own
+    /// letters and its own tags, so every timed load and every scroll
+    /// writes the buffer. The first open is cold: the window is presented
+    /// inside the timer, and that timer includes the first paint.
     /// Set OMAQUILL_GTK_OPEN to one of those counts to time only that size.
     /// Set it to `probe` to time word-char layout under the cap. A held
     /// paragraph stays one buffer line and wraps on characters.
@@ -1991,11 +2237,11 @@ next}";
         let window = gtk::Window::new();
         window.set_default_size(800, 600);
         window.set_child(Some(&ed.root));
-        show_window(&window);
-        assert!(window.is_mapped(), "the window did not map");
-        paint_editor(&ed);
         let context = gtk::glib::MainContext::default();
         if which == "probe" {
+            show_window(&window);
+            assert!(window.is_mapped(), "the window did not map");
+            paint_editor(&ed);
             probe_word_char(&ed, &context);
             window.close();
             return;
@@ -2007,10 +2253,49 @@ next}";
         } else {
             vec![10_000, 50_000, 100_000]
         };
-        for chars in sizes {
-            time_open(&ed, &context, "uniform", &uniform(chars));
-            time_open(&ed, &context, "alternating", &toggled(chars));
-            time_open(&ed, &context, "line", &one_line(chars));
+        let mut seen = std::collections::HashSet::new();
+        let mut first = true;
+        for (size_tag, chars) in sizes.iter().copied().enumerate() {
+            for (kind, label) in [(0u8, "uniform"), (1, "alternating"), (2, "line")] {
+                let text = timed_document(chars, kind, size_tag);
+                let runs = &text.paragraphs[0].runs;
+                if chars > HELD_WINDOW {
+                    assert!(
+                        runs.len() >= 2,
+                        "{label} at {chars} has one page, so the scroll does not write"
+                    );
+                    assert!(
+                        runs.windows(2).all(|pair| pair[0].style != pair[1].style),
+                        "{label} at {chars} reuses a tag run on the next page"
+                    );
+                }
+                let letters: Vec<char> = text.plain_text().chars().collect();
+                let mut offset = 0usize;
+                let mut page = 0usize;
+                while offset < letters.len() {
+                    let end = (offset + HELD_WINDOW).min(letters.len());
+                    let slice: String = letters[offset..end].iter().collect();
+                    assert!(
+                        seen.insert(slice),
+                        "{label} at {chars} page {page} repeats an earlier window"
+                    );
+                    offset = end;
+                    page += 1;
+                }
+                let name = format!("{label} {chars}");
+                let cold = if first {
+                    assert!(!window.is_mapped(), "the cold open was already on screen");
+                    first = false;
+                    Some(&window)
+                } else {
+                    None
+                };
+                time_open(&ed, &context, &name, &text, cold);
+            }
+        }
+        // Three shapes and three lengths. Every page is its own window.
+        if sizes == [10_000, 50_000, 100_000] {
+            assert_eq!(seen.len(), 2_400, "timed {} distinct pages", seen.len());
         }
         window.close();
     }

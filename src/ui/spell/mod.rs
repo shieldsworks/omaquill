@@ -864,6 +864,29 @@ pub(crate) mod tests {
         let ignore = dir.join("ignored");
 
         let editor = Editor::new(true);
+        let mut settings = Settings::default();
+        // The word under the caret is not marked. Hide that exception so a
+        // scan that does run has to mark `helo`.
+        settings.spell_hide_current = false;
+        let session = Session::new(&editor, &settings);
+        assert!(
+            session.has_dictionary(),
+            "without a dictionary known() accepts every word, and an empty mark list does not show that the scan was skipped"
+        );
+        *session.dictionary.borrow_mut() = state::load_words(&dict);
+        *session.dictionary_file.borrow_mut() = dict.clone();
+        *session.ignore_path.borrow_mut() = Some(ignore.clone());
+
+        editor.load(omaquill::rtf::RichText::from_plain("helo storm"));
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
+        session.rescan();
+        drain(&session);
+        let marked = marked_words(&editor.buffer);
+        assert!(
+            marked.iter().any(|word| word == "helo"),
+            "the dictionary did not mark helo ({marked:?}); an empty held list would not show that the scan was skipped"
+        );
+
         let body = format!("helo {}", "a".repeat(10_000));
         editor.load(omaquill::rtf::RichText::from_plain(&body));
         assert!(editor.is_too_formatted());
@@ -881,11 +904,8 @@ pub(crate) mod tests {
             .collect();
         assert!(!fragment.is_empty());
         assert!(fragment.chars().count() < 10_000);
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
 
-        let session = Session::new(&editor, &Settings::default());
-        *session.dictionary.borrow_mut() = state::load_words(&dict);
-        *session.dictionary_file.borrow_mut() = dict.clone();
-        *session.ignore_path.borrow_mut() = Some(ignore.clone());
         session.rescan();
         drain(&session);
         assert!(
