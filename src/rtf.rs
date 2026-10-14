@@ -13,7 +13,79 @@
 //! contains a tab. A project replace skips a lossy file. The editor names
 //! the same list and does not replace.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::hash::Hash;
+use std::rc::Rc;
+
+#[cfg(test)]
+thread_local! {
+    static PARSES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_parses() {
+    PARSES.with(|n| n.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn parses() -> u64 {
+    PARSES.with(|n| n.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TABLE_PROBES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_table(n: u64) {
+    #[cfg(test)]
+    TABLE_PROBES.with(|probes| probes.set(probes.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_table_probes() {
+    TABLE_PROBES.with(|probes| probes.set(0));
+}
+
+#[cfg(test)]
+fn table_probes() -> u64 {
+    TABLE_PROBES.with(|probes| probes.get())
+}
+
+/// Insertion order plus a one-lookup index. The vec is what the RTF
+/// tables emit, so the file bytes stay in first-seen order.
+struct Order<T> {
+    values: Vec<T>,
+    index: HashMap<T, usize>,
+}
+
+impl<T: Clone + Eq + Hash> Order<T> {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    fn push_unique(&mut self, value: T) {
+        note_table(1);
+        if self.index.contains_key(&value) {
+            return;
+        }
+        self.index.insert(value.clone(), self.values.len());
+        self.values.push(value);
+    }
+
+    fn position(&self, value: &T) -> Option<usize> {
+        note_table(1);
+        self.index.get(value).copied()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RichText {
@@ -96,7 +168,8 @@ pub struct CharStyle {
     /// another document (`scrivlnk://`), or the anchor of a Scrivener
     /// comment or footnote (`scrivcmt://`), whose text lives in the
     /// document's `content.comments`.
-    pub link: Option<String>,
+    /// Shared across runs. A bold toggle clones the style, not the target.
+    pub link: Option<Rc<str>>,
 }
 
 pub type Rgb = (u8, u8, u8);
@@ -260,6 +333,8 @@ struct Reader<'a> {
 }
 
 pub fn parse(src: &[u8]) -> RichText {
+    #[cfg(test)]
+    PARSES.with(|n| n.set(n.get() + 1));
     let mut r = Reader {
         src,
         pos: 0,
@@ -777,7 +852,7 @@ impl Reader<'_> {
             }
             "fldrslt" => {
                 self.flush();
-                self.st.ch.link = self.field_link.take();
+                self.st.ch.link = self.field_link.take().map(Rc::from);
             }
             // Unicode.
             "uc" => self.st.uc = n.max(0) as usize,
@@ -1060,57 +1135,50 @@ pub fn font_family(name: &str) -> (String, bool, bool) {
 
 /// Writes `text` as Cocoa-flavored RTF, the way Scrivener lays it out.
 pub fn write(text: &RichText) -> String {
-    let mut fonts: Vec<String> = Vec::new();
-    let mut colors: Vec<Rgb> = Vec::new();
+    let mut fonts: Order<String> = Order::new();
+    let mut colors: Order<Rgb> = Order::new();
     for p in &text.paragraphs {
         for r in &p.runs {
             let font = r.style.font.clone().unwrap_or_else(default_font);
-            if !fonts.contains(&font) {
-                fonts.push(font);
-            }
+            fonts.push_unique(font);
             for c in [r.style.color, r.style.highlight].into_iter().flatten() {
-                if !colors.contains(&c) {
-                    colors.push(c);
-                }
+                colors.push_unique(c);
             }
         }
     }
-    if fonts.is_empty() {
-        fonts.push(default_font());
+    if fonts.values.is_empty() {
+        fonts.push_unique(default_font());
     }
     // Color 1 is white in every file Scrivener writes; keep that.
-    let mut table: Vec<Rgb> = vec![(255, 255, 255)];
-    for c in colors {
-        if !table.contains(&c) {
-            table.push(c);
-        }
+    let mut table: Order<Rgb> = Order::new();
+    table.push_unique((255, 255, 255));
+    for c in &colors.values {
+        table.push_unique(*c);
     }
 
     let mut out = String::from(
         "{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n\\cocoatextscaling0\\cocoaplatform0{\\fonttbl",
     );
-    for (i, f) in fonts.iter().enumerate() {
+    for (i, f) in fonts.values.iter().enumerate() {
         // ';' ends a font-table entry, so it can't be part of a name.
         let name: String = f.chars().filter(|&c| c != ';').collect();
         let _ = write!(out, "\\f{i}\\fnil\\fcharset0 {};", rtf_escape_plain(&name));
     }
     out.push_str("}\n{\\colortbl;");
-    for (r, g, b) in &table {
+    for (r, g, b) in &table.values {
         let _ = write!(out, "\\red{r}\\green{g}\\blue{b};");
     }
     out.push_str("}\n{\\*\\expandedcolortbl;");
-    for _ in &table {
+    for _ in &table.values {
         out.push(';');
     }
     out.push_str("}\n");
 
-    let color_index = |c: Option<Rgb>| -> usize {
-        c.and_then(|c| table.iter().position(|t| *t == c))
-            .map_or(0, |i| i + 1)
-    };
+    let color_index =
+        |c: Option<Rgb>| -> usize { c.and_then(|c| table.position(&c)).map_or(0, |i| i + 1) };
     let font_index = |f: &Option<String>| -> usize {
         let f = f.clone().unwrap_or_else(default_font);
-        fonts.iter().position(|x| *x == f).unwrap_or(0)
+        fonts.position(&f).unwrap_or(0)
     };
 
     let mut last_para: Option<&ParaStyle> = None;
@@ -1122,10 +1190,10 @@ pub fn write(text: &RichText) -> String {
     let mut cf = usize::MAX;
     // An open `\field`: its link, and the formatting outside it, which
     // comes back when its groups close.
-    let mut field: Option<(String, CharStyle, usize)> = None;
+    let mut field: Option<(Rc<str>, CharStyle, usize)> = None;
     fn close_field(
         out: &mut String,
-        field: &mut Option<(String, CharStyle, usize)>,
+        field: &mut Option<(Rc<str>, CharStyle, usize)>,
         ch: &mut CharStyle,
         cf: &mut usize,
     ) {
@@ -1414,6 +1482,58 @@ mod tests {
         );
         let again = parse(write(&t).as_bytes());
         assert_eq!(again.paragraphs, t.paragraphs);
+    }
+
+    #[test]
+    fn a_link_split_by_bold_is_stored_once() {
+        let link = "https://example.test/".repeat(100);
+        let toggles = 2_000usize;
+        let mut src = format!(
+            "{{\\rtf1\\ansi{{\\fonttbl\\f0 Palatino-Roman;}}\\f0{{\\field{{\\*\\fldinst{{HYPERLINK \"{link}\"}}}}{{\\fldrslt "
+        );
+        for i in 0..toggles {
+            if i % 2 == 0 {
+                src.push_str("\\b a\\b0 ");
+            } else {
+                src.push('a');
+            }
+        }
+        src.push_str("}}}");
+        let started = std::time::Instant::now();
+        let text = parse(src.as_bytes());
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let runs = text.paragraphs.iter().map(|p| p.runs.len()).sum::<usize>();
+        assert!(runs >= toggles / 2, "runs {runs}");
+        let bytes = link_storage_bytes(&text);
+        let one = text.paragraphs[0].runs[0]
+            .style
+            .link
+            .as_ref()
+            .expect("the run keeps the link")
+            .len();
+        assert_eq!(
+            bytes, one,
+            "link storage {bytes} across {runs} runs, one target is {one}"
+        );
+        let again = parse(write(&text).as_bytes());
+        assert_eq!(again.plain_text(), text.plain_text());
+        assert_eq!(link_storage_bytes(&again), one);
+        eprintln!("link runs={runs} stored={bytes} ms={ms:.1}");
+    }
+
+    fn link_storage_bytes(text: &RichText) -> usize {
+        let mut seen = std::collections::HashSet::<*const u8>::new();
+        let mut bytes = 0usize;
+        for paragraph in &text.paragraphs {
+            for run in &paragraph.runs {
+                if let Some(link) = &run.style.link
+                    && seen.insert(link.as_ptr())
+                {
+                    bytes += link.len();
+                }
+            }
+        }
+        bytes
     }
 
     #[test]
@@ -1838,5 +1958,106 @@ mod tests {
         let t = parse(&src);
         assert_eq!(t.plain_text(), "Zooms the PDF to its native scale.");
         assert_eq!(t.lossy, vec!["footnotes"]);
+    }
+
+    #[test]
+    fn font_and_color_tables_are_built_in_one_pass() {
+        let n = 2_000usize;
+        let mut runs = Vec::with_capacity(n);
+        for i in 0..n {
+            runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    font: Some(format!("Face{i}")),
+                    color: Some((
+                        u8::try_from(i % 200).unwrap(),
+                        u8::try_from((i / 200) % 200).unwrap(),
+                        1,
+                    )),
+                    ..CharStyle::default()
+                },
+            });
+        }
+        let text = RichText {
+            paragraphs: vec![Paragraph {
+                style: ParaStyle::default(),
+                runs,
+            }],
+            lossy: Vec::new(),
+        };
+        reset_table_probes();
+        let started = std::time::Instant::now();
+        let rtf = write(&text);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let probes = table_probes();
+        let runs_n = u64::try_from(n).unwrap();
+        assert!(rtf.contains("\\f0\\fnil\\fcharset0 Face0;"));
+        assert!(rtf.contains(&format!("\\f{}\\fnil\\fcharset0 Face{};", n - 1, n - 1)));
+        assert!(
+            probes <= runs_n.saturating_mul(12),
+            "probed {probes} for {runs_n} runs"
+        );
+        eprintln!("table probes={probes} runs={runs_n} ms={ms:.1}");
+    }
+
+    #[test]
+    fn font_table_bytes_stay_put() {
+        let text = RichText {
+            paragraphs: vec![
+                Paragraph {
+                    style: ParaStyle::default(),
+                    runs: vec![
+                        Run {
+                            text: "Hi".into(),
+                            style: CharStyle {
+                                font: Some("Times".into()),
+                                bold: true,
+                                color: Some((200, 0, 0)),
+                                ..CharStyle::default()
+                            },
+                        },
+                        Run {
+                            text: " ".into(),
+                            style: CharStyle::default(),
+                        },
+                        Run {
+                            text: "there".into(),
+                            style: CharStyle {
+                                highlight: Some((255, 255, 0)),
+                                color: Some((255, 255, 255)),
+                                ..CharStyle::default()
+                            },
+                        },
+                    ],
+                },
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Center,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![Run {
+                        text: "end".into(),
+                        style: CharStyle {
+                            font: Some("Times".into()),
+                            ..CharStyle::default()
+                        },
+                    }],
+                },
+            ],
+            lossy: Vec::new(),
+        };
+        assert_eq!(
+            write(&text),
+            "{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n\
+\\cocoatextscaling0\\cocoaplatform0{\\fonttbl\\f0\\fnil\\fcharset0 Times;\\f1\\fnil\\fcharset0 Palatino;}\n\
+{\\colortbl;\\red255\\green255\\blue255;\\red200\\green0\\blue0;\\red255\\green255\\blue0;}\n\
+{\\*\\expandedcolortbl;;;;}\n\
+\\pard\\pardirnatural\\partightenfactor0\n\
+\n\
+\\f0\\fs24\\b\\cf2 Hi\\f1\\b0\\cf0  \\cf1 {\\cb3 there}\\\n\
+\\pard\\pardirnatural\\qc\\partightenfactor0\n\
+\n\
+\\f0\\cf0 end}"
+        );
     }
 }

@@ -1,8 +1,86 @@
 use crate::project::{self, Item, Kind, Project};
 use crate::rtf::{CharStyle, ParaStyle, Paragraph, RichText, Run};
 use regex::Regex;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    static STYLE_VISITS: Cell<u64> = const { Cell::new(0) };
+    static EMIT_VISITS: Cell<u64> = const { Cell::new(0) };
+    static SLICE_VISITS: Cell<u64> = const { Cell::new(0) };
+    static SNIPPET_VISITS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_visits(n: usize) {
+    #[cfg(test)]
+    STYLE_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+fn note_emit(n: usize) {
+    #[cfg(test)]
+    EMIT_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_emit_visits() {
+    EMIT_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn emit_visits() -> u64 {
+    EMIT_VISITS.with(|visits| visits.get())
+}
+
+fn note_snippet(n: usize) {
+    #[cfg(test)]
+    SNIPPET_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_snippet_visits() {
+    SNIPPET_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn snippet_visits() -> u64 {
+    SNIPPET_VISITS.with(|visits| visits.get())
+}
+
+fn note_slice(n: usize) {
+    #[cfg(test)]
+    SLICE_VISITS.with(|visits| visits.set(visits.get() + u64::try_from(n).unwrap_or(u64::MAX)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_slice_visits() {
+    SLICE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn slice_visits() -> u64 {
+    SLICE_VISITS.with(|visits| visits.get())
+}
+
+#[cfg(test)]
+fn reset_style_visits() {
+    STYLE_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn style_visits() -> u64 {
+    STYLE_VISITS.with(|visits| visits.get())
+}
 
 pub const MAX_PATTERN: usize = 1024;
 
@@ -286,6 +364,7 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
     }
     let atoms = atoms_of(text);
     let total = atoms.last().map(Atom::end).unwrap_or(0);
+    let mut source = EmitCursor::default();
     let mut paras = vec![Paragraph {
         style: text
             .paragraphs
@@ -310,7 +389,7 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
             .get(edit_ix)
             .map(|e| e.range.start)
             .unwrap_or(total);
-        emit_source(&mut paras, &atoms, i, limit);
+        emit_source(&mut paras, &atoms, &mut source, i, limit);
         i = limit;
     }
     Some(RichText {
@@ -319,7 +398,7 @@ pub fn render(text: &RichText, plan: &EditPlan) -> Option<RichText> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Field {
     Body,
     Notes,
@@ -504,6 +583,31 @@ impl Preview {
         &self.skipped
     }
 
+    /// Documents open as a plain read-only view are not rewritten. They
+    /// are listed with the documents whose rewrite would drop images or
+    /// other content the reader does not keep.
+    pub fn skip_held(&mut self, held: &[(&str, Field)]) {
+        let mut keep = Vec::new();
+        for group in std::mem::take(&mut self.groups) {
+            let blocked = held.iter().any(|(uuid, field)| {
+                group.id.field == *field && group.id.uuid.eq_ignore_ascii_case(uuid)
+            });
+            if blocked {
+                self.skipped.push(Skipped {
+                    id: group.id,
+                    title: group.title,
+                    path_label: group.path_label,
+                    in_trash: group.in_trash,
+                    reason: vec!["inline formatting"],
+                    rows: group.rows,
+                });
+            } else {
+                keep.push(group);
+            }
+        }
+        self.groups = keep;
+    }
+
     pub fn ids(&self) -> Vec<MatchId> {
         self.groups
             .iter()
@@ -548,6 +652,7 @@ pub fn preview(project: &Project, query: &Query) -> Result<Preview, project::Err
         groups: &mut groups,
         skipped: &mut skipped,
         next: &mut next,
+        seen: HashSet::new(),
     };
     walk(&mut scan, &items, "", false)?;
     Ok(Preview { groups, skipped })
@@ -624,12 +729,13 @@ pub fn apply_at(
     for group in &preview.groups {
         let current = read_field(project, group.id()).map_err(ApplyError::Read)?;
         let plain = current.plain_text();
+        let mut place = PlainCursor::default();
         let mut edits = Vec::new();
         for row in group.rows() {
             if !chosen.contains(&row.id()) {
                 continue;
             }
-            match plain_slice(&plain, row.edit().range()) {
+            match plain_slice(&plain, &mut place, row.edit().range()) {
                 Some(slice) if slice == row.edit().matched() => edits.push(row.edit().clone()),
                 _ => missed += 1,
             }
@@ -696,6 +802,7 @@ fn find_in(text: &RichText, query: &Query) -> Vec<Found> {
             .map(|_| index)
             .expect("regex match lands on a character boundary")
     };
+    let mut styles = StyleWalk::new(text);
     let mut out = Vec::new();
     for caps in query.needle.captures_iter(&plain) {
         let whole = caps.get(0).expect("capture 0 is the whole match");
@@ -712,7 +819,7 @@ fn find_in(text: &RichText, query: &Query) -> Vec<Found> {
         };
         let matched: String = chars[start..end].iter().collect();
         let replacement = expand(&query.template, &caps);
-        let (char_style, para_style) = style_at(text, start);
+        let (char_style, para_style) = styles.at(start);
         out.push(Found {
             range,
             matched,
@@ -848,11 +955,121 @@ fn group_index(needle: &Regex, name: &str) -> Result<usize, QueryError> {
         .ok_or_else(|| QueryError::Replacement(format!("No group ${name}")))
 }
 
+/// Styles for match starts, in nondecreasing order. Each character and
+/// paragraph break is counted once.
+struct StyleWalk<'a> {
+    text: &'a RichText,
+    para_i: usize,
+    run_i: usize,
+    at: usize,
+    noted: usize,
+    run_chars: usize,
+    previous: CharStyle,
+    on_break: bool,
+    done: bool,
+    end_para: ParaStyle,
+}
+
+impl<'a> StyleWalk<'a> {
+    fn new(text: &'a RichText) -> Self {
+        Self {
+            text,
+            para_i: 0,
+            run_i: 0,
+            at: 0,
+            noted: 0,
+            run_chars: 0,
+            previous: CharStyle::default(),
+            on_break: false,
+            done: text.paragraphs.is_empty(),
+            end_para: text
+                .paragraphs
+                .last()
+                .map(|p| p.style.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn at(&mut self, index: usize) -> (CharStyle, ParaStyle) {
+        if self.done {
+            return (self.previous.clone(), self.end_para.clone());
+        }
+        loop {
+            if self.para_i >= self.text.paragraphs.len() {
+                self.done = true;
+                return (self.previous.clone(), self.end_para.clone());
+            }
+            if self.on_break {
+                if self.noted == 0 {
+                    note_visits(1);
+                    self.noted = 1;
+                }
+                let char_style = self.text.paragraphs[self.para_i]
+                    .runs
+                    .first()
+                    .map(|r| r.style.clone())
+                    .unwrap_or_else(|| self.previous.clone());
+                let para_style = self.text.paragraphs[self.para_i].style.clone();
+                if self.at == index {
+                    self.on_break = false;
+                    self.at += 1;
+                    self.run_i = 0;
+                    self.noted = 0;
+                    self.run_chars = 0;
+                    return (char_style, para_style);
+                }
+                self.on_break = false;
+                self.at += 1;
+                self.run_i = 0;
+                self.noted = 0;
+                self.run_chars = 0;
+                continue;
+            }
+            if self.run_i >= self.text.paragraphs[self.para_i].runs.len() {
+                self.para_i += 1;
+                self.run_i = 0;
+                self.noted = 0;
+                self.run_chars = 0;
+                self.on_break = self.para_i < self.text.paragraphs.len();
+                continue;
+            }
+            let n = if self.noted == 0 {
+                let n = self.text.paragraphs[self.para_i].runs[self.run_i]
+                    .text
+                    .chars()
+                    .count();
+                note_visits(n);
+                self.run_chars = n;
+                self.noted = n;
+                n
+            } else {
+                self.run_chars
+            };
+            let style = self.text.paragraphs[self.para_i].runs[self.run_i]
+                .style
+                .clone();
+            let para_style = self.text.paragraphs[self.para_i].style.clone();
+            if index < self.at + n {
+                return (style, para_style);
+            }
+            if n > 0 {
+                self.previous = style;
+            }
+            self.at += n;
+            self.run_i += 1;
+            self.noted = 0;
+            self.run_chars = 0;
+        }
+    }
+}
+
+#[cfg(test)]
 fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
     let mut at = 0usize;
     let mut previous = CharStyle::default();
     for (pi, para) in text.paragraphs.iter().enumerate() {
         if pi > 0 {
+            note_visits(1);
             if at == index {
                 let char_style = para
                     .runs
@@ -865,6 +1082,7 @@ fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
         }
         for run in &para.runs {
             let n = run.text.chars().count();
+            note_visits(n);
             if index < at + n {
                 return (run.style.clone(), para.style.clone());
             }
@@ -885,6 +1103,7 @@ fn style_at(text: &RichText, index: usize) -> (CharStyle, ParaStyle) {
 
 enum Atom {
     Chars {
+        start: usize,
         end: usize,
         text: String,
         style: CharStyle,
@@ -893,6 +1112,13 @@ enum Atom {
         at: usize,
         next: ParaStyle,
     },
+}
+
+#[derive(Default)]
+struct EmitCursor {
+    atom: usize,
+    taken: usize,
+    byte: usize,
 }
 
 impl Atom {
@@ -921,6 +1147,7 @@ fn atoms_of(text: &RichText) -> Vec<Atom> {
                 continue;
             }
             atoms.push(Atom::Chars {
+                start: at,
                 end: at + n,
                 text: run.text.clone(),
                 style: run.style.clone(),
@@ -931,27 +1158,81 @@ fn atoms_of(text: &RichText) -> Vec<Atom> {
     atoms
 }
 
-fn emit_source(paras: &mut Vec<Paragraph>, atoms: &[Atom], from: usize, to: usize) {
-    for atom in atoms {
-        match atom {
-            Atom::Break { at, next } if *at >= from && *at < to => {
+fn emit_source(
+    paras: &mut Vec<Paragraph>,
+    atoms: &[Atom],
+    cursor: &mut EmitCursor,
+    from: usize,
+    to: usize,
+) {
+    while cursor.atom < atoms.len() && from < to {
+        if let Atom::Break { at, next } = &atoms[cursor.atom] {
+            let at = *at;
+            if at >= to {
+                return;
+            }
+            let next = next.clone();
+            if at >= from {
                 paras.push(Paragraph {
-                    style: next.clone(),
+                    style: next,
                     runs: Vec::new(),
                 });
             }
-            Atom::Chars { end, text, style } => {
-                let start = end - text.chars().count();
-                let lo = from.max(start);
-                let hi = to.min(*end);
-                if lo < hi {
-                    let slice: String = text.chars().skip(lo - start).take(hi - lo).collect();
-                    push_chars(paras, &slice, style);
-                }
-            }
-            Atom::Break { .. } => {}
+            cursor.atom += 1;
+            cursor.taken = 0;
+            cursor.byte = 0;
+            continue;
+        }
+        let Atom::Chars {
+            start,
+            end,
+            text,
+            style,
+        } = &atoms[cursor.atom]
+        else {
+            continue;
+        };
+        let start = *start;
+        let end = *end;
+        if start >= to {
+            return;
+        }
+        if end <= from {
+            cursor.atom += 1;
+            cursor.taken = 0;
+            cursor.byte = 0;
+            continue;
+        }
+        let lo = from.max(start);
+        let hi = to.min(end);
+        let style = style.clone();
+        let (skipped, taken) = advance_run(text, cursor.byte, cursor.taken, lo - start);
+        let (byte, taken) = advance_run(text, skipped, taken, hi - start);
+        let slice = text[skipped..byte].to_string();
+        push_chars(paras, &slice, &style);
+        cursor.byte = byte;
+        cursor.taken = taken;
+        if hi == end {
+            cursor.atom += 1;
+            cursor.taken = 0;
+            cursor.byte = 0;
+        } else {
+            return;
         }
     }
+}
+
+fn advance_run(text: &str, mut byte: usize, mut taken: usize, target: usize) -> (usize, usize) {
+    while taken < target {
+        let ch = text[byte..]
+            .chars()
+            .next()
+            .expect("run text has the character length atoms_of stored");
+        byte += ch.len_utf8();
+        taken += 1;
+        note_emit(1);
+    }
+    (byte, taken)
 }
 
 fn emit_replacement(paras: &mut Vec<Paragraph>, edit: &Edit) {
@@ -1010,12 +1291,31 @@ fn edits_of(found: &[Found]) -> Vec<Edit> {
         .collect()
 }
 
-fn plain_slice(plain: &str, range: CharRange) -> Option<String> {
-    let slice: String = plain
-        .chars()
-        .skip(range.start())
-        .take(range.len())
-        .collect();
+#[derive(Default)]
+struct PlainCursor {
+    chars: usize,
+    byte: usize,
+}
+
+fn plain_slice(plain: &str, cursor: &mut PlainCursor, range: CharRange) -> Option<String> {
+    if range.start() < cursor.chars || cursor.byte > plain.len() {
+        cursor.chars = 0;
+        cursor.byte = 0;
+    }
+    while cursor.chars < range.start() {
+        let ch = plain[cursor.byte..].chars().next()?;
+        cursor.byte += ch.len_utf8();
+        cursor.chars += 1;
+        note_slice(1);
+    }
+    let from = cursor.byte;
+    while cursor.chars < range.end() {
+        let ch = plain[cursor.byte..].chars().next()?;
+        cursor.byte += ch.len_utf8();
+        cursor.chars += 1;
+        note_slice(1);
+    }
+    let slice = plain[from..cursor.byte].to_string();
     (slice.chars().count() == range.len()).then_some(slice)
 }
 
@@ -1032,6 +1332,9 @@ struct Scan<'a> {
     groups: &'a mut Vec<Group>,
     skipped: &'a mut Vec<Skipped>,
     next: &'a mut u32,
+    /// Uppercase UUID plus field. `Files/Data/<UUID>/` is one document, so a
+    /// later binder row with that id is not parsed or matched again.
+    seen: HashSet<(String, Field)>,
 }
 
 fn walk(
@@ -1047,13 +1350,16 @@ fn walk(
         } else {
             format!("{path} / {}", item.title)
         };
-        if item.kind.has_text() {
+        let key = item.uuid.to_ascii_uppercase();
+        if item.kind.has_text() && scan.seen.insert((key.clone(), Field::Body)) {
             let text = scan.project.text(&item.uuid)?;
             push_group(scan, item, path, here, Field::Body, &text);
         }
-        let notes = scan.project.notes(&item.uuid)?;
-        if !notes.plain_text().is_empty() {
-            push_group(scan, item, path, here, Field::Notes, &notes);
+        if scan.seen.insert((key, Field::Notes)) {
+            let notes = scan.project.notes(&item.uuid)?;
+            if !notes.plain_text().is_empty() {
+                push_group(scan, item, path, here, Field::Notes, &notes);
+            }
         }
         walk(scan, &item.children, &label, here)?;
     }
@@ -1073,14 +1379,14 @@ fn push_group(
     if edits.is_empty() {
         return;
     }
+    let snippets = snippets_of(&plain, &edits);
     let mut rows = Vec::new();
-    for edit in edits {
+    for (edit, snippet) in edits.into_iter().zip(snippets) {
         let Some(advanced) = scan.next.checked_add(1) else {
             break;
         };
         let id = MatchId(*scan.next);
         *scan.next = advanced;
-        let snippet = snippet_of(&plain, edit.range, &edit.replacement);
         rows.push(Row { id, edit, snippet });
     }
     if rows.is_empty() {
@@ -1112,8 +1418,23 @@ fn push_group(
     }
 }
 
+fn snippets_of(plain: &str, edits: &[Edit]) -> Vec<Snippet> {
+    let chars: Vec<char> = plain.chars().collect();
+    note_snippet(chars.len());
+    edits
+        .iter()
+        .map(|edit| snippet_from(&chars, edit.range, &edit.replacement))
+        .collect()
+}
+
+#[cfg(test)]
 fn snippet_of(plain: &str, range: CharRange, replacement: &str) -> Snippet {
     let chars: Vec<char> = plain.chars().collect();
+    note_snippet(chars.len());
+    snippet_from(&chars, range, replacement)
+}
+
+fn snippet_from(chars: &[char], range: CharRange, replacement: &str) -> Snippet {
     let from = range.start().saturating_sub(40);
     let to = (range.end() + 40).min(chars.len());
     let take = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
@@ -1419,10 +1740,338 @@ mod tests {
     }
 
     #[test]
+    fn a_held_document_is_skipped_like_an_image() {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-held-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Held.scriv");
+        let mut project = Project::create(&path).unwrap();
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        project
+            .set_text(&scene, &RichText::from_plain("alpha beta"))
+            .unwrap();
+        let other = project.add_item(Kind::Text, "Other", &draft, None).unwrap();
+        project
+            .set_text(&other, &RichText::from_plain("alpha gamma"))
+            .unwrap();
+        project.save().unwrap();
+        let before = std::fs::read(project.data_dir(&scene).join("content.rtf")).unwrap();
+        let project = Project::open(&path).unwrap();
+        let query = literal("alpha", "omega", Word::Any, Case::Sensitive);
+        let mut preview = preview(&project, &query).unwrap();
+        assert!(
+            preview
+                .groups()
+                .iter()
+                .any(|group| group.id().uuid().eq_ignore_ascii_case(&scene))
+        );
+        preview.skip_held(&[(&scene, Field::Body)]);
+        assert!(
+            preview
+                .groups()
+                .iter()
+                .all(|group| !group.id().uuid().eq_ignore_ascii_case(&scene))
+        );
+        let skipped = preview
+            .skipped()
+            .iter()
+            .find(|skip| skip.id().uuid().eq_ignore_ascii_case(&scene))
+            .expect("the held document is listed with the image documents");
+        assert_eq!(skipped.reason(), ["inline formatting"]);
+        assert!(!skipped.rows().is_empty());
+        let mut project = Project::open(&path).unwrap();
+        let outcome = apply(
+            &mut project,
+            &dir.join("backups"),
+            1,
+            &preview,
+            &preview.ids(),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Done(_) | ApplyOutcome::SkippedOnly(_)
+        ));
+        assert_eq!(
+            std::fs::read(project.data_dir(&scene).join("content.rtf")).unwrap(),
+            before
+        );
+        let other_text = project.text(&other).unwrap().plain_text();
+        assert!(other_text.contains("omega"), "{other_text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn empty_pattern_is_rejected() {
         assert!(matches!(
             query("", "a", Options::default()),
             Err(QueryError::Empty)
         ));
+    }
+
+    #[test]
+    fn find_in_walks_styles_once() {
+        let n = 4_000usize;
+        let runs: Vec<Run> = (0..n)
+            .map(|i| Run {
+                text: "x ".into(),
+                style: CharStyle {
+                    bold: i % 2 == 0,
+                    ..CharStyle::default()
+                },
+            })
+            .collect();
+        let text = RichText {
+            paragraphs: vec![Paragraph {
+                style: ParaStyle::default(),
+                runs,
+            }],
+            lossy: Vec::new(),
+        };
+        let query = literal("x", "y", Word::Any, Case::Sensitive);
+        reset_style_visits();
+        let started = std::time::Instant::now();
+        let plan = plan_all(&text, &query);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(plan.edits().len(), n);
+        assert!(plan.edits()[0].char_style().bold);
+        assert!(!plan.edits()[1].char_style().bold);
+        let visits = style_visits();
+        let chars = u64::try_from(text.plain_text().chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("find visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn style_walk_matches_style_at_across_breaks() {
+        let text = RichText {
+            paragraphs: vec![
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Left,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![
+                        Run {
+                            text: String::new(),
+                            style: CharStyle {
+                                bold: true,
+                                ..CharStyle::default()
+                            },
+                        },
+                        Run {
+                            text: "ab".into(),
+                            style: CharStyle {
+                                italic: true,
+                                ..CharStyle::default()
+                            },
+                        },
+                    ],
+                },
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Center,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![],
+                },
+                Paragraph {
+                    style: ParaStyle {
+                        align: Align::Right,
+                        ..ParaStyle::default()
+                    },
+                    runs: vec![Run {
+                        text: "c".into(),
+                        style: CharStyle {
+                            underline: true,
+                            ..CharStyle::default()
+                        },
+                    }],
+                },
+            ],
+            lossy: Vec::new(),
+        };
+        let plain_len = text.plain_text().chars().count();
+        let mut walk = StyleWalk::new(&text);
+        for index in 0..=plain_len {
+            let from_walk = walk.at(index);
+            let from_at = style_at(&text, index);
+            assert_eq!(from_walk.0, from_at.0, "char style at {index}");
+            assert_eq!(from_walk.1, from_at.1, "para style at {index}");
+        }
+    }
+
+    #[test]
+    fn render_walks_source_atoms_once() {
+        let n = 2_000usize;
+        let runs: Vec<Run> = (0..n)
+            .map(|_| Run {
+                text: "ab ".into(),
+                style: CharStyle::default(),
+            })
+            .collect();
+        let text = RichText {
+            paragraphs: vec![Paragraph {
+                style: ParaStyle::default(),
+                runs,
+            }],
+            lossy: Vec::new(),
+        };
+        let plan = plan_all(&text, &literal("a", "A", Word::Any, Case::Sensitive));
+        assert_eq!(plan.edits().len(), n);
+        reset_emit_visits();
+        let started = std::time::Instant::now();
+        let next = render(&text, &plan).unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(next.plain_text().matches('A').count(), n);
+        let visits = emit_visits();
+        let chars = u64::try_from(text.plain_text().chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("render visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn chosen_matches_are_sliced_from_a_carried_offset() {
+        let n = 4_000usize;
+        let plain = "ab ".repeat(n);
+        let mut place = PlainCursor::default();
+        reset_slice_visits();
+        let started = std::time::Instant::now();
+        for i in 0..n {
+            let start = i * 3;
+            let range = CharRange::try_bounds(start, start + 1).unwrap();
+            assert_eq!(plain_slice(&plain, &mut place, range).as_deref(), Some("a"));
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let visits = slice_visits();
+        let chars = u64::try_from(plain.chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("slice visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn snippets_read_the_document_once() {
+        let sample = snippet_of(
+            "abcdefghijklmnopqrstuvwxyz",
+            CharRange::try_bounds(10, 12).unwrap(),
+            "XY",
+        );
+        assert_eq!(sample.before, "abcdefghij");
+        assert_eq!(sample.matched, "kl");
+        assert_eq!(sample.after, "mnopqrstuvwxyz");
+        assert_eq!(sample.replacement, "XY");
+
+        let n = 4_000usize;
+        let plain = "x ".repeat(n);
+        let text = RichText::from_plain(&plain);
+        let query = literal("x", "y", Word::Any, Case::Sensitive);
+        let edits = edits_of(&find_in(&text, &query));
+        assert_eq!(edits.len(), n);
+        reset_snippet_visits();
+        let started = std::time::Instant::now();
+        let snippets = snippets_of(&plain, &edits);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(snippets.len(), n);
+        assert_eq!(snippets[0].matched, "x");
+        assert_eq!(snippets[0].replacement, "y");
+        assert!(snippets[0].after.starts_with(' '));
+        let visits = snippet_visits();
+        let chars = u64::try_from(plain.chars().count()).unwrap();
+        assert!(
+            visits <= chars.saturating_mul(4),
+            "visited {visits} of {chars}"
+        );
+        eprintln!("snippet visits={visits} chars={chars} ms={ms:.1}");
+    }
+
+    #[test]
+    fn shared_uuid_is_parsed_and_written_once() {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-alias-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Aliases.scriv");
+        let mut project = Project::create(&path).unwrap();
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let shared = project
+            .add_item(Kind::Text, "The Lamp", &draft, None)
+            .unwrap();
+        let copies = 32usize;
+        project
+            .set_text(&shared, &RichText::from_plain(&"lamp ".repeat(copies)))
+            .unwrap();
+        let mut aliases = Vec::new();
+        for n in 0..100 {
+            aliases.push(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        let scrivx = std::fs::read_dir(&path)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.extension()
+                    .is_some_and(|ext| ext == "scrivx")
+                    .then_some(path)
+            })
+            .unwrap();
+        let mut xml = std::fs::read_to_string(&scrivx).unwrap();
+        for alias in &aliases {
+            let from = format!("UUID=\"{alias}\"");
+            assert!(xml.contains(&from), "{alias}");
+            xml = xml.replacen(&from, &format!("UUID=\"{shared}\""), 1);
+        }
+        std::fs::write(&scrivx, xml).unwrap();
+        let mut project = Project::open(&path).unwrap();
+        let query = literal("lamp", "light", Word::Whole, Case::Sensitive);
+        crate::rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let preview = preview(&project, &query).unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let parses = crate::rtf::parses();
+        assert_eq!(preview.groups().len(), 1, "one document, one group");
+        assert_eq!(preview.groups()[0].rows().len(), copies);
+        assert!(
+            parses <= 4,
+            "101 rows parsed the shared file {parses} times"
+        );
+        project::reset_content_writes();
+        let outcome = apply(
+            &mut project,
+            &dir.join("backups"),
+            1,
+            &preview,
+            &preview.ids(),
+        )
+        .unwrap();
+        let ApplyOutcome::Done(report) = outcome else {
+            panic!("expected a write");
+        };
+        let writes = project::content_writes();
+        assert_eq!(writes, 1, "shared file written {writes} times");
+        assert_eq!(report.written.len(), 1);
+        let text = Project::open(&path)
+            .unwrap()
+            .text(&shared)
+            .unwrap()
+            .plain_text();
+        assert!(text.contains("light"));
+        assert!(!text.contains("lamp"));
+        eprintln!("aliases=100 parses={parses} writes={writes} ms={ms:.1}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

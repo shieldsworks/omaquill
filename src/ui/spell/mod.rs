@@ -17,6 +17,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+mod menu;
+
 const TAG: &str = "spell";
 
 thread_local! {
@@ -42,10 +44,16 @@ pub struct Session {
     language: RefCell<String>,
     broker: RefCell<Option<Broker>>,
     dictionary: RefCell<BTreeSet<String>>,
+    /// Where added words are stored. A held document does not write this file.
+    dictionary_file: RefCell<PathBuf>,
     ignored: RefCell<BTreeSet<String>>,
     ignore_path: RefCell<Option<PathBuf>>,
     line: Cell<i32>,
     index: Cell<i32>,
+    /// Line-relative character offset of `scan_mark`, so the next slice
+    /// walks forward from there.
+    scan_at: Cell<i32>,
+    scan_mark: RefCell<Option<gtk::TextMark>>,
     idle: RefCell<Option<glib::SourceId>>,
     me: RefCell<std::rc::Weak<Session>>,
     /// Buffer offsets of the word the caret was in, so leaving it can mark it.
@@ -67,10 +75,13 @@ impl Session {
             broker: RefCell::new(Broker::open(&tag)),
             language: RefCell::new(tag),
             dictionary: RefCell::new(state::load_words(&state::dictionary_path())),
+            dictionary_file: RefCell::new(state::dictionary_path()),
             ignored: RefCell::new(BTreeSet::new()),
             ignore_path: RefCell::new(None),
             line: Cell::new(0),
             index: Cell::new(0),
+            scan_at: Cell::new(0),
+            scan_mark: RefCell::new(None),
             idle: RefCell::new(None),
             me: RefCell::new(std::rc::Weak::new()),
             left: Cell::new(None),
@@ -122,22 +133,46 @@ impl Session {
         self.rescan();
     }
 
-    /// A one-character edit checks the words next to the caret. A paste, or
-    /// any larger change, checks the whole buffer.
+    /// A paste, or any larger change, checks the whole buffer. A
+    /// one-character edit moves the scan backward to the word that changed.
+    /// It does not move the scan forward, so a keystroke ahead of the idle
+    /// pass cannot skip text that has not been checked. The scan mark is
+    /// cleared only when the index moves, so the next slice does not copy
+    /// the line.
     pub fn after_edit(&self) {
+        if self.editor.is_too_formatted() {
+            return;
+        }
         let n = self.editor.buffer.char_count();
         let prev = self.chars.replace(n);
-        if (n - prev).abs() > 1 {
+        let delta = n - prev;
+        if delta.abs() > 1 {
             self.left.set(None);
             self.rescan();
             return;
+        }
+        let buffer = &self.editor.buffer;
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let line = cursor.line();
+        let scan_line = self.line.get();
+        if line < scan_line {
+            self.line.set(line);
+            self.index
+                .set(spell::line_anchor_after_edit(cursor.line_offset(), delta));
+            self.clear_scan_mark();
+        } else if line == scan_line {
+            let next = spell::scan_index_after_edit(self.index.get(), cursor.line_offset(), delta);
+            if next < self.index.get() {
+                self.index.set(next);
+                self.clear_scan_mark();
+            }
         }
         self.refresh_cursor();
     }
 
     pub fn refresh_cursor(&self) {
         let policy = *self.policy.borrow();
-        if !spell::shown(&policy) {
+        if !spell::shown(&policy) || self.editor.is_too_formatted() {
             return;
         }
         let buffer = &self.editor.buffer;
@@ -158,10 +193,15 @@ impl Session {
 
     pub fn rescan(&self) {
         self.stop();
+        self.clear_scan_mark();
         self.left.set(None);
         self.chars.set(self.editor.buffer.char_count());
-        if !spell::shown(&self.policy.borrow()) {
+        if !spell::shown(&self.policy.borrow()) || self.editor.is_too_formatted() {
             self.clear_all();
+            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
+            self.editor
+                .view
+                .insert_action_group("spell", None::<&gtk::gio::SimpleActionGroup>);
             return;
         }
         self.line.set(0);
@@ -195,113 +235,6 @@ impl Session {
             session.prepare_click(x, y);
         });
         self.editor.view.add_controller(click);
-    }
-
-    fn prepare_click(&self, x: f64, y: f64) {
-        let (bx, by) = self.editor.view.window_to_buffer_coords(
-            gtk::TextWindowType::Widget,
-            widget_coord(x),
-            widget_coord(y),
-        );
-        let Some(click) = self.editor.view.iter_at_location(bx, by) else {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return;
-        };
-        self.prepare_at(&click);
-    }
-
-    /// Suggestions, Add, and Ignore are items on the text view's own menu.
-    /// A second popover would sit under that menu.
-    fn prepare_at(&self, click: &gtk::TextIter) -> bool {
-        let mut policy = *self.policy.borrow();
-        policy.hide_word_at_cursor = false;
-        if !spell::shown(&policy) {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return false;
-        }
-        let mut origin = *click;
-        origin.backward_chars(4_200);
-        let mut end = *click;
-        end.forward_chars(80);
-        let text = self.editor.buffer.text(&origin, &end, false).to_string();
-        let at = byte_between(&text, click.offset() - origin.offset());
-        let at = if spell::is_word_char(click.char()) {
-            let ch = click.char();
-            at.saturating_add(ch.len_utf8()).min(text.len())
-        } else {
-            at
-        };
-        let mut known = |w: &str| self.known(w);
-        let touches = spell::keystroke_marks(&text, at, &policy, &mut known);
-        let Some(touch) = touches.into_iter().find(|t| t.start < at && at <= t.end) else {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return false;
-        };
-        let Some(bad) = touch
-            .bad
-            .iter()
-            .find(|r| r.start < at && at <= r.end)
-            .or(touch.bad.first())
-        else {
-            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
-            return false;
-        };
-        let word = text[bad.clone()].to_string();
-        let form = spell::dictionary_form(&word);
-        let suggestions = self
-            .broker
-            .borrow()
-            .as_ref()
-            .map(|b| b.suggest(&form))
-            .unwrap_or_default();
-        let start = origin
-            .offset()
-            .saturating_add(chars_before(&text, bad.start));
-        let end = origin.offset().saturating_add(chars_before(&text, bad.end));
-        self.install_menu(&word, &suggestions, start, end);
-        true
-    }
-
-    fn install_menu(&self, word: &str, suggestions: &[String], start: i32, end: i32) {
-        let menu = gtk::gio::Menu::new();
-        let group = gtk::gio::SimpleActionGroup::new();
-        for (i, suggestion) in suggestions.iter().take(8).enumerate() {
-            let name = format!("s{i}");
-            menu.append(Some(suggestion), Some(&format!("spell.{name}")));
-            let action = gtk::gio::SimpleAction::new(&name, None);
-            let replacement = suggestion.clone();
-            let weak_editor = Rc::downgrade(&self.editor);
-            action.connect_activate(move |_, _| {
-                if let Some(editor) = weak_editor.upgrade() {
-                    replace_word(&editor, start, end, &replacement);
-                }
-            });
-            group.add_action(&action);
-        }
-        menu.append(Some("Add to Dictionary"), Some("spell.add"));
-        menu.append(Some("Ignore"), Some("spell.ignore"));
-        let add = gtk::gio::SimpleAction::new("add", None);
-        let ignore = gtk::gio::SimpleAction::new("ignore", None);
-        let weak = self.me.borrow().clone();
-        let added = word.to_string();
-        add.connect_activate(move |_, _| {
-            if let Some(session) = weak.upgrade() {
-                session.remember(&added, true);
-                session.rescan();
-            }
-        });
-        let weak = self.me.borrow().clone();
-        let ignored = word.to_string();
-        ignore.connect_activate(move |_, _| {
-            if let Some(session) = weak.upgrade() {
-                session.remember(&ignored, false);
-                session.rescan();
-            }
-        });
-        group.add_action(&add);
-        group.add_action(&ignore);
-        self.editor.view.insert_action_group("spell", Some(&group));
-        self.editor.view.set_extra_menu(Some(&menu));
     }
 
     fn remember_cursor_word(&self, origin: &gtk::TextIter, text: &str, cursor: usize) {
@@ -405,7 +338,7 @@ impl Session {
     }
 
     fn pump(&self) -> glib::ControlFlow {
-        if !spell::shown(&self.policy.borrow()) {
+        if !spell::shown(&self.policy.borrow()) || self.editor.is_too_formatted() {
             self.idle.borrow_mut().take();
             return glib::ControlFlow::Break;
         }
@@ -416,8 +349,7 @@ impl Session {
             return glib::ControlFlow::Break;
         }
         let Some(line_start) = buffer.iter_at_line(line) else {
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         };
         let mut line_end = line_start;
@@ -428,39 +360,86 @@ impl Session {
         let index = self.index.get().clamp(0, chars.max(0));
         if chars <= 2_000 {
             self.paint_slice(&line_start, &line_end);
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         }
         if index >= chars {
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         }
-        let text = buffer.text(&line_start, &line_end, false).to_string();
-        let Some(scan) = spell::next_scan(&text, byte_between(&text, index), 1_500) else {
-            self.line.set(line + 1);
-            self.index.set(0);
+        let line_chars = usize::try_from(chars).unwrap_or(0);
+        let index_at = usize::try_from(index).unwrap_or(0).min(line_chars);
+        let (win_start, win_end) = spell::slice_window(line_chars, index_at, 1_500);
+        if win_end <= win_start {
+            self.advance_line(line);
+            return glib::ControlFlow::Continue;
+        }
+        let origin = self.iter_on_line(&line_start, win_start);
+        let mut win_end_iter = origin;
+        let win_chars = i32::try_from(win_end - win_start).unwrap_or(i32::MAX);
+        win_end_iter.forward_chars(win_chars);
+        let text = buffer.text(&origin, &win_end_iter, false).to_string();
+        let local = index_at - win_start;
+        let mut mark = spell::LineMark::resume(local, spell::byte_of_chars(&text, local));
+        let Some(slice) = spell::take_slice(&text, &mut mark, 1_500) else {
+            self.advance_line(line);
             return glib::ControlFlow::Continue;
         };
-        if scan.end > scan.start {
-            let start = iter_at(&line_start, &text, scan.start);
-            let end = iter_at(&line_start, &text, scan.end);
+        if slice.end_byte > slice.start_byte {
+            let start = iter_chars(&origin, slice.start_chars);
+            let end = iter_chars(&origin, slice.end_chars);
             self.paint_slice(&start, &end);
         }
-        if scan.resume > scan.end {
-            let start = iter_at(&line_start, &text, scan.end);
-            let end = iter_at(&line_start, &text, scan.resume);
+        if slice.resume_byte > slice.end_byte {
+            let start = iter_chars(&origin, slice.end_chars);
+            let end = iter_chars(&origin, slice.resume_chars);
             buffer.remove_tag(&self.tag(), &start, &end);
         }
-        let next = chars_before(&text, scan.resume);
+        let next_chars = win_start.saturating_add(slice.resume_chars);
+        let next = i32::try_from(next_chars).unwrap_or(i32::MAX);
         if next >= chars {
-            self.line.set(line + 1);
-            self.index.set(0);
+            self.advance_line(line);
         } else {
             self.index.set(next);
         }
         glib::ControlFlow::Continue
+    }
+
+    fn advance_line(&self, line: i32) {
+        self.line.set(line + 1);
+        self.index.set(0);
+        self.clear_scan_mark();
+    }
+
+    fn clear_scan_mark(&self) {
+        if let Some(mark) = self.scan_mark.borrow_mut().take() {
+            self.editor.buffer.delete_mark(&mark);
+        }
+        self.scan_at.set(0);
+    }
+
+    /// An iterator `chars` into the current line. The mark stays on the
+    /// buffer so the next slice moves by the gap, not from the line start.
+    fn iter_on_line(&self, line_start: &gtk::TextIter, chars: usize) -> gtk::TextIter {
+        let buffer = &self.editor.buffer;
+        let target = i32::try_from(chars).unwrap_or(i32::MAX);
+        if let Some(mark) = self.scan_mark.borrow().clone() {
+            let mut iter = buffer.iter_at_mark(&mark);
+            let delta = target - self.scan_at.get();
+            if delta > 0 {
+                iter.forward_chars(delta);
+            } else if delta < 0 {
+                iter.backward_chars(delta.saturating_neg());
+            }
+            buffer.move_mark(&mark, &iter);
+            self.scan_at.set(iter.offset() - line_start.offset());
+            return iter;
+        }
+        let iter = iter_chars(line_start, chars);
+        let mark = buffer.create_mark(None, &iter, true);
+        self.scan_at.set(target);
+        *self.scan_mark.borrow_mut() = Some(mark);
+        iter
     }
 
     fn paint_slice(&self, start: &gtk::TextIter, end: &gtk::TextIter) {
@@ -500,6 +479,9 @@ impl Session {
     }
 
     fn remember(&self, word: &str, dictionary: bool) {
+        if self.editor.is_too_formatted() {
+            return;
+        }
         let key = spell::dictionary_key(word);
         if key.is_empty() {
             return;
@@ -507,7 +489,7 @@ impl Session {
         if dictionary {
             self.dictionary.borrow_mut().insert(key);
             let words = self.dictionary.borrow().clone();
-            let _ = state::save_words(&state::dictionary_path(), &words);
+            let _ = state::save_words(&self.dictionary_file.borrow(), &words);
         } else {
             self.ignored.borrow_mut().insert(key);
             if let Some(path) = self.ignore_path.borrow().clone() {
@@ -519,6 +501,9 @@ impl Session {
 }
 
 fn replace_word(editor: &Editor, start: i32, end: i32, word: &str) {
+    if !editor.allows_edits() {
+        return;
+    }
     let buffer = &editor.buffer;
     let mut s = buffer.iter_at_offset(start);
     let mut e = buffer.iter_at_offset(end);
@@ -526,6 +511,12 @@ fn replace_word(editor: &Editor, start: i32, end: i32, word: &str) {
     buffer.delete(&mut s, &mut e);
     buffer.insert(&mut s, word);
     buffer.end_user_action();
+}
+
+fn iter_chars(origin: &gtk::TextIter, chars: usize) -> gtk::TextIter {
+    let mut iter = *origin;
+    iter.forward_chars(i32::try_from(chars).unwrap_or(i32::MAX));
+    iter
 }
 
 fn iter_at(origin: &gtk::TextIter, text: &str, byte: usize) -> gtk::TextIter {
@@ -834,6 +825,196 @@ pub(crate) mod tests {
         );
         assert!(labels.iter().any(|label| label == "Add to Dictionary"));
         assert!(labels.iter().any(|label| label == "Ignore"));
+    }
+
+    /// A held document is not spellchecked. The buffer is one window of the
+    /// file, so a mark or Add would keep a fragment cut at that edge. The
+    /// scan paints nothing, the text menu has no suggestion, Add, or Ignore,
+    /// and the dictionary file is left as it was.
+    pub(crate) fn a_held_document_is_not_spellchecked() {
+        let dir = std::env::temp_dir().join(format!("omaquill-spell-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dict = dir.join("dictionary");
+        std::fs::write(&dict, "alpha\n").unwrap();
+        let before = std::fs::read(&dict).unwrap();
+        let ignore = dir.join("ignored");
+
+        let editor = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&editor.root));
+        window.present();
+        let mut settings = Settings::default();
+        // The word under the caret is not marked. Hide that exception so a
+        // scan that does run has to mark `helo`.
+        settings.spell_hide_current = false;
+        let session = Session::new(&editor, &settings);
+        *session.dictionary.borrow_mut() = state::load_words(&dict);
+        *session.dictionary_file.borrow_mut() = dict.clone();
+        *session.ignore_path.borrow_mut() = Some(ignore.clone());
+        if session.has_dictionary() {
+            editor.load(omaquill::rtf::RichText::from_plain("helo storm"));
+            editor.buffer.place_cursor(&editor.buffer.end_iter());
+            session.rescan();
+            drain(&session);
+            let marked = marked_words(&editor.buffer);
+            assert!(
+                marked.iter().any(|word| word == "helo"),
+                "the dictionary did not mark helo ({marked:?}); an empty held list would not show that the scan was skipped"
+            );
+        } else {
+            eprintln!("no spelling dictionary; the held window is still checked");
+        }
+
+        let body = format!("helo {}", "a".repeat(10_000));
+        editor.load(omaquill::rtf::RichText::from_plain(&body));
+        assert!(editor.is_too_formatted());
+        let (start, end) = editor.buffer.bounds();
+        let shown = editor.buffer.text(&start, &end, false).to_string();
+        assert!(shown.starts_with("helo "));
+        assert!(shown.chars().count() < body.chars().count());
+        let fragment: String = shown
+            .chars()
+            .rev()
+            .take_while(|c| *c == 'a')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        assert!(!fragment.is_empty());
+        assert!(fragment.chars().count() < 10_000);
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
+
+        session.rescan();
+        drain(&session);
+        assert!(
+            marked_words(&editor.buffer).is_empty(),
+            "a held document was marked: {:?}",
+            marked_words(&editor.buffer)
+        );
+        let inside = editor.buffer.iter_at_offset(2);
+        assert!(!session.prepare_at(&inside));
+        assert!(editor.view.extra_menu().is_none());
+        session.remember("helo", true);
+        session.remember(&fragment, true);
+        session.remember("helo", false);
+        session.remember(&fragment, false);
+        assert!(
+            !session.dictionary.borrow().contains("helo"),
+            "Add stored a word from a held document"
+        );
+        assert!(!session.dictionary.borrow().contains(&fragment));
+        assert_eq!(std::fs::read(&dict).unwrap(), before);
+        assert!(!ignore.exists(), "Ignore wrote {}", ignore.display());
+
+        *session.broker.borrow_mut() = None;
+        assert!(!session.has_dictionary());
+        editor.load(omaquill::rtf::RichText::from_plain(&body));
+        let (start, end) = editor.buffer.bounds();
+        let shown = editor.buffer.text(&start, &end, false).to_string();
+        assert!(shown.starts_with("helo "));
+        assert!(shown.chars().count() < body.chars().count());
+        session.rescan();
+        drain(&session);
+        let inside = editor.buffer.iter_at_offset(2);
+        assert!(!session.prepare_at(&inside));
+        assert!(editor.view.extra_menu().is_none());
+        session.remember("helo", true);
+        session.remember("helo", false);
+        assert_eq!(std::fs::read(&dict).unwrap(), before);
+        assert!(!ignore.exists(), "Ignore wrote {}", ignore.display());
+        window.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spell walks `line_count`. One paragraph is one line, including when
+    /// its runs would have been split after 32 style spans.
+    pub(crate) fn one_paragraph_is_one_spelling_line() {
+        let editor = Editor::new(true);
+        let mut paragraph = omaquill::rtf::Paragraph::default();
+        for i in 0..32 {
+            paragraph.runs.push(omaquill::rtf::Run {
+                text: "q".into(),
+                style: omaquill::rtf::CharStyle {
+                    bold: i % 2 == 0,
+                    ..omaquill::rtf::CharStyle::default()
+                },
+            });
+        }
+        paragraph.runs.push(omaquill::rtf::Run {
+            text: "zz ".into(),
+            style: omaquill::rtf::CharStyle {
+                italic: true,
+                ..omaquill::rtf::CharStyle::default()
+            },
+        });
+        let word = format!("{}zz", "q".repeat(32));
+        editor.load(omaquill::rtf::RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        });
+        assert_eq!(
+            editor.buffer.line_count(),
+            1,
+            "spell would check {} lines",
+            editor.buffer.line_count()
+        );
+        editor.buffer.place_cursor(&editor.buffer.end_iter());
+        let session = Session::new(&editor, &Settings::default());
+        session.rescan();
+        drain(&session);
+        assert_eq!(session.line.get(), editor.buffer.line_count());
+        assert_eq!(editor.buffer.line_count(), 1);
+        if session.has_dictionary() {
+            assert_eq!(marked_words(&editor.buffer), vec![word]);
+        } else {
+            eprintln!("no spelling dictionary; the line count still stands");
+        }
+    }
+
+    /// A keystroke past the idle scan used to jump the index to the caret
+    /// and leave the gap unchecked.
+    pub(crate) fn a_keystroke_ahead_of_the_scan_does_not_skip() {
+        let editor = Editor::new(true);
+        let session = Session::new(&editor, &Settings::default());
+        let body = format!("{}\nend", "alpha ".repeat(800));
+        editor.buffer.set_text(&body);
+        session.rescan();
+        session.pump();
+        let index = session.index.get();
+        assert_eq!(session.line.get(), 0);
+        assert!(
+            index > 0 && index < 4_000,
+            "the first slice did not stop inside the line: {index}"
+        );
+        let mut end = editor.buffer.iter_at_line(0).expect("line");
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        editor.buffer.place_cursor(&end);
+        editor.buffer.insert(&mut end, "x");
+        session.after_edit();
+        assert_eq!(session.line.get(), 0);
+        assert!(
+            session.index.get() <= index,
+            "scan moved from {index} to {}",
+            session.index.get()
+        );
+        let mut second = editor.buffer.iter_at_line(1).expect("second line");
+        editor.buffer.place_cursor(&second);
+        editor.buffer.insert(&mut second, "y");
+        session.after_edit();
+        assert_eq!(
+            session.line.get(),
+            0,
+            "an edit on a later line moved the scan"
+        );
+        assert!(
+            session.index.get() <= index,
+            "scan moved from {index} to {}",
+            session.index.get()
+        );
     }
 
     pub(crate) fn the_same_spelling_settings_do_not_restart_the_scan() {

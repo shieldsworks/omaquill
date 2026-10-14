@@ -7,6 +7,28 @@
 
 use std::fmt::Write as _;
 
+#[cfg(test)]
+thread_local! {
+    static INSERT_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_insert_walk(n: u64) {
+    #[cfg(test)]
+    INSERT_WALKS.with(|visits| visits.set(visits.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+pub fn reset_insert_walks() {
+    INSERT_WALKS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+pub fn insert_walks() -> u64 {
+    INSERT_WALKS.with(|visits| visits.get())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Element(Element),
@@ -666,6 +688,7 @@ impl Element {
             // keeping any comments.
             let mut fresh = Vec::new();
             for n in std::mem::take(&mut self.children) {
+                note_insert_walk(1);
                 if let Node::Raw(_) = n {
                     fresh.push(Node::Text(indent.clone()));
                     fresh.push(n);
@@ -682,6 +705,7 @@ impl Element {
         let mut seen = 0;
         let mut at = None;
         for (i, node) in self.children.iter().enumerate() {
+            note_insert_walk(1);
             if let Node::Element(_) = node {
                 if seen == index {
                     at = Some(i);
@@ -708,6 +732,49 @@ impl Element {
                 self.children.insert(last + 1, Node::Text(indent));
             }
         }
+    }
+
+    /// Appends every element after the children already here. The existing
+    /// children are examined once. Inserting one child at a time walks the
+    /// list again for each element.
+    pub fn append_elements(&mut self, entries: Vec<Element>, own: &str) {
+        if entries.is_empty() {
+            return;
+        }
+        let indent = self.child_indent(own);
+        let close = self.closing_indent(own);
+        for _ in &self.children {
+            note_insert_walk(1);
+        }
+        let has_elements = self.elements().next().is_some();
+        if !has_elements {
+            let mut fresh = Vec::new();
+            for n in std::mem::take(&mut self.children) {
+                if let Node::Raw(_) = n {
+                    fresh.push(Node::Text(indent.clone()));
+                    fresh.push(n);
+                }
+            }
+            for entry in entries {
+                note_insert_walk(1);
+                fresh.push(Node::Text(indent.clone()));
+                fresh.push(Node::Element(entry));
+            }
+            fresh.push(Node::Text(close));
+            self.children = fresh;
+            self.empty = false;
+            return;
+        }
+        let closing = match self.children.last() {
+            Some(Node::Text(ws)) if ws.trim().is_empty() => self.children.pop(),
+            _ => None,
+        };
+        for entry in entries {
+            note_insert_walk(1);
+            self.children.push(Node::Text(indent.clone()));
+            self.children.push(Node::Element(entry));
+        }
+        self.children.push(closing.unwrap_or(Node::Text(close)));
     }
 
     /// Removes the `index`th child element with the whitespace before it.
@@ -829,6 +896,27 @@ mod tests {
         let item = doc.root.child_mut("Item").unwrap();
         item.remove_child("Synopsis");
         assert_eq!(doc.to_xml(), SAMPLE);
+    }
+
+    #[test]
+    fn append_elements_walks_the_list_once() {
+        let mut parent = Element::new("Docs");
+        parent.append_elements(vec![Element::new("Existing")], "\n    ");
+        let n = 80usize;
+        let entries: Vec<Element> = (0..n).map(|_| Element::new("Document")).collect();
+        reset_insert_walks();
+        parent.append_elements(entries, "\n    ");
+        let walks = insert_walks();
+        let bound = u64::try_from(n).unwrap().saturating_mul(4);
+        assert!(
+            walks >= u64::try_from(n).unwrap(),
+            "appending {n} elements recorded {walks} steps"
+        );
+        assert!(
+            walks <= bound,
+            "appending {n} elements walked {walks} element-list steps"
+        );
+        assert_eq!(parent.elements().count(), n + 1);
     }
 
     #[test]

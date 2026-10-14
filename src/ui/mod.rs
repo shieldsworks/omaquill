@@ -29,6 +29,14 @@ use std::rc::Rc;
 
 pub const APP_ID: &str = "io.github.shieldsworks.Omaquill";
 
+/// Shown when a paragraph has too many style runs to tag on the UI thread.
+const FORMATTING_NOTE: &str = "This document has too much inline formatting to edit safely. The words are shown plain, and the file stays unchanged.";
+
+/// Shown when one unbreakable run is long enough that word-char layout would
+/// block the UI thread. The formatting sentence would name the wrong reason,
+/// including when the tag count is also over the cap.
+const LENGTH_NOTE: &str = "This document has a line too long to edit safely. The words are shown plain, and the file stays unchanged.";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FolderView {
     Text,
@@ -46,6 +54,7 @@ pub struct Win {
     /// saved here, never to `current`, so a failed load or save can't send
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
+    last_toast: RefCell<String>,
     dirty_text: Cell<bool>,
     backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
     dirty_notes: Cell<bool>,
@@ -556,6 +565,7 @@ impl Win {
             project: RefCell::new(None),
             current: RefCell::new(None),
             editor_uuid: RefCell::new(None),
+            last_toast: RefCell::new(String::new()),
             dirty_text: Cell::new(false),
             backup_job: RefCell::new(None),
             dirty_notes: Cell::new(false),
@@ -624,6 +634,9 @@ impl Win {
         let weak = Rc::downgrade(self);
         self.editor.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
+                if !w.editor.allows_edits() {
+                    return;
+                }
                 w.dirty_text.set(true);
                 w.update_doc_words();
                 w.schedule_save();
@@ -639,6 +652,9 @@ impl Win {
         let weak = Rc::downgrade(self);
         self.notes.connect_changed(move || {
             if let Some(w) = weak.upgrade() {
+                if !w.notes.allows_edits() {
+                    return;
+                }
                 w.dirty_notes.set(true);
                 w.schedule_save();
             }
@@ -923,6 +939,7 @@ impl Win {
     }
 
     pub fn toast(&self, text: &str) {
+        *self.last_toast.borrow_mut() = text.to_string();
         // Toast titles are markup; titles can hold '&' and '<'.
         self.toasts
             .add_toast(adw::Toast::new(&glib::markup_escape_text(text)));
@@ -1072,49 +1089,19 @@ impl Win {
         }
     }
 
-    /// Reads every text once: word counts and search text.
+    /// Reads every distinct document once: word counts and search text.
     fn index_project(&self, project: &Project) {
-        let mut counts = HashMap::new();
-        let mut search = HashMap::new();
-        fn walk(
-            p: &Project,
-            items: &[Item],
-            counts: &mut HashMap<String, usize>,
-            search: &mut HashMap<String, String>,
-        ) {
-            for i in items {
-                let mut text = format!("{}\n{}\n", i.title, p.synopsis(&i.uuid));
-                if i.kind.has_text() {
-                    let body = p.text(&i.uuid).map(|t| t.plain_text()).unwrap_or_default();
-                    counts.insert(i.uuid.clone(), rtf::word_count(&body));
-                    text.push_str(&body);
-                }
-                if let Ok(n) = p.notes(&i.uuid) {
-                    text.push('\n');
-                    text.push_str(&n.plain_text());
-                }
-                search.insert(i.uuid.clone(), text.to_lowercase());
-                walk(p, &i.children, counts, search);
-            }
-        }
-        walk(project, &project.items(), &mut counts, &mut search);
-        *self.counts.borrow_mut() = counts;
-        *self.search_text.borrow_mut() = search;
+        let indexed = project.binder_index();
+        *self.counts.borrow_mut() = indexed.counts;
+        *self.search_text.borrow_mut() = indexed.search;
     }
 
     /// Words in everything the manuscript compiles.
     fn manuscript_words(&self, project: &Project) -> usize {
         let counts = self.counts.borrow();
-        fn sum(items: &[Item], counts: &HashMap<String, usize>) -> usize {
-            items
-                .iter()
-                .filter(|i| i.include_in_compile)
-                .map(|i| counts.get(&i.uuid).copied().unwrap_or(0) + sum(&i.children, counts))
-                .sum()
-        }
         project
             .root_folder(Kind::Draft)
-            .map(|d| counts.get(&d.uuid).copied().unwrap_or(0) + sum(&d.children, &counts))
+            .map(|draft| omaquill::project::compile_words(&draft, &counts))
             .unwrap_or(0)
     }
 
@@ -1191,6 +1178,26 @@ impl Win {
             self.reselect_current();
             return;
         }
+        let as_text = match item.kind {
+            Kind::Text => true,
+            ref kind if kind.is_folder() => {
+                self.folder_view.get() == FolderView::Text && kind.has_text()
+            }
+            _ => false,
+        };
+        let text = if as_text {
+            match self.load_text(&item.uuid) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.reselect_current();
+                    self.toast(&format!("Couldn't read {}: {e}", item.title));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.editor.release_plain();
         // Everything is saved; the editor and inspector are free.
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
@@ -1201,12 +1208,12 @@ impl Win {
         let is_folder = item.kind.is_folder();
         self.view_buttons.set_visible(is_folder);
         match item.kind {
-            Kind::Text => self.show_text(&item),
+            Kind::Text => self.show_text(&item, text),
             k if k.is_folder() => {
                 let view = self.folder_view.get();
                 self.sync_view_buttons(view);
                 match view {
-                    FolderView::Text if k.has_text() => self.show_text(&item),
+                    FolderView::Text if k.has_text() => self.show_text(&item, text),
                     FolderView::Outliner => self.show_outliner(&item),
                     _ => self.show_corkboard(&item),
                 }
@@ -1247,47 +1254,78 @@ impl Win {
         }
     }
 
-    fn show_text(self: &Rc<Self>, item: &Item) {
-        let text = self
-            .project
-            .borrow()
-            .as_ref()
-            .map(|p| p.text(&item.uuid))
-            .transpose();
-        match text {
-            Ok(Some(text)) => {
-                if !text.lossy.is_empty() {
-                    self.banner.set_title(&format!(
-                        "This document has {} that omaquill shows as plain text. Editing it keeps the words but not that layout.",
-                        join_words(&text.lossy)
-                    ));
-                    self.banner.set_revealed(true);
-                }
-                self.editor.load(&text);
-                self.spell.rescan();
-                self.dirty_text.set(false);
-                *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
-                self.format_bar.set_visible(true);
-                self.stack.set_visible_child_name("editor");
-                // Browsing the binder with the keyboard keeps focus there.
-                // set_focus works before the window is shown; grab_focus doesn't.
-                let in_binder = gtk::prelude::RootExt::focus(&self.window)
-                    .is_some_and(|f| f.is_ancestor(&self.binder.root));
-                if !in_binder {
-                    GtkWindowExt::set_focus(&self.window, Some(&self.editor.view));
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Never leave another document's text editable here.
-                *self.editor_uuid.borrow_mut() = None;
-                self.stack.set_visible_child_name("empty");
-                self.toast(&format!("Couldn't read {}: {e}", item.title));
-            }
+    /// The format bar and the banner follow the editor. A document with too
+    /// much inline formatting hides the bar and says why it cannot be edited.
+    fn sync_editor_chrome(&self) {
+        if self.editor_uuid.borrow().is_none() {
+            return;
+        }
+        if self.editor.is_too_formatted() {
+            let note = if self.editor.held_for_length() {
+                LENGTH_NOTE
+            } else {
+                FORMATTING_NOTE
+            };
+            self.banner.set_title(note);
+            self.banner.set_revealed(true);
+            self.format_bar.set_visible(false);
+            return;
+        }
+        if !self.composing.get() {
+            self.format_bar.set_visible(true);
+        }
+        let lossy = self.editor.lossy();
+        if lossy.is_empty() {
+            self.banner.set_revealed(false);
+        } else {
+            self.banner.set_title(&format!(
+                "This document has {} that omaquill shows as plain text. Editing it keeps the words but not that layout.",
+                join_words(&lossy)
+            ));
+            self.banner.set_revealed(true);
+        }
+    }
+
+    fn load_text(&self, uuid: &str) -> omaquill::project::Result<Option<rtf::RichText>> {
+        let project = self.project.borrow();
+        let Some(project) = project.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(project.text(uuid)?))
+    }
+
+    fn show_text(self: &Rc<Self>, item: &Item, text: Option<rtf::RichText>) {
+        let Some(text) = text else {
+            return;
+        };
+        let stored = omaquill::project::is_uuid(&item.uuid);
+        if !stored {
+            self.editor.set_editing(false);
+            self.editor.load(rtf::RichText::from_plain(""));
+            self.banner.set_title("This item has no file.");
+            self.banner.set_revealed(true);
+            self.dirty_text.set(false);
+            *self.editor_uuid.borrow_mut() = None;
+            self.format_bar.set_visible(false);
+            self.stack.set_visible_child_name("editor");
+            return;
+        }
+        self.editor.set_editing(true);
+        self.editor.load(text);
+        self.spell.rescan();
+        self.dirty_text.set(false);
+        *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
+        self.sync_editor_chrome();
+        self.stack.set_visible_child_name("editor");
+        let in_binder = gtk::prelude::RootExt::focus(&self.window)
+            .is_some_and(|f| f.is_ancestor(&self.binder.root));
+        if !in_binder {
+            GtkWindowExt::set_focus(&self.window, Some(&self.editor.view));
         }
     }
 
     fn set_folder_view(self: &Rc<Self>, view: FolderView) {
+        let previous = self.folder_view.get();
         self.folder_view.set(view);
         self.sync_view_buttons(view);
         let Some(uuid) = self.current.borrow().clone() else {
@@ -1300,12 +1338,32 @@ impl Win {
         if !self.save_now() {
             return;
         }
+        if view == FolderView::Text && item.kind.has_text() {
+            let text = match self.load_text(&item.uuid) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.folder_view.set(previous);
+                    self.sync_view_buttons(previous);
+                    self.toast(&format!("Couldn't read {}: {e}", item.title));
+                    return;
+                }
+            };
+            self.editor.release_plain();
+            *self.editor_uuid.borrow_mut() = None;
+            self.dirty_text.set(false);
+            self.banner.set_revealed(false);
+            self.show_text(&item, text);
+            self.update_doc_words();
+            return;
+        }
+        self.editor.release_plain();
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
-        match view {
-            FolderView::Text if item.kind.has_text() => self.show_text(&item),
-            FolderView::Outliner => self.show_outliner(&item),
-            _ => self.show_corkboard(&item),
+        self.banner.set_revealed(false);
+        if view == FolderView::Outliner {
+            self.show_outliner(&item);
+        } else {
+            self.show_corkboard(&item);
         }
         self.update_doc_words();
     }
@@ -1377,7 +1435,10 @@ impl Win {
         };
         let mut touched = Vec::new();
         if self.dirty_text.get() {
-            if let Some(uuid) = &editor_uuid {
+            if !self.editor.is_too_formatted()
+                && let Some(uuid) = &editor_uuid
+                && omaquill::project::is_uuid(uuid)
+            {
                 let text = self.editor.text();
                 p.set_text(uuid, &text)?;
                 self.counts
@@ -1387,8 +1448,10 @@ impl Win {
             }
             self.dirty_text.set(false);
         }
-        if let Some(uuid) = &inspector_uuid {
-            if self.dirty_notes.get() {
+        if let Some(uuid) = &inspector_uuid
+            && omaquill::project::is_uuid(uuid)
+        {
+            if self.dirty_notes.get() && !self.notes.is_too_formatted() {
                 p.set_notes(uuid, &self.notes.text())?;
                 touched.push(uuid.clone());
             }
@@ -1614,13 +1677,40 @@ impl Win {
         rich::restyle(&self.notes.buffer);
     }
 
+    fn format_bar_visible(&self) -> bool {
+        !self.composing.get()
+            && self.editor_uuid.borrow().is_some()
+            && !self.editor.is_too_formatted()
+    }
+
+    /// Project replace leaves a held document in the skipped list, the same
+    /// place as a document that contains an image.
+    pub(super) fn hold_open_preview(&self, preview: &mut omaquill::replace::Preview) {
+        let mut held = Vec::new();
+        if self.editor.is_too_formatted()
+            && let Some(uuid) = self.editor_uuid.borrow().clone()
+        {
+            held.push((uuid, omaquill::replace::Field::Body));
+        }
+        if self.notes.is_too_formatted()
+            && let Some(uuid) = self.inspector.uuid()
+        {
+            held.push((uuid, omaquill::replace::Field::Notes));
+        }
+        let refs: Vec<(&str, omaquill::replace::Field)> = held
+            .iter()
+            .map(|(uuid, field)| (uuid.as_str(), *field))
+            .collect();
+        preview.skip_held(&refs);
+    }
+
     fn set_composing(&self, on: bool) {
         self.composing.set(on);
         self.toolbar_view.set_reveal_top_bars(!on);
         self.toolbar_view.set_reveal_bottom_bars(!on);
         self.outer.set_show_sidebar(!on);
         self.inner.set_show_sidebar(!on);
-        self.format_bar.set_visible(!on);
+        self.format_bar.set_visible(self.format_bar_visible());
         if on {
             self.window.add_css_class("omaquill-compose");
             self.window.fullscreen();
@@ -1674,9 +1764,531 @@ fn join_words(list: &[&str]) -> String {
     }
 }
 
+#[cfg(test)]
+fn id_less_text_is_read_only() {
+    let dir = std::env::temp_dir().join(format!("omaquill-noid-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Bare.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let chapter = project
+        .root_folder(Kind::Draft)
+        .unwrap()
+        .children
+        .iter()
+        .find(|item| item.kind == Kind::Text)
+        .unwrap()
+        .uuid
+        .clone();
+    let real = project.add_item(Kind::Text, "Kept", &draft, None).unwrap();
+    project
+        .set_text(&real, &rtf::RichText::from_plain("kept words"))
+        .unwrap();
+    project.save().unwrap();
+    let scrivx = std::fs::read_dir(&path)
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            path.extension()
+                .is_some_and(|ext| ext == "scrivx")
+                .then_some(path)
+        })
+        .unwrap();
+    let xml = std::fs::read_to_string(&scrivx).unwrap();
+    let from = format!("UUID=\"{chapter}\" ");
+    assert!(xml.contains(&from), "{chapter}");
+    std::fs::write(&scrivx, xml.replacen(&from, "", 1)).unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.IdLess")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.show_item("");
+    assert!(!win.editor.view.is_editable());
+    assert!(win.editor_uuid.borrow().is_none());
+    assert!(!win.dirty_text.get());
+    assert!(win.banner.is_revealed());
+    assert_eq!(win.banner.title().as_str(), "This item has no file.");
+    win.dirty_text.set(true);
+    assert!(win.save_now());
+    assert!(!win.dirty_text.get());
+    win.set_composing(true);
+    win.set_composing(false);
+    assert!(!win.format_bar.property::<bool>("visible"));
+    win.editor.set_align(rtf::Align::Center);
+    assert!(!win.dirty_text.get());
+    assert_eq!(win.editor.plain_text(), "");
+    win.show_item(&real);
+    assert_eq!(win.current.borrow().as_deref(), Some(real.as_str()));
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "kept words");
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
+    let dir = std::env::temp_dir().join(format!("omaquill-paint-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Paint.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let big = project
+        .add_item(Kind::Text, "Hostile", &draft, None)
+        .unwrap();
+    let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
+    let link: Rc<str> = Rc::from("https://example.test/chapter");
+    let mut paragraph = rtf::Paragraph::default();
+    paragraph.style.align = rtf::Align::Center;
+    for i in 0..2_000 {
+        paragraph.runs.push(rtf::Run {
+            text: "a".into(),
+            style: rtf::CharStyle {
+                bold: i % 2 == 0,
+                link: Some(Rc::clone(&link)),
+                ..rtf::CharStyle::default()
+            },
+        });
+    }
+    project
+        .set_text(
+            &big,
+            &rtf::RichText {
+                paragraphs: vec![paragraph],
+                lossy: Vec::new(),
+            },
+        )
+        .unwrap();
+    project
+        .set_text(&short, &rtf::RichText::from_plain("Hello"))
+        .unwrap();
+    project.save().unwrap();
+    let rtf_path = project.data_dir(&big).join("content.rtf");
+    let before = std::fs::read(&rtf_path).unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Paint")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.show_item(&big);
+    assert!(win.editor.is_too_formatted());
+    assert!(!win.editor.view.is_editable());
+    assert!(!win.dirty_text.get());
+    assert_eq!(win.editor_uuid.borrow().as_deref(), Some(big.as_str()));
+    assert!(win.banner.is_revealed());
+    assert_eq!(
+        win.banner.title().as_str(),
+        "This document has too much inline formatting to edit safely. The words are shown plain, and the file stays unchanged."
+    );
+    // `is_visible` stays false until the window is shown. The property is
+    // the flag `sync_editor_chrome` sets.
+    assert!(!win.format_bar.property::<bool>("visible"));
+    assert_eq!(win.editor.buffer.line_count(), 1);
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..5 {
+        context.iteration(true);
+    }
+    assert!(win.editor.is_too_formatted());
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    win.set_composing(true);
+    win.set_composing(false);
+    assert!(
+        !win.format_bar.property::<bool>("visible"),
+        "leaving compose showed the format bar"
+    );
+    win.editor.set_align(rtf::Align::Left);
+    assert!(!win.dirty_text.get());
+    assert!(win.save_now());
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    assert!(
+        String::from_utf8_lossy(&before).contains("\\qc"),
+        "the fixture lost its center alignment before the edit"
+    );
+    let query = omaquill::replace::query("a", "b", omaquill::replace::Options::default()).unwrap();
+    let mut preview = {
+        let guard = win.project.borrow();
+        omaquill::replace::preview(guard.as_ref().unwrap(), &query).unwrap()
+    };
+    assert!(
+        preview
+            .groups()
+            .iter()
+            .any(|group| group.id().uuid().eq_ignore_ascii_case(&big))
+    );
+    win.hold_open_preview(&mut preview);
+    assert!(
+        preview
+            .groups()
+            .iter()
+            .all(|group| !group.id().uuid().eq_ignore_ascii_case(&big))
+    );
+    assert!(preview.skipped().iter().any(|skip| {
+        skip.id().uuid().eq_ignore_ascii_case(&big) && skip.reason() == ["inline formatting"]
+    }));
+    win.show_item(&short);
+    assert!(!win.editor.is_too_formatted());
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "Hello");
+    assert!(!win.banner.is_revealed());
+    assert!(win.format_bar.property::<bool>("visible"));
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    for _ in 0..20 {
+        if !context.iteration(false) {
+            break;
+        }
+    }
+    assert_eq!(win.editor.plain_text(), "Hello");
+    assert_eq!(std::fs::read(&rtf_path).unwrap(), before);
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A long unspaced line is held for its length. The banner does not call
+/// that "too much inline formatting".
+#[cfg(test)]
+fn a_long_line_names_the_line() {
+    let dir = std::env::temp_dir().join(format!("omaquill-length-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Length.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let id = project.add_item(Kind::Text, "Line", &draft, None).unwrap();
+    project
+        .set_text(&id, &rtf::RichText::from_plain(&"a".repeat(10_000)))
+        .unwrap();
+    project.save().unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Length")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.show_item(&id);
+    assert!(win.editor.is_too_formatted());
+    assert!(win.editor.held_for_length());
+    assert!(win.banner.is_revealed());
+    let title = win.banner.title();
+    assert_eq!(title.as_str(), LENGTH_NOTE);
+    assert!(
+        !title.contains("inline formatting"),
+        "a length hold used the formatting banner: {title}"
+    );
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+fn menu_labels(view: &gtk::TextView) -> Vec<String> {
+    let Some(model) = view.extra_menu() else {
+        return Vec::new();
+    };
+    let Ok(menu) = model.downcast::<gio::Menu>() else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    for i in 0..menu.n_items() {
+        if let Some(label) = menu
+            .item_attribute_value(i, gio::MENU_ATTRIBUTE_LABEL, None)
+            .and_then(|value| value.get::<String>())
+        {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+#[cfg(test)]
+fn pump_layout(win: &Win) {
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..60 {
+        if win.window.is_mapped()
+            && win
+                .editor
+                .view
+                .iter_location(&win.editor.buffer.start_iter())
+                .height()
+                > 0
+        {
+            return;
+        }
+        if !context.iteration(true) {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+fn click_on(view: &gtk::TextView, at: &gtk::TextIter) -> (f64, f64) {
+    let loc = view.iter_location(at);
+    assert!(loc.height() > 0, "the word was not on screen");
+    let (x, y) = view.buffer_to_window_coords(
+        gtk::TextWindowType::Widget,
+        loc.x() + 1,
+        loc.y() + loc.height() / 2,
+    );
+    (f64::from(x), f64::from(y))
+}
+
+#[cfg(test)]
+fn a_held_suggestion_does_not_reach_the_file() {
+    let dir = std::env::temp_dir().join(format!("omaquill-suggest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Suggest.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
+    project
+        .set_text(&short, &rtf::RichText::from_plain("helo storm"))
+        .unwrap();
+    let held = project.add_item(Kind::Text, "Held", &draft, None).unwrap();
+    project
+        .set_text(
+            &held,
+            &rtf::RichText::from_plain(&format!("helo {}", "a".repeat(10_000))),
+        )
+        .unwrap();
+    project.save().unwrap();
+    let held_rtf = project.data_dir(&held).join("content.rtf");
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Suggest")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.window.present();
+    pump_layout(&win);
+    if win.spell.has_dictionary() {
+        win.select(&short);
+        pump_layout(&win);
+        let at = win.editor.buffer.iter_at_offset(2);
+        let (x, y) = click_on(&win.editor.view, &at);
+        win.spell.prepare_click(x, y);
+        let labels = menu_labels(&win.editor.view);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case("hello")),
+            "a right-click on helo installed no suggestion: {labels:?}"
+        );
+        assert!(
+            win.editor.view.activate_action("spell.s0", None).is_ok(),
+            "the short document's suggestion could not be activated"
+        );
+    } else {
+        eprintln!("no spelling dictionary; the held click is still checked");
+    }
+    win.select(&held);
+    pump_layout(&win);
+    assert!(win.editor.is_too_formatted());
+    assert!(!win.editor.view.is_editable());
+    let before = std::fs::read(&held_rtf).unwrap();
+    let at = win.editor.buffer.iter_at_offset(2);
+    let (x, y) = click_on(&win.editor.view, &at);
+    win.spell.prepare_click(x, y);
+    let labels = menu_labels(&win.editor.view);
+    assert!(
+        labels.is_empty(),
+        "a held document offered suggestions: {labels:?}"
+    );
+    assert!(win.editor.view.extra_menu().is_none());
+    assert!(
+        win.editor.view.activate_action("spell.s0", None).is_err(),
+        "a held document ran a suggestion"
+    );
+    assert!(win.save_now());
+    assert_eq!(
+        std::fs::read(&held_rtf).unwrap(),
+        before,
+        "a suggestion click wrote the held file"
+    );
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+fn a_failed_open_keeps_the_typed_text() {
+    let dir = std::env::temp_dir().join(format!("omaquill-typed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Typed.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let note = project.add_item(Kind::Text, "Note", &draft, None).unwrap();
+    project
+        .set_text(&note, &rtf::RichText::from_plain("Hello"))
+        .unwrap();
+    let bad = project
+        .add_item(Kind::Text, "Broken", &draft, None)
+        .unwrap();
+    project
+        .set_text(&bad, &rtf::RichText::from_plain("retry me"))
+        .unwrap();
+    project.save().unwrap();
+    let note_rtf = project.data_dir(&note).join("content.rtf");
+    let rtf_path = project.data_dir(&bad).join("content.rtf");
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Typed")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.window.present();
+    pump_layout(&win);
+    win.select(&note);
+    pump_layout(&win);
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "Hello");
+    let mut end = win.editor.buffer.end_iter();
+    win.editor.buffer.insert(&mut end, " there");
+    assert_eq!(win.editor.plain_text(), "Hello there");
+    assert!(
+        win.dirty_text.get(),
+        "typing did not mark the document dirty"
+    );
+    std::fs::remove_file(&rtf_path).unwrap();
+    std::fs::create_dir(&rtf_path).unwrap();
+    win.select(&bad);
+    assert!(win.window.is_mapped());
+    assert_eq!(win.stack.visible_child_name().as_deref(), Some("editor"));
+    assert_eq!(win.current.borrow().as_deref(), Some(note.as_str()));
+    assert_eq!(win.editor_uuid.borrow().as_deref(), Some(note.as_str()));
+    assert_eq!(win.title.subtitle().as_str(), "Note");
+    assert!(win.editor.view.is_editable());
+    assert_eq!(win.editor.plain_text(), "Hello there");
+    let (start, end) = win.editor.buffer.bounds();
+    assert_eq!(
+        win.editor.buffer.text(&start, &end, false).as_str(),
+        "Hello there"
+    );
+    let bytes = std::fs::read(&note_rtf).unwrap();
+    assert!(
+        bytes
+            .windows(b"Hello there".len())
+            .any(|window| window == b"Hello there"),
+        "the typed text was not in the original file"
+    );
+    let told = win.last_toast.borrow().clone();
+    assert!(
+        told.contains("Couldn't read") && told.contains("Broken"),
+        "the error was not shown: {told}"
+    );
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+fn a_failed_open_can_be_retried() {
+    let dir = std::env::temp_dir().join(format!("omaquill-retry-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Retry.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let long = project.add_item(Kind::Text, "Long", &draft, None).unwrap();
+    project
+        .set_text(&long, &rtf::RichText::from_plain(&"a".repeat(10_000)))
+        .unwrap();
+    let bad = project
+        .add_item(Kind::Text, "Broken", &draft, None)
+        .unwrap();
+    project
+        .set_text(&bad, &rtf::RichText::from_plain("retry me"))
+        .unwrap();
+    project.save().unwrap();
+    let long_rtf = project.data_dir(&long).join("content.rtf");
+    let long_bytes = std::fs::read(&long_rtf).unwrap();
+    let rtf_path = project.data_dir(&bad).join("content.rtf");
+    let bytes = std::fs::read(&rtf_path).unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Retry")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.window.present();
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..30 {
+        if win.window.is_mapped() {
+            break;
+        }
+        if !context.iteration(true) {
+            break;
+        }
+    }
+    win.select(&long);
+    assert!(win.editor.is_too_formatted());
+    assert!(!win.editor.view.is_editable());
+    assert_eq!(win.editor_uuid.borrow().as_deref(), Some(long.as_str()));
+    let (start, end) = win.editor.buffer.bounds();
+    let shown = win.editor.buffer.text(&start, &end, false).to_string();
+    assert_eq!(shown.chars().count(), 200);
+    assert!(shown.chars().all(|c| c == 'a'));
+    assert_eq!(win.title.subtitle().as_str(), "Long");
+    // A directory where the document file should be. `read` returns
+    // EISDIR, including when the process can read a chmod 000 file.
+    std::fs::remove_file(&rtf_path).unwrap();
+    std::fs::create_dir(&rtf_path).unwrap();
+    win.select(&bad);
+    assert_eq!(
+        win.stack.visible_child_name().as_deref(),
+        Some("editor"),
+        "a failed open left the editor"
+    );
+    assert_eq!(
+        win.current.borrow().as_deref(),
+        Some(long.as_str()),
+        "a failed open switched off the document that was open"
+    );
+    assert_eq!(
+        win.editor_uuid.borrow().as_deref(),
+        Some(long.as_str()),
+        "a failed open dropped the document save would write"
+    );
+    assert_eq!(win.title.subtitle().as_str(), "Long");
+    assert!(
+        win.binder.selected().as_deref() != Some(bad.as_str()),
+        "the broken row stayed selected"
+    );
+    assert!(!win.editor.view.is_editable());
+    assert!(win.editor.is_too_formatted());
+    let (start, end) = win.editor.buffer.bounds();
+    assert_eq!(
+        win.editor.buffer.text(&start, &end, false).as_str(),
+        shown,
+        "a failed open cleared the held window"
+    );
+    assert_eq!(std::fs::read(&long_rtf).unwrap(), long_bytes);
+    let told = win.last_toast.borrow().clone();
+    assert!(
+        told.contains("Couldn't read") && told.contains("Broken"),
+        "the error was not shown: {told}"
+    );
+    assert_eq!(win.banner.title().as_str(), LENGTH_NOTE);
+    std::fs::remove_dir(&rtf_path).unwrap();
+    std::fs::write(&rtf_path, &bytes).unwrap();
+    win.select(&bad);
+    assert_eq!(win.current.borrow().as_deref(), Some(bad.as_str()));
+    assert_eq!(win.stack.visible_child_name().as_deref(), Some("editor"));
+    assert_eq!(win.editor.plain_text(), "retry me");
+    assert!(win.editor.view.is_editable());
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
-/// that started it, and each #[test] gets its own thread. Needs a display;
-/// skipped without one (CI).
+/// that started it, and each #[test] gets its own thread. Needs a display.
+/// xvfb provides one. Without a display the test returns.
 #[cfg(test)]
 #[test]
 fn gtk_checks() {
@@ -1685,6 +2297,36 @@ fn gtk_checks() {
         return;
     }
     adw::init().unwrap();
+    rich::tests::load_inserts_the_text_once();
+    editor::tests::find_matches_across_a_style_boundary();
+    editor::tests::large_documents_open_in_the_window();
+    editor::tests::a_hostile_paragraph_opens_plain_and_read_only();
+    editor::tests::a_held_document_refuses_every_edit();
+    editor::tests::a_long_uniform_line_opens_plain();
+    editor::tests::a_held_long_line_wraps_on_characters();
+    editor::tests::find_in_a_long_held_line_reaches_the_tail();
+    editor::tests::find_across_a_held_page_edge_selects_the_whole_match();
+    editor::tests::find_of_a_long_needle_starts_at_the_match();
+    editor::tests::find_next_on_a_long_needle_reaches_the_second_match();
+    editor::tests::held_find_matches_plain_find();
+    editor::tests::held_find_folds_like_plain_find();
+    editor::tests::held_find_edges_match_gtk();
+    editor::tests::held_find_sequences_match_gtk();
+    editor::tests::held_menu_select_all_copies_the_document();
+    editor::tests::held_cut_leaves_the_document();
+    editor::tests::held_find_in_the_last_page_stays_on_the_bar();
+    editor::tests::find_next_on_the_only_long_needle_wraps();
+    editor::tests::select_all_copies_the_held_document();
+    editor::tests::a_zero_width_space_survives_edit_and_replace();
+    editor::tests::switching_mid_paint_leaves_the_new_document();
+    editor::tests::identical_runs_open_without_an_idle_pass();
+    editor::tests::many_plain_paragraphs_stay_editable();
+    editor::tests::a_held_load_clears_the_previous_tags_and_selection();
+    editor::tests::time_styled_paragraph_open();
+    a_long_line_names_the_line();
+    spell::tests::one_paragraph_is_one_spelling_line();
+    id_less_text_is_read_only();
+    a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();
@@ -1699,6 +2341,11 @@ fn gtk_checks() {
     spell::tests::leaving_the_word_by_a_jump_marks_it();
     spell::tests::a_paste_marks_every_new_word();
     spell::tests::suggestions_share_the_text_view_menu();
+    a_held_suggestion_does_not_reach_the_file();
+    spell::tests::a_held_document_is_not_spellchecked();
+    a_failed_open_keeps_the_typed_text();
+    a_failed_open_can_be_retried();
+    spell::tests::a_keystroke_ahead_of_the_scan_does_not_skip();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
     spell::tests::activating_spellcheck_flips_its_state();
 }

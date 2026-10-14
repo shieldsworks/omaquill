@@ -4,6 +4,12 @@
 
 use std::ops::Range;
 
+mod scan;
+
+pub use scan::{
+    LineMark, Scan, Slice, byte_of_chars, line_anchor_after_edit, next_scan, scan_index_after_edit,
+    slice_window, take_slice,
+};
 /// How many characters a single lookup will accept.
 const MAX_WORD: usize = 80;
 
@@ -431,107 +437,6 @@ pub fn keystroke_marks(
         out.push(Touch { start, end, bad });
     }
     out
-}
-
-/// One idle pass over a line. `start..end` holds only whole tokens.
-/// `resume` is the next byte index, past an overlong token when one was skipped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Scan {
-    pub start: usize,
-    pub end: usize,
-    pub resume: usize,
-}
-
-/// `(start, end, chars)` of the token that contains `at`, if `at` is inside one.
-fn token_extent(text: &str, at: usize) -> Option<(usize, usize, usize)> {
-    let at = floor(text, at);
-    let inside = char_before(text, at).is_some_and(|(_, c)| is_word_char(c))
-        || text[at..].chars().next().is_some_and(is_word_char);
-    if !inside {
-        return None;
-    }
-    let mut start = at;
-    while let Some((i, _)) = char_before(text, start).filter(|(_, c)| is_word_char(*c)) {
-        start = i;
-    }
-    let mut chars = 0usize;
-    let mut end = start;
-    while end < text.len() {
-        let Some(ch) = text[end..].chars().next() else {
-            break;
-        };
-        if !is_word_char(ch) {
-            break;
-        }
-        end += ch.len_utf8();
-        chars += 1;
-    }
-    (chars > 0).then_some((start, end, chars))
-}
-
-/// The next piece of `text` to paint, starting at byte `index`.
-///
-/// A pass stops on a token boundary after about `budget` characters. A token
-/// longer than the lookup limit is not painted, and `resume` lands after it.
-pub fn next_scan(text: &str, index: usize, budget: usize) -> Option<Scan> {
-    let origin = floor(text, index);
-    if origin >= text.len() || budget == 0 {
-        return None;
-    }
-    let mut index = origin;
-    if let Some((start, end, chars)) = token_extent(text, origin)
-        && start < origin
-        && origin < end
-    {
-        if chars > MAX_WORD {
-            return Some(Scan {
-                start: origin,
-                end: origin,
-                resume: end,
-            });
-        }
-        index = start;
-    }
-    let start = index;
-    let mut end = index;
-    let mut counted = 0usize;
-    let mut i = index;
-    while i < text.len() && counted < budget {
-        let Some(c) = text[i..].chars().next() else {
-            break;
-        };
-        if !is_word_char(c) {
-            i += c.len_utf8();
-            end = i;
-            counted += 1;
-            continue;
-        }
-        let Some((token_start, token_end, chars)) = token_extent(text, i) else {
-            break;
-        };
-        if chars > MAX_WORD {
-            return Some(Scan {
-                start,
-                end,
-                resume: token_end,
-            });
-        }
-        if counted > 0 && counted + chars > budget {
-            return Some(Scan {
-                start,
-                end,
-                resume: token_start,
-            });
-        }
-        end = token_end;
-        counted += chars;
-        i = token_end;
-    }
-    let resume = i.max(end);
-    if resume <= origin {
-        return None;
-    }
-    Some(Scan { start, end, resume })
 }
 
 /// `en_US.UTF-8` and `en-GB` become the tag Enchant asks a provider for.

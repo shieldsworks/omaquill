@@ -12,8 +12,33 @@
 use gtk::prelude::*;
 use gtk::{TextBuffer, TextIter, TextTag, pango};
 use omaquill::rtf::{Align, CharStyle, LineSpacing, ParaStyle, Paragraph, RichText, Run, Script};
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+#[cfg(test)]
+thread_local! {
+    static INSERTS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_insert(n: u64) {
+    #[cfg(test)]
+    INSERTS.with(|inserts| inserts.set(inserts.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+pub(crate) fn reset_inserts() {
+    INSERTS.with(|inserts| inserts.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn inserts() -> u64 {
+    INSERTS.with(|inserts| inserts.get())
+}
 
 thread_local! {
     /// How tags are drawn: zoom and which installed font stands in for each
@@ -281,7 +306,16 @@ pub fn para_tags(s: &ParaStyle) -> Vec<String> {
     out
 }
 
-fn char_style(names: &[String]) -> CharStyle {
+fn shared_link(links: &mut HashMap<String, Rc<str>>, value: &str) -> Rc<str> {
+    if let Some(link) = links.get(value) {
+        return Rc::clone(link);
+    }
+    let link = Rc::<str>::from(value);
+    links.insert(value.to_string(), Rc::clone(&link));
+    link
+}
+
+fn char_style(names: &[String], links: &mut HashMap<String, Rc<str>>) -> CharStyle {
     let mut s = CharStyle::default();
     for n in names {
         let Some(rest) = n.strip_prefix("c:") else {
@@ -299,7 +333,7 @@ fn char_style(names: &[String]) -> CharStyle {
             "size" => s.size = value.parse().unwrap_or(24),
             "fg" => s.color = unhex(value),
             "bg" => s.highlight = unhex(value),
-            "link" => s.link = Some(value.to_string()),
+            "link" => s.link = Some(shared_link(links, value)),
             _ => {}
         }
     }
@@ -362,51 +396,429 @@ pub fn tag_names(iter: &TextIter) -> Vec<String> {
         .collect()
 }
 
-/// Replaces the buffer's contents with `text`. Not undoable.
-pub fn load(buffer: &TextBuffer, text: &RichText) {
-    buffer.begin_irreversible_action();
-    buffer.set_text("");
+/// Tag names for one character style. The `c:link=` name is built once per
+/// shared target and reused for every later run.
+fn style_names(style: &CharStyle, links: &mut HashMap<*const str, Rc<str>>) -> Vec<Rc<str>> {
+    let link = style.link.clone();
+    let mut bare = style.clone();
+    bare.link = None;
+    let mut names: Vec<Rc<str>> = char_tags(&bare).into_iter().map(Rc::from).collect();
+    if let Some(link) = link {
+        let key = Rc::as_ptr(&link);
+        let name = links
+            .entry(key)
+            .or_insert_with(|| {
+                let mut tagged = String::from("c:link=");
+                tagged.push_str(&link);
+                Rc::from(tagged)
+            })
+            .clone();
+        names.push(name);
+    }
+    names
+}
+
+fn forward(iter: &mut TextIter, mut n: usize) {
+    while n > 0 {
+        let step = n.min(i32::MAX as usize);
+        iter.forward_chars(step as i32);
+        n -= step;
+    }
+}
+
+/// The buffer's visible text. Character tags change formatting only, so a
+/// paragraph stays one line for find and for spell.
+pub fn logical_plain(buffer: &TextBuffer) -> String {
+    let (start, end) = buffer.bounds();
+    buffer.text(&start, &end, false).into()
+}
+
+/// How many character-tag applies a document needs after adjacent runs with
+/// the same style have been merged. `c:size` is always one of them.
+pub(crate) fn style_tag_count(style: &CharStyle) -> usize {
+    1 + usize::from(style.font.is_some())
+        + usize::from(style.bold)
+        + usize::from(style.italic)
+        + usize::from(style.underline)
+        + usize::from(style.strike)
+        + usize::from(style.script != Script::Normal)
+        + usize::from(style.color.is_some())
+        + usize::from(style.highlight.is_some())
+        + usize::from(style.link.is_some())
+}
+
+/// On-screen tagging of 1,000 alternating runs, about 2,500 tag applies on
+/// one line, took 159 ms and grew with the square of that count. A paragraph
+/// under this many applies is styled before the window returns to the main
+/// loop. Above it, applying the tags and laying the line out again froze the
+/// UI thread: 10,000 runs kept a visible editor busy for 560 s, and one main
+/// loop turn took 1.3 s. The editor then shows the words and does not tag.
+pub(crate) const SYNC_TAG_APPLIES: usize = 800;
+
+/// Word-char wrap of one unspaced line is laid out on the next main-loop
+/// turn. A visible 800×600 editor, GTK 4.14.5, took 20.9 ms at 2,048
+/// characters, 24.4 at 4,096, 73.5 at 8,192, and 101.8 at 10,000.
+/// `set_text` itself stayed under 1 ms. The run count does not matter:
+/// uniform runs merge to one range and still produce that line. A longer
+/// breakless run is shown plain and read-only, with character wrap, so the
+/// line stays inside the column. Ordinary prose breaks on spaces, so a long
+/// manuscript of short words stays editable. A keystroke in an editable
+/// document is not held: that layout is the writer's own line.
+pub(crate) const SYNC_BREAKLESS_CHARS: usize = 8_192;
+
+/// A no-break space glues the characters on either side. Unicode `White_Space`
+/// includes it, and a line break does not.
+fn is_no_break_space(ch: char) -> bool {
+    matches!(ch, '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{FEFF}')
+}
+
+/// CJK, kana, and hangul break between characters. A long run of them is
+/// not one unbreakable line.
+fn is_cjk_break(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{2E80}'..='\u{A4CF}'
+            | '\u{A960}'..='\u{A97F}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF00}'..='\u{FFEF}'
+    )
+}
+
+fn breakless_len(chars: impl Iterator<Item = char>) -> usize {
+    let mut heavy = 0usize;
+    let mut run = 0usize;
+    for ch in chars {
+        if is_cjk_break(ch) {
+            heavy = heavy.max(run).max(1);
+            run = 0;
+            continue;
+        }
+        // U+200B is a break opportunity. Pango wraps there.
+        if ch == '\u{200B}' || (ch.is_whitespace() && !is_no_break_space(ch)) {
+            heavy = heavy.max(run);
+            run = 0;
+            continue;
+        }
+        run += 1;
+    }
+    heavy.max(run)
+}
+
+/// Characters in the longest stretch that word-char wrap cannot break.
+/// A style change does not break the stretch. A no-break space does not
+/// either. CJK does.
+pub(crate) fn breakless_chars(text: &RichText) -> usize {
+    let mut heavy = 0usize;
+    for paragraph in &text.paragraphs {
+        let chars = paragraph.runs.iter().flat_map(|piece| piece.text.chars());
+        heavy = heavy.max(breakless_len(chars));
+    }
+    heavy
+}
+
+/// The plain read-only view. Either the heaviest paragraph needs too many
+/// tag applies, or one unspaced run is long enough that word-char layout
+/// blocks the UI thread.
+pub(crate) fn needs_plain_view(text: &RichText) -> bool {
+    heavy_applies(text) > SYNC_TAG_APPLIES || breakless_chars(text) > SYNC_BREAKLESS_CHARS
+}
+
+/// Tag applies in the paragraph that has the most, after adjacent runs with
+/// the same style have been merged. Paragraphs do not add together.
+pub(crate) fn heavy_applies(text: &RichText) -> usize {
+    let mut heavy = 0usize;
     let n = text.paragraphs.len();
     for (i, p) in text.paragraphs.iter().enumerate() {
-        let start = buffer.end_iter().offset();
+        let mut para_applies = 0usize;
+        let mut span: Option<&CharStyle> = None;
+        let mut span_chars = 0usize;
+        let close =
+            |span: &mut Option<&CharStyle>, span_chars: &mut usize, para_applies: &mut usize| {
+                if let Some(style) = span.take()
+                    && *span_chars > 0
+                {
+                    *para_applies += style_tag_count(style);
+                }
+                *span_chars = 0;
+            };
         for run in &p.runs {
-            let tags: Vec<TextTag> = char_tags(&run.style)
-                .iter()
-                .map(|n| tag(buffer, n))
-                .collect();
-            let tag_refs: Vec<&TextTag> = tags.iter().collect();
-            let mut end = buffer.end_iter();
-            buffer.insert_with_tags(&mut end, &run.text, &tag_refs);
+            if run.text.is_empty() {
+                continue;
+            }
+            let same = span.is_some_and(|style| style == &run.style);
+            if !same {
+                close(&mut span, &mut span_chars, &mut para_applies);
+                span = Some(&run.style);
+            }
+            span_chars += run.text.chars().count();
         }
+        let fallback = CharStyle::default();
         if i + 1 < n {
-            // The newline takes the paragraph's last character formatting,
-            // so typing at the end of a line continues in that style.
-            let tags: Vec<TextTag> = p
-                .runs
-                .last()
-                .map(|r| char_tags(&r.style))
-                .unwrap_or_else(|| char_tags(&CharStyle::default()))
-                .iter()
-                .map(|n| tag(buffer, n))
-                .collect();
-            let tag_refs: Vec<&TextTag> = tags.iter().collect();
-            let mut end = buffer.end_iter();
-            buffer.insert_with_tags(&mut end, "\n", &tag_refs);
+            let newline_style = p.runs.last().map(|run| &run.style).unwrap_or(&fallback);
+            let same = span.is_some_and(|style| style == newline_style);
+            if !same {
+                close(&mut span, &mut span_chars, &mut para_applies);
+                span = Some(newline_style);
+            }
+            span_chars += 1;
         }
-        let s = buffer.iter_at_offset(start);
-        let e = buffer.end_iter();
-        for name in para_tags(&p.style) {
-            buffer.apply_tag(&tag(buffer, &name), &s, &e);
+        close(&mut span, &mut span_chars, &mut para_applies);
+        para_applies += para_tags(&p.style).len();
+        heavy = heavy.max(para_applies);
+    }
+    heavy
+}
+
+/// Tags still to apply after [`Paint::begin`] has inserted the characters.
+/// [`Paint::pump`] with an unlimited budget tags every range before the
+/// caller returns to the main loop.
+pub(crate) struct Paint {
+    marks: Vec<(usize, usize, CharStyle)>,
+    paras: Vec<(usize, usize, ParaStyle)>,
+    index: usize,
+    pos: usize,
+    place: gtk::TextMark,
+    links: HashMap<*const str, Rc<str>>,
+    char_tags: HashMap<CharStyle, Vec<TextTag>>,
+    para_i: usize,
+    chars_done: bool,
+    closed: bool,
+}
+
+impl Paint {
+    /// Inserts `text` with one `set_text`. Adjacent runs that share a style
+    /// become one range. The newline keeps the paragraph's last character
+    /// formatting, so typing at the end of a line continues in that style.
+    pub(crate) fn begin(buffer: &TextBuffer, text: &RichText) -> Self {
+        buffer.begin_irreversible_action();
+        let mut body = String::new();
+        let mut marks = Vec::new();
+        let mut paras = Vec::new();
+        let mut heavy = 0usize;
+        let mut chars = 0usize;
+        let n = text.paragraphs.len();
+        for (i, p) in text.paragraphs.iter().enumerate() {
+            let para_start = chars;
+            let mut para_applies = 0usize;
+            let mut span_style: Option<CharStyle> = None;
+            let mut span_start = chars;
+            // Equal `CharStyle` values produce the same GTK tag set, so
+            // adjacent equal runs are one range. Alternating bold does not
+            // merge: each run keeps its own tags.
+            let close_span = |span_style: &mut Option<CharStyle>,
+                              span_start: usize,
+                              chars: usize,
+                              marks: &mut Vec<(usize, usize, CharStyle)>,
+                              para_applies: &mut usize| {
+                if let Some(style) = span_style.take()
+                    && span_start < chars
+                {
+                    *para_applies += style_tag_count(&style);
+                    marks.push((span_start, chars, style));
+                }
+            };
+            for run in &p.runs {
+                if run.text.is_empty() {
+                    continue;
+                }
+                let same = span_style.as_ref().is_some_and(|style| style == &run.style);
+                if !same {
+                    close_span(
+                        &mut span_style,
+                        span_start,
+                        chars,
+                        &mut marks,
+                        &mut para_applies,
+                    );
+                    span_style = Some(run.style.clone());
+                    span_start = chars;
+                }
+                body.push_str(&run.text);
+                chars += run.text.chars().count();
+            }
+            if i + 1 < n {
+                let newline_style = p
+                    .runs
+                    .last()
+                    .map(|run| run.style.clone())
+                    .unwrap_or_default();
+                let same = span_style
+                    .as_ref()
+                    .is_some_and(|style| style == &newline_style);
+                if !same {
+                    close_span(
+                        &mut span_style,
+                        span_start,
+                        chars,
+                        &mut marks,
+                        &mut para_applies,
+                    );
+                    span_style = Some(newline_style);
+                    span_start = chars;
+                }
+                body.push('\n');
+                chars += 1;
+            }
+            close_span(
+                &mut span_style,
+                span_start,
+                chars,
+                &mut marks,
+                &mut para_applies,
+            );
+            para_applies += para_tags(&p.style).len();
+            heavy = heavy.max(para_applies);
+            paras.push((para_start, chars, p.style.clone()));
+        }
+        note_insert(1);
+        buffer.set_text(&body);
+        let place = buffer.create_mark(None, &buffer.start_iter(), true);
+        buffer.place_cursor(&buffer.start_iter());
+        buffer.set_modified(false);
+        debug_assert_eq!(heavy, heavy_applies(text));
+        Self {
+            marks,
+            paras,
+            index: 0,
+            pos: 0,
+            place,
+            links: HashMap::new(),
+            char_tags: HashMap::new(),
+            para_i: 0,
+            chars_done: false,
+            closed: false,
         }
     }
-    buffer.end_irreversible_action();
-    buffer.set_modified(false);
-    buffer.place_cursor(&buffer.start_iter());
+
+    /// Applies ranges until `budget_ms` has passed. One range may run past
+    /// the budget. Returns true when every range has been tagged.
+    pub(crate) fn pump(&mut self, buffer: &TextBuffer, budget_ms: f64) -> bool {
+        if self.closed {
+            return true;
+        }
+        let started = std::time::Instant::now();
+        let mut worked = false;
+        loop {
+            if self.chars_done && self.para_i >= self.paras.len() {
+                return true;
+            }
+            if worked && started.elapsed().as_secs_f64() * 1000.0 >= budget_ms {
+                return false;
+            }
+            if !self.chars_done {
+                self.paint_range(buffer);
+            } else {
+                self.paint_paragraph(buffer);
+            }
+            worked = true;
+        }
+    }
+
+    fn paint_range(&mut self, buffer: &TextBuffer) {
+        if self.index >= self.marks.len() {
+            self.chars_done = true;
+            return;
+        }
+        let (start, end, style) = self.marks[self.index].clone();
+        let mut cursor = buffer.iter_at_mark(&self.place);
+        forward(&mut cursor, start.saturating_sub(self.pos));
+        buffer.move_mark(&self.place, &cursor);
+        let mut stop = cursor;
+        forward(&mut stop, end.saturating_sub(start));
+        let stop_mark = buffer.create_mark(None, &stop, false);
+        let tags = cached_char_tags(&mut self.char_tags, buffer, &style, &mut self.links).to_vec();
+        for text_tag in &tags {
+            let head = buffer.iter_at_mark(&self.place);
+            let tail = buffer.iter_at_mark(&stop_mark);
+            buffer.apply_tag(text_tag, &head, &tail);
+        }
+        buffer.move_mark(&self.place, &buffer.iter_at_mark(&stop_mark));
+        buffer.delete_mark(&stop_mark);
+        self.pos = end;
+        self.index += 1;
+        if self.index >= self.marks.len() {
+            self.chars_done = true;
+            self.pos = 0;
+            buffer.move_mark(&self.place, &buffer.start_iter());
+        }
+    }
+
+    fn paint_paragraph(&mut self, buffer: &TextBuffer) {
+        if self.para_i >= self.paras.len() {
+            return;
+        }
+        let (start, end, style) = self.paras[self.para_i].clone();
+        self.para_i += 1;
+        let mut cursor = buffer.iter_at_mark(&self.place);
+        forward(&mut cursor, start.saturating_sub(self.pos));
+        buffer.move_mark(&self.place, &cursor);
+        if start == end {
+            self.pos = end;
+            return;
+        }
+        let mut stop = buffer.iter_at_mark(&self.place);
+        forward(&mut stop, end.saturating_sub(start));
+        let head = buffer.create_mark(None, &buffer.iter_at_mark(&self.place), true);
+        let tail = buffer.create_mark(None, &stop, false);
+        for name in para_tags(&style) {
+            buffer.apply_tag(
+                &tag(buffer, &name),
+                &buffer.iter_at_mark(&head),
+                &buffer.iter_at_mark(&tail),
+            );
+        }
+        buffer.move_mark(&self.place, &buffer.iter_at_mark(&tail));
+        self.pos = end;
+        buffer.delete_mark(&head);
+        buffer.delete_mark(&tail);
+    }
+
+    pub(crate) fn finish(&mut self, buffer: &TextBuffer) {
+        self.close(buffer);
+        buffer.set_modified(false);
+        buffer.place_cursor(&buffer.start_iter());
+    }
+
+    fn close(&mut self, buffer: &TextBuffer) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        buffer.delete_mark(&self.place);
+        buffer.end_irreversible_action();
+    }
+}
+
+/// Replaces the buffer's contents with `text`. Not undoable.
+#[cfg(test)]
+pub(crate) fn load(buffer: &TextBuffer, text: &RichText) {
+    let mut paint = Paint::begin(buffer, text);
+    while !paint.pump(buffer, f64::MAX) {}
+    paint.finish(buffer);
+}
+
+fn cached_char_tags<'a>(
+    cache: &'a mut HashMap<CharStyle, Vec<TextTag>>,
+    buffer: &TextBuffer,
+    style: &CharStyle,
+    links: &mut HashMap<*const str, Rc<str>>,
+) -> &'a [TextTag] {
+    if !cache.contains_key(style) {
+        let built = style_names(style, links)
+            .iter()
+            .map(|name| tag(buffer, name))
+            .collect();
+        cache.insert(style.clone(), built);
+    }
+    cache.get(style).expect("the style was stored in the cache")
 }
 
 /// Reads the buffer back into [`RichText`].
 pub fn save(buffer: &TextBuffer) -> RichText {
-    let mut paragraphs = Vec::new();
+    let mut paragraphs: Vec<Paragraph> = Vec::new();
+    let mut links = HashMap::new();
     // By line number: forward_line() won't step onto an empty last line.
     for i in 0..buffer.line_count() {
         let Some(line) = buffer.iter_at_line(i) else {
@@ -433,7 +845,7 @@ pub fn save(buffer: &TextBuffer) -> RichText {
                 .chars()
                 .filter(|&c| c != '\u{fffc}')
                 .collect();
-            let s = char_style(&tag_names(&at));
+            let s = char_style(&tag_names(&at), &mut links);
             match p.runs.last_mut() {
                 Some(last) if last.style == s => last.text.push_str(&text),
                 _ => {
@@ -482,6 +894,141 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn heavy_applies_uses_the_worst_paragraph_and_merges_equal_runs() {
+        let alternating = toggled(4);
+        // Even runs are size, bold, and link. Odd runs are size and link.
+        assert_eq!(heavy_applies(&alternating), 2 * 3 + 2 * 2);
+        let mut two = alternating.clone();
+        two.paragraphs.push(alternating.paragraphs[0].clone());
+        assert_eq!(heavy_applies(&two), heavy_applies(&alternating));
+        let mut paragraph = Paragraph::default();
+        for _ in 0..10 {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: true,
+                    ..CharStyle::default()
+                },
+            });
+        }
+        let uniform = RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        };
+        assert_eq!(heavy_applies(&uniform), 2);
+        assert!(!needs_plain_view(&uniform));
+        let long = RichText::from_plain(&"a".repeat(SYNC_BREAKLESS_CHARS + 1));
+        assert!(heavy_applies(&long) <= SYNC_TAG_APPLIES);
+        assert!(needs_plain_view(&long));
+        let spaced = RichText::from_plain(&"aa ".repeat(10_000));
+        assert!(!needs_plain_view(&spaced));
+        assert!(breakless_chars(&spaced) < SYNC_BREAKLESS_CHARS);
+    }
+
+    #[test]
+    fn breakless_chars_keeps_a_no_break_space_and_splits_cjk() {
+        let glued = "a\u{00A0}".repeat(100);
+        assert_eq!(breakless_chars(&RichText::from_plain(&glued)), 200);
+        assert!(needs_plain_view(&RichText::from_plain(&format!(
+            "a\u{00A0}{}",
+            "b".repeat(SYNC_BREAKLESS_CHARS)
+        ))));
+        let cjk = "漢".repeat(10_000);
+        assert_eq!(breakless_chars(&RichText::from_plain(&cjk)), 1);
+        assert!(!needs_plain_view(&RichText::from_plain(&cjk)));
+        let broken = "a\u{200B}".repeat(100);
+        assert_eq!(breakless_chars(&RichText::from_plain(&broken)), 1);
+        assert!(!needs_plain_view(&RichText::from_plain(&broken)));
+    }
+
+    #[test]
+    fn style_tag_count_matches_the_tag_list() {
+        let full = CharStyle {
+            font: Some("Palatino".into()),
+            size: 24,
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+            color: Some((1, 2, 3)),
+            highlight: Some((4, 5, 6)),
+            script: Script::Super,
+            link: Some(Rc::from("https://example.test/chapter")),
+        };
+        assert_eq!(style_tag_count(&full), char_tags(&full).len());
+        let plain = CharStyle::default();
+        assert_eq!(char_tags(&plain), vec!["c:size=24".to_string()]);
+        assert_eq!(style_tag_count(&plain), 1);
+        let sub = CharStyle {
+            script: Script::Sub,
+            ..CharStyle::default()
+        };
+        assert_eq!(style_tag_count(&sub), char_tags(&sub).len());
+    }
+
+    #[test]
+    fn save_reuses_one_link_for_every_run() {
+        let mut links = HashMap::new();
+        let names = vec![
+            "c:b".to_string(),
+            "c:link=https://example.test/chapter".to_string(),
+        ];
+        let first = char_style(&names, &mut links);
+        let second = char_style(&names, &mut links);
+        let left = first.link.clone().expect("first link");
+        let right = second.link.clone().expect("second link");
+        assert!(Rc::ptr_eq(&left, &right), "each run allocated its own link");
+    }
+
+    #[test]
+    fn a_shared_link_builds_one_tag_name() {
+        let link = "https://example.test/".repeat(80);
+        let toggles = 400usize;
+        let mut src = format!(
+            "{{\\rtf1\\ansi{{\\fonttbl\\f0 Palatino-Roman;}}\\f0{{\\field{{\\*\\fldinst{{HYPERLINK \"{link}\"}}}}{{\\fldrslt "
+        );
+        for i in 0..toggles {
+            if i % 2 == 0 {
+                src.push_str("\\b a\\b0 ");
+            } else {
+                src.push('a');
+            }
+        }
+        src.push_str("}}}");
+        let text = rtf::parse(src.as_bytes());
+        let mut links = HashMap::new();
+        let mut held = Vec::new();
+        let mut runs = 0usize;
+        for paragraph in &text.paragraphs {
+            for run in &paragraph.runs {
+                runs += 1;
+                held.extend(style_names(&run.style, &mut links));
+            }
+        }
+        let mut seen = std::collections::HashSet::<*const str>::new();
+        let mut bytes = 0usize;
+        for name in &held {
+            let Some(target) = name.strip_prefix("c:link=") else {
+                continue;
+            };
+            if seen.insert(Rc::as_ptr(name)) {
+                bytes += target.len();
+            }
+        }
+        let one = text.paragraphs[0].runs[0]
+            .style
+            .link
+            .as_ref()
+            .expect("the run keeps the link")
+            .len();
+        assert!(runs >= toggles / 2, "runs {runs}");
+        assert_eq!(
+            bytes, one,
+            "tag name bytes {bytes} across {runs} runs, one target is {one}"
+        );
+    }
+
     /// Every document survives the trip into a GTK buffer and back. Needs
     /// a display; skipped without one. Set OMAQUILL_REAL_PROJECT to also
     /// run a real project's documents through it.
@@ -512,5 +1059,49 @@ pub(crate) mod tests {
             assert!(same(&again.paragraphs, &text.paragraphs), "{}", f.display());
         }
         eprintln!("{} documents through a GTK buffer", files.len());
+    }
+
+    fn toggled(runs: usize) -> RichText {
+        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let mut paragraph = Paragraph::default();
+        for i in 0..runs {
+            paragraph.runs.push(Run {
+                text: "a".into(),
+                style: CharStyle {
+                    bold: i % 2 == 0,
+                    link: Some(Rc::clone(&link)),
+                    ..CharStyle::default()
+                },
+            });
+        }
+        RichText {
+            paragraphs: vec![paragraph],
+            lossy: Vec::new(),
+        }
+    }
+
+    /// One buffer insert, then one tag range per style run, on the paragraph's
+    /// own line. A newline between runs would hide a find match and split a
+    /// spelling line.
+    pub(crate) fn load_inserts_the_text_once() {
+        let runs = 500usize;
+        let text = toggled(runs);
+        let buffer = TextBuffer::new(None);
+        reset_inserts();
+        let started = std::time::Instant::now();
+        load(&buffer, &text);
+        let small_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let wrote = inserts();
+        assert_eq!(wrote, 1, "inserted {wrote} times for {runs} runs");
+        assert_eq!(buffer.line_count(), 1);
+        let back = save(&buffer);
+        assert!(
+            same(&back.paragraphs, &text.paragraphs),
+            "round trip dropped a run"
+        );
+        eprintln!(
+            "runs={runs} inserts={wrote} lines={} ms={small_ms:.1}",
+            buffer.line_count()
+        );
     }
 }

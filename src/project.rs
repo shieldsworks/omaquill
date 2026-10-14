@@ -17,9 +17,75 @@
 use crate::rtf::{self, RichText};
 use crate::xml::{self, Element};
 use crate::{sha1, zip};
-use std::collections::BTreeMap;
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    static CONTENT_WRITES: Cell<u64> = const { Cell::new(0) };
+    static RETAINED_INDEX: Cell<usize> = const { Cell::new(0) };
+    static BINDER_WALKS: Cell<u64> = const { Cell::new(0) };
+    static INDEX_VISITS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_content_writes() {
+    CONTENT_WRITES.with(|n| n.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn content_writes() -> u64 {
+    CONTENT_WRITES.with(|n| n.get())
+}
+
+fn note_retained(docs: &HashMap<String, IndexedDoc>) {
+    #[cfg(test)]
+    {
+        let n = docs
+            .values()
+            .map(|doc| doc.body.capacity() + doc.notes.as_ref().map(String::capacity).unwrap_or(0))
+            .sum();
+        RETAINED_INDEX.with(|kept| kept.set(n));
+    }
+    #[cfg(not(test))]
+    let _ = docs;
+}
+
+#[cfg(test)]
+fn retained_index() -> usize {
+    RETAINED_INDEX.with(|kept| kept.get())
+}
+
+fn note_binder_walk() {
+    #[cfg(test)]
+    BINDER_WALKS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+fn note_index_visit(n: u64) {
+    #[cfg(test)]
+    INDEX_VISITS.with(|visits| visits.set(visits.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+#[cfg(test)]
+fn reset_index_scan() {
+    BINDER_WALKS.with(|n| n.set(0));
+    INDEX_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn binder_walks() -> u64 {
+    BINDER_WALKS.with(|n| n.get())
+}
+
+#[cfg(test)]
+fn index_visits() -> u64 {
+    INDEX_VISITS.with(|visits| visits.get())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -147,6 +213,143 @@ fn missing_item(uuid: &str) -> Error {
         Error::Invalid("binder item has no id".into())
     } else {
         Error::NoSuchItem(uuid.to_string())
+    }
+}
+
+/// Words compiled from `draft`, counting each document once.
+///
+/// The count starts at the Draft folder's children, as [`crate::compile::gather`]
+/// does. The folder's own text is not a chapter. A child counts only when
+/// it is included in compile, and an excluded folder hides its children.
+/// Rows that share a UUID are one document.
+pub fn compile_words(draft: &Item, counts: &HashMap<String, usize>) -> usize {
+    fn add(
+        item: &Item,
+        counts: &HashMap<String, usize>,
+        seen: &mut HashSet<String>,
+        gate: bool,
+    ) -> usize {
+        // Compile omits an excluded item and everything under it. An
+        // included child of an excluded folder is not in the manuscript.
+        if gate && !item.include_in_compile {
+            return 0;
+        }
+        let mut total = 0;
+        if seen.insert(item.uuid.to_ascii_uppercase()) {
+            total += counts.get(&item.uuid).copied().unwrap_or(0);
+        }
+        for child in &item.children {
+            total += add(child, counts, seen, true);
+        }
+        total
+    }
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    for child in &draft.children {
+        total += add(child, counts, &mut seen, true);
+    }
+    total
+}
+
+/// Characters in the paragraph after trimming the joined runs. One short
+/// run does not decide this. The count is characters, not bytes.
+fn paragraph_trimmed_chars(par: &rtf::Paragraph) -> usize {
+    par.text().trim().chars().count()
+}
+
+/// The character style that covers the most characters. A tie keeps the
+/// earlier style. A short lead-in is not the result when a later run is longer.
+fn dominant_char_style(par: &rtf::Paragraph) -> rtf::CharStyle {
+    let mut totals: Vec<(rtf::CharStyle, usize)> = Vec::new();
+    for run in &par.runs {
+        let n = run.text.chars().count();
+        if n == 0 {
+            continue;
+        }
+        if let Some((_, total)) = totals.iter_mut().find(|(style, _)| style == &run.style) {
+            *total += n;
+        } else {
+            totals.push((run.style.clone(), n));
+        }
+    }
+    let mut best: Option<(rtf::CharStyle, usize)> = None;
+    for (style, n) in totals {
+        if best.as_ref().is_none_or(|pair| n > pair.1) {
+            best = Some((style, n));
+        }
+    }
+    best.map(|(style, _)| style).unwrap_or_default()
+}
+
+/// Word counts and lowercase search text, one entry per binder id.
+pub struct BinderIndex {
+    pub counts: HashMap<String, usize>,
+    pub search: HashMap<String, String>,
+}
+
+struct IndexedDoc {
+    synopsis: String,
+    /// Loaded the first time a row with this id has text.
+    body: String,
+    body_loaded: bool,
+    /// `None` when the notes file could not be read. A missing file is
+    /// `Some("")`, matching `notes`.
+    notes: Option<String>,
+}
+
+struct IndexSlot {
+    title: String,
+    /// The last row with this id has a text body.
+    has_text: bool,
+    /// Some row with this id had a text body, so the count stays.
+    saw_text: bool,
+}
+
+fn index_rows(items: &[Item], rows: &mut HashMap<String, (String, bool)>) {
+    for item in items {
+        rows.entry(item.uuid.to_ascii_uppercase())
+            .or_insert_with(|| (item.title.clone(), item.kind.has_text()));
+        index_rows(&item.children, rows);
+    }
+}
+
+fn index_items(
+    project: &Project,
+    items: &[Item],
+    docs: &mut HashMap<String, IndexedDoc>,
+    slots: &mut HashMap<String, IndexSlot>,
+) {
+    for item in items {
+        if is_uuid(&item.uuid) {
+            let key = item.uuid.to_ascii_uppercase();
+            let doc = docs.entry(key).or_insert_with(|| IndexedDoc {
+                synopsis: project.synopsis(&item.uuid),
+                body: String::new(),
+                body_loaded: false,
+                notes: match project.notes(&item.uuid) {
+                    Ok(text) => Some(text.plain_text()),
+                    Err(_) => None,
+                },
+            });
+            if item.kind.has_text() && !doc.body_loaded {
+                doc.body = project
+                    .text(&item.uuid)
+                    .map(|text| text.plain_text())
+                    .unwrap_or_default();
+                doc.body_loaded = true;
+            }
+        }
+        let slot = slots.entry(item.uuid.clone()).or_insert(IndexSlot {
+            title: String::new(),
+            has_text: false,
+            saw_text: false,
+        });
+        slot.title.clone_from(&item.title);
+        slot.has_text = item.kind.has_text();
+        if item.kind.has_text() {
+            slot.saw_text = true;
+        }
+        index_items(project, &item.children, docs, slots);
     }
 }
 
@@ -298,6 +501,7 @@ impl Project {
 
     /// The whole binder as a tree.
     pub fn items(&self) -> Vec<Item> {
+        note_binder_walk();
         fn read(container: &Element) -> Vec<Item> {
             container
                 .elements()
@@ -748,6 +952,11 @@ impl Project {
     /// The extension comes from the project's XML, so it must be a plain
     /// one: letters and digits only, no path tricks.
     pub fn media_path(&self, uuid: &str) -> Option<PathBuf> {
+        // An empty id is not a folder. Joining it would look at
+        // `Files/Data/content.<ext>`, which is not a document.
+        if !is_uuid(uuid) {
+            return None;
+        }
         let ext = self.item(uuid)?.extension?;
         if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
@@ -757,6 +966,12 @@ impl Project {
     }
 
     fn read_rtf(&self, uuid: &str, file: &str) -> Result<RichText> {
+        // A binder row is a document only when its id is a Scrivener UUID.
+        // The files live in `Files/Data/<UUID>/`. An empty or missing id has
+        // no folder; joining it would read `Files/Data/` itself.
+        if !is_uuid(uuid) {
+            return Ok(RichText::from_plain(""));
+        }
         match read_inside(&self.root, &self.data_dir(uuid).join(file)) {
             Ok(bytes) => Ok(rtf::parse(&bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RichText::from_plain("")),
@@ -766,6 +981,23 @@ impl Project {
 
     pub fn text(&self, uuid: &str) -> Result<RichText> {
         self.read_rtf(uuid, "content.rtf")
+    }
+
+    /// One parse of a document, then a clone for every later row with that
+    /// id. The key is the uppercase id, matching the `Files/Data` folder.
+    /// [`text`] itself stays uncached, so a save cannot hand back this copy.
+    pub fn text_shared(
+        &self,
+        uuid: &str,
+        cache: &mut HashMap<String, RichText>,
+    ) -> Result<RichText> {
+        let key = uuid.to_ascii_uppercase();
+        if let Some(text) = cache.get(&key) {
+            return Ok(text.clone());
+        }
+        let text = self.text(uuid)?;
+        cache.insert(key, text.clone());
+        Ok(text)
     }
 
     pub fn notes(&self, uuid: &str) -> Result<RichText> {
@@ -793,39 +1025,109 @@ impl Project {
                 .filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok())
                 .collect();
             let t = rtf::parse(&bytes);
-            if let Some(p) = t.paragraphs.iter().find(|p| !p.runs.is_empty()) {
-                return Some((p.style.clone(), p.runs[0].style.clone()));
+            if let Some(p) = t
+                .paragraphs
+                .iter()
+                .find(|p| p.runs.iter().any(|r| !r.text.is_empty()))
+            {
+                return Some((p.style.clone(), dominant_char_style(p)));
             }
         }
-        fn first(p: &Project, items: &[Item]) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
+        // A shared id is one file. Aliases of one short document are parsed
+        // once. The search keeps going through later included documents
+        // until it finds a paragraph long enough to copy, or the binder ends.
+        fn search(
+            p: &Project,
+            items: &[Item],
+            seen: &mut HashSet<String>,
+        ) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
             for i in items.iter().filter(|i| i.include_in_compile) {
                 if i.kind.has_text()
+                    && is_uuid(&i.uuid)
+                    && seen.insert(i.uuid.to_ascii_uppercase())
                     && let Ok(t) = p.text(&i.uuid)
                     && let Some(par) = t
                         .paragraphs
                         .iter()
-                        .find(|par| par.runs.iter().any(|r| r.text.trim().len() > 20))
+                        .find(|par| paragraph_trimmed_chars(par) > 20)
                 {
-                    return Some((par.style.clone(), par.runs[0].style.clone()));
+                    return Some((par.style.clone(), dominant_char_style(par)));
                 }
-                if let Some(found) = first(p, &i.children) {
+                if let Some(found) = search(p, &i.children, seen) {
                     return Some(found);
                 }
             }
             None
         }
-        first(self, &self.root_folder(Kind::Draft)?.children)
+        let mut seen = HashSet::new();
+        search(self, &self.root_folder(Kind::Draft)?.children, &mut seen)
     }
 
     pub fn synopsis(&self, uuid: &str) -> String {
+        if !is_uuid(uuid) {
+            return String::new();
+        }
         read_inside(&self.root, &self.data_dir(uuid).join("synopsis.txt"))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default()
     }
 
+    /// Word counts and the binder search text.
+    ///
+    /// Scrivener keeps a document's files in `Files/Data/<UUID>/`. Rows that
+    /// share a UUID share that folder, and a row with no UUID has no folder.
+    /// Each distinct UUID is read once. The search entry still follows the
+    /// last row that used that id, which is what a per-row walk stored.
+    pub fn binder_index(&self) -> BinderIndex {
+        let mut docs: HashMap<String, IndexedDoc> = HashMap::new();
+        let mut slots: HashMap<String, IndexSlot> = HashMap::new();
+        index_items(self, &self.items(), &mut docs, &mut slots);
+        let mut counts = HashMap::new();
+        let mut search = HashMap::new();
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for uuid in slots.keys() {
+            if is_uuid(uuid) {
+                *uses.entry(uuid.to_ascii_uppercase()).or_default() += 1;
+            }
+        }
+        for (uuid, slot) in slots {
+            let key = uuid.to_ascii_uppercase();
+            let doc = is_uuid(&uuid).then(|| docs.get_mut(&key)).flatten();
+            let synopsis = doc.as_ref().map(|d| d.synopsis.as_str()).unwrap_or("");
+            let mut text = format!("{}\n{synopsis}\n", slot.title);
+            if slot.has_text {
+                text.push_str(doc.as_ref().map(|d| d.body.as_str()).unwrap_or(""));
+            }
+            if slot.saw_text {
+                let body = doc.as_ref().map(|d| d.body.as_str()).unwrap_or("");
+                counts.insert(uuid.clone(), rtf::word_count(body));
+            }
+            if doc.as_ref().is_none_or(|d| d.notes.is_some()) {
+                text.push('\n');
+                text.push_str(doc.as_ref().and_then(|d| d.notes.as_deref()).unwrap_or(""));
+            }
+            if let Some(doc) = doc {
+                let left = uses
+                    .get_mut(&key)
+                    .expect("every indexed document has a slot");
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    doc.body = String::new();
+                    doc.notes = None;
+                }
+            }
+            search.insert(uuid, text.to_lowercase());
+        }
+        note_retained(&docs);
+        BinderIndex { counts, search }
+    }
+
     /// Writes (or, for empty content, removes) one of an item's files, and
     /// keeps the checksum list in step.
     fn write_file(&mut self, uuid: &str, file: &str, bytes: Option<&[u8]>) -> Result<()> {
+        if !is_uuid(uuid) {
+            return Err(missing_item(uuid));
+        }
         let dir = self.data_dir(uuid);
         let path = dir.join(file);
         let key = format!("{}/{file}", uuid.to_lowercase());
@@ -833,6 +1135,10 @@ impl Project {
             Some(bytes) => {
                 create_dir_inside(&self.root, &dir)?;
                 write_inside(&self.root, &path, bytes)?;
+                #[cfg(test)]
+                if file == "content.rtf" {
+                    CONTENT_WRITES.with(|n| n.set(n.get() + 1));
+                }
                 let sum = sha1::hex(bytes);
                 match self.checksums.iter_mut().find(|(k, _)| *k == key) {
                     Some(slot) => slot.1 = sum,
@@ -912,19 +1218,43 @@ impl Project {
             )?,
         };
         let uuids: Vec<String> = self.reindex.keys().cloned().collect();
+        let dirty: HashSet<String> = uuids.iter().map(|uuid| uuid.to_ascii_uppercase()).collect();
         let docs = doc
             .root
             .child_mut("Documents")
             .expect("the search index has a Documents element");
-        for uuid in uuids {
-            let pos = docs.elements().position(|e| {
-                e.attr("ID")
-                    .is_some_and(|id| id.eq_ignore_ascii_case(&uuid))
-            });
-            if let Some(pos) = pos {
-                docs.remove_element(pos);
+        let children = std::mem::take(&mut docs.children);
+        let mut kept = Vec::with_capacity(children.len());
+        for node in children {
+            note_index_visit(1);
+            let drop_doc = match &node {
+                xml::Node::Element(el) if el.name == "Document" => el
+                    .attr("ID")
+                    .is_some_and(|id| dirty.contains(&id.to_ascii_uppercase())),
+                _ => false,
+            };
+            if drop_doc {
+                if let Some(xml::Node::Text(text)) = kept.last()
+                    && text.trim().is_empty()
+                {
+                    kept.pop();
+                }
+                continue;
             }
-            let Some(item) = self.item(&uuid) else {
+            kept.push(node);
+        }
+        if !kept
+            .iter()
+            .any(|node| matches!(node, xml::Node::Element(_)))
+        {
+            kept.retain(|node| !matches!(node, xml::Node::Text(text) if text.trim().is_empty()));
+        }
+        docs.children = kept;
+        let mut rows = HashMap::new();
+        index_rows(&self.items(), &mut rows);
+        let mut entries = Vec::new();
+        for uuid in uuids {
+            let Some((title, has_text)) = rows.get(&uuid.to_ascii_uppercase()) else {
                 continue; // deleted
             };
             let mut entry = Element::new("Document");
@@ -936,16 +1266,16 @@ impl Project {
                     entry.children.push(xml::Node::Element(e));
                 }
             };
-            add("Title", &item.title);
+            add("Title", title);
             add("Synopsis", &self.synopsis(&uuid));
-            if item.kind.has_text() {
+            if *has_text {
                 add("Text", &self.text(&uuid)?.plain_text());
             }
             add("Notes", &self.notes(&uuid)?.plain_text());
             xml::pretty(&mut entry, "\n        ");
-            let n = docs.elements().count();
-            docs.insert_element(n, entry, "\n    ");
+            entries.push(entry);
         }
+        docs.append_elements(entries, "\n    ");
         write_inside(&self.root, &path, doc.to_xml().as_bytes())?;
         Ok(())
     }
@@ -1397,4 +1727,638 @@ pub fn timestamp() -> String {
         off.abs() / 60,
         off.abs() % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtf::RichText;
+    use crate::xml::Node;
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    fn temp_project(name: &str) -> (std::path::PathBuf, Project) {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-index-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.scriv"));
+        let project = Project::create(&path).unwrap();
+        (path, project)
+    }
+
+    fn naive_index(project: &Project) -> BinderIndex {
+        let mut counts = HashMap::new();
+        let mut search = HashMap::new();
+        fn walk(
+            project: &Project,
+            items: &[Item],
+            counts: &mut HashMap<String, usize>,
+            search: &mut HashMap<String, String>,
+        ) {
+            for item in items {
+                let mut text = format!("{}\n{}\n", item.title, project.synopsis(&item.uuid));
+                if item.kind.has_text() {
+                    let body = project
+                        .text(&item.uuid)
+                        .map(|text| text.plain_text())
+                        .unwrap_or_default();
+                    counts.insert(item.uuid.clone(), rtf::word_count(&body));
+                    text.push_str(&body);
+                }
+                if let Ok(notes) = project.notes(&item.uuid) {
+                    text.push('\n');
+                    text.push_str(&notes.plain_text());
+                }
+                search.insert(item.uuid.clone(), text.to_lowercase());
+                walk(project, &item.children, counts, search);
+            }
+        }
+        walk(project, &project.items(), &mut counts, &mut search);
+        BinderIndex { counts, search }
+    }
+
+    fn rewrite_ids(path: &Path, aliases: &HashSet<String>, bare: &HashSet<String>, shared: &str) {
+        let scrivx = std::fs::read_dir(path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "scrivx"))
+            .unwrap()
+            .path();
+        let mut doc = xml::parse(&std::fs::read_to_string(&scrivx).unwrap()).unwrap();
+        fn walk(
+            el: &mut xml::Element,
+            aliases: &HashSet<String>,
+            bare: &HashSet<String>,
+            shared: &str,
+        ) {
+            if el.name == "BinderItem" {
+                let uuid = el.attr("UUID").unwrap_or_default();
+                if aliases.contains(&uuid) {
+                    el.set_attr("UUID", shared);
+                } else if bare.contains(&uuid) {
+                    el.attrs.retain(|(key, _)| key != "UUID");
+                }
+            }
+            for child in &mut el.children {
+                if let Node::Element(el) = child {
+                    walk(el, aliases, bare, shared);
+                }
+            }
+        }
+        walk(&mut doc.root, aliases, bare, shared);
+        std::fs::write(scrivx, doc.to_xml()).unwrap();
+    }
+
+    fn item(uuid: &str, kind: Kind, children: Vec<Item>) -> Item {
+        Item {
+            uuid: uuid.to_string(),
+            kind,
+            title: String::new(),
+            label: None,
+            status: None,
+            include_in_compile: true,
+            extension: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn save_search_index_walks_each_list_once() {
+        let (path, mut project) = temp_project("reindex");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let mut ids = Vec::new();
+        for n in 0..80 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain(&format!("words {n}")))
+                .unwrap();
+            ids.push(id);
+        }
+        project.save().unwrap();
+        reset_index_scan();
+        for id in &ids {
+            project
+                .set_text(id, &RichText::from_plain("updated lamp"))
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        project.save().unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let n = u64::try_from(ids.len()).unwrap();
+        let walks = binder_walks();
+        let visits = index_visits();
+        assert!(
+            walks <= 4,
+            "saving {n} documents walked the binder {walks} times"
+        );
+        assert!(
+            visits <= n.saturating_mul(8),
+            "visited {visits} index rows for {n} documents"
+        );
+        let index = std::fs::read_to_string(path.join("Files/search.indexes")).unwrap();
+        assert_eq!(index.matches("updated lamp").count(), ids.len());
+        eprintln!("reindex docs={n} walks={walks} visits={visits} ms={ms:.1}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_search_index_inserts_each_document_once() {
+        let (path, mut project) = temp_project("reindex-linear");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let mut ids = Vec::new();
+        for n in 0..80 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain(&format!("words {n}")))
+                .unwrap();
+            ids.push(id);
+        }
+        project.save().unwrap();
+        for id in &ids {
+            project
+                .set_text(id, &RichText::from_plain("updated lamp"))
+                .unwrap();
+        }
+        xml::reset_insert_walks();
+        project.save().unwrap();
+        let n = u64::try_from(ids.len()).unwrap();
+        let walks = xml::insert_walks();
+        assert!(
+            walks <= n.saturating_mul(4),
+            "inserting {n} documents walked {walks} element-list steps"
+        );
+        let index = std::fs::read_to_string(path.join("Files/search.indexes")).unwrap();
+        assert_eq!(index.matches("updated lamp").count(), ids.len());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn compile_words_counts_a_shared_uuid_once() {
+        let shared = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let other = "11111111-2222-3333-4444-555555555555";
+        let mut counts = HashMap::new();
+        counts.insert(shared.to_string(), 10);
+        counts.insert(shared.to_ascii_lowercase(), 10);
+        counts.insert(other.to_string(), 4);
+        counts.insert("SKIP".to_string(), 1_000);
+        let mut aliases = Vec::new();
+        for _ in 0..1_000 {
+            aliases.push(item(shared, Kind::Text, Vec::new()));
+        }
+        aliases.push(item(&shared.to_ascii_lowercase(), Kind::Text, Vec::new()));
+        aliases.push(item(other, Kind::Text, Vec::new()));
+        let mut skipped = item("SKIP", Kind::Text, Vec::new());
+        skipped.include_in_compile = false;
+        aliases.push(skipped);
+        let draft = item(shared, Kind::Draft, aliases);
+        let words = compile_words(&draft, &counts);
+        assert_eq!(words, 14, "shared uuid counted {words}");
+    }
+
+    #[test]
+    fn compile_words_skips_an_included_child_of_an_excluded_folder() {
+        let child_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000001";
+        let nested_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000002";
+        let folder_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000003";
+        let kept_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000004";
+        let mut nested = item(nested_id, Kind::Text, Vec::new());
+        nested.include_in_compile = true;
+        let mut child = item(child_id, Kind::Text, vec![nested]);
+        child.include_in_compile = true;
+        let mut folder = item(folder_id, Kind::Folder, vec![child]);
+        folder.include_in_compile = false;
+        let kept = item(kept_id, Kind::Text, Vec::new());
+        let draft = item("DRAFT", Kind::Draft, vec![folder, kept]);
+        let mut counts = HashMap::new();
+        counts.insert(child_id.to_string(), 40);
+        counts.insert(nested_id.to_string(), 9);
+        counts.insert(folder_id.to_string(), 7);
+        counts.insert(kept_id.to_string(), 3);
+        assert_eq!(compile_words(&draft, &counts), 3);
+    }
+
+    #[test]
+    fn compile_words_starts_at_the_draft_children() {
+        let draft_id = "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD";
+        let child_id = "CCCCCCCC-DDDD-EEEE-FFFF-000000000011";
+        let child = item(child_id, Kind::Text, Vec::new());
+        let draft = item(draft_id, Kind::Draft, vec![child]);
+        let mut counts = HashMap::new();
+        counts.insert(draft_id.to_string(), 1_000);
+        counts.insert(child_id.to_string(), 5);
+        assert_eq!(compile_words(&draft, &counts), 5);
+    }
+
+    #[test]
+    fn binder_index_releases_each_body() {
+        let (path, mut project) = temp_project("release");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let body = "lamp ".repeat(4_000);
+        let mut ids = Vec::new();
+        for n in 0..64 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project.set_text(&id, &RichText::from_plain(&body)).unwrap();
+            ids.push(id);
+        }
+        let alias = project.add_item(Kind::Text, "Alias", &draft, None).unwrap();
+        project.save().unwrap();
+        let shared = ids[0].clone();
+        let lower = shared.to_ascii_lowercase();
+        let mut aliases = HashSet::new();
+        aliases.insert(alias);
+        rewrite_ids(&path, &aliases, &HashSet::new(), &lower);
+        let project = Project::open(&path).unwrap();
+        let indexed = project.binder_index();
+        let kept = retained_index();
+        let one = body.len();
+        assert_eq!(
+            kept,
+            0,
+            "kept {kept} body bytes after indexing {} documents of {one}",
+            ids.len()
+        );
+        let upper = indexed.search.get(&shared).unwrap();
+        let folded = indexed.search.get(&lower).unwrap();
+        assert!(upper.contains("lamp"), "{upper}");
+        assert!(folded.contains("lamp"), "{folded}");
+        let words = rtf::word_count(&body);
+        assert_eq!(indexed.counts.get(&shared).copied(), Some(words));
+        assert_eq!(indexed.counts.get(&lower).copied(), Some(words));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn binder_index_matches_a_per_row_read_of_lighthouse() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Lighthouse.scriv");
+        let project = Project::open(&path).unwrap();
+        let indexed = project.binder_index();
+        let naive = naive_index(&project);
+        assert_eq!(indexed.counts, naive.counts);
+        assert_eq!(indexed.search, naive.search);
+        assert!(indexed.search.values().any(|text| text.contains("storm")));
+    }
+
+    #[test]
+    fn binder_index_reads_each_document_once() {
+        let (distinct_path, mut project) = temp_project("distinct");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let mut distinct = Vec::new();
+        for n in 0..32 {
+            let id = project
+                .add_item(Kind::Text, &format!("Scene {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain(&format!("words of scene {n}")))
+                .unwrap();
+            distinct.push(id);
+        }
+        project.save().unwrap();
+        let project = Project::open(&distinct_path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let indexed = project.binder_index();
+        let distinct_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let distinct_parses = rtf::parses();
+        assert_eq!(
+            distinct_parses, 32,
+            "32 documents parsed {distinct_parses} times"
+        );
+        assert_eq!(
+            indexed.counts.get(&distinct[3]).copied(),
+            Some(rtf::word_count("words of scene 3"))
+        );
+
+        let (path, mut project) = temp_project("aliases");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let shared = project
+            .add_item(Kind::Text, "The Lamp", &draft, None)
+            .unwrap();
+        project
+            .set_text(&shared, &RichText::from_plain("The lamp stays lit."))
+            .unwrap();
+        let mut aliases = HashSet::new();
+        for n in 0..400 {
+            aliases.insert(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        let mut bare = HashSet::new();
+        for n in 0..40 {
+            bare.insert(
+                project
+                    .add_item(Kind::Text, &format!("Bare {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        rewrite_ids(&path, &aliases, &bare, &shared);
+        std::fs::write(
+            path.join("Files/Data/content.rtf"),
+            br"{\rtf1\ansi BAIT bait bait}",
+        )
+        .unwrap();
+        let project = Project::open(&path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        let indexed = project.binder_index();
+        let alias_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let alias_parses = rtf::parses();
+        let rows = 401 + 40;
+        assert!(
+            alias_parses <= 1,
+            "{rows} rows parsed {alias_parses} times; one shared document"
+        );
+        assert!(
+            indexed.search.values().all(|text| !text.contains("bait")),
+            "an id-less row must not read Files/Data/content.rtf"
+        );
+        let found = indexed.search.get(&shared).unwrap();
+        assert!(found.contains("the lamp stays lit"), "{found}");
+        assert!(indexed.counts.get(&shared).copied().unwrap_or(0) > 0);
+        eprintln!(
+            "distinct docs=32 parses={distinct_parses} ms={distinct_ms:.1}; aliases={rows} parses={alias_parses} ms={alias_ms:.1}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(distinct_path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_row_with_no_id_is_not_a_document() {
+        let (path, mut project) = temp_project("noid");
+        let err = project
+            .set_text("", &RichText::from_plain("nope"))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "binder item has no id");
+        assert!(!path.join("Files/Data/content.rtf").exists());
+        let err = project
+            .set_notes("", &RichText::from_plain("nope"))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "binder item has no id");
+        let err = project.set_synopsis("", "nope").unwrap_err();
+        assert_eq!(err.to_string(), "binder item has no id");
+        std::fs::write(path.join("Files/Data/content.rtf"), br"{\rtf1 BAIT}").unwrap();
+        std::fs::write(path.join("Files/Data/synopsis.txt"), b"BAIT synopsis").unwrap();
+        rtf::reset_parses();
+        assert_eq!(project.text("").unwrap().plain_text(), "");
+        assert_eq!(project.notes("").unwrap().plain_text(), "");
+        assert_eq!(project.synopsis(""), "");
+        assert_eq!(rtf::parses(), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_reads_a_bounded_number_of_documents() {
+        let (hit_path, mut project) = temp_project("style-hit");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        project
+            .set_text(
+                &scene,
+                &RichText::from_plain("This sentence is definitely longer than twenty characters."),
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&hit_path).unwrap();
+        rtf::reset_parses();
+        assert!(project.default_style().is_some());
+        assert!(rtf::parses() <= 2);
+
+        let (alias_path, mut project) = temp_project("style-alias");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let shared = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
+        project
+            .set_text(&shared, &RichText::from_plain("short words"))
+            .unwrap();
+        let mut aliases = HashSet::new();
+        for n in 0..400 {
+            aliases.insert(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        rewrite_ids(&alias_path, &aliases, &HashSet::new(), &shared);
+        let project = Project::open(&alias_path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        assert!(project.default_style().is_none());
+        let alias_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let alias_parses = rtf::parses();
+        assert!(
+            alias_parses <= 2,
+            "400 aliases parsed the short file {alias_parses} times"
+        );
+
+        let (cap_path, mut project) = temp_project("style-cap");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        for n in 0..24 {
+            let id = project
+                .add_item(Kind::Text, &format!("Short {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain("short words"))
+                .unwrap();
+        }
+        project.save().unwrap();
+        let project = Project::open(&cap_path).unwrap();
+        rtf::reset_parses();
+        let started = std::time::Instant::now();
+        assert!(project.default_style().is_none());
+        let cap_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let cap_parses = rtf::parses();
+        assert_eq!(
+            cap_parses, 24,
+            "24 short documents parsed {cap_parses} times"
+        );
+        eprintln!(
+            "aliases parses={alias_parses} ms={alias_ms:.1}; distinct parses={cap_parses} ms={cap_ms:.1}"
+        );
+        let _ = std::fs::remove_dir_all(hit_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(alias_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(cap_path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_reads_past_short_included_documents() {
+        let (path, mut project) = temp_project("style-after-short");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        for n in 0..8 {
+            let id = project
+                .add_item(Kind::Text, &format!("Short {n}"), &draft, None)
+                .unwrap();
+            project
+                .set_text(&id, &RichText::from_plain("short words"))
+                .unwrap();
+        }
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        let mut paragraph = rtf::Paragraph::default();
+        paragraph.style.align = rtf::Align::Center;
+        paragraph.runs.push(rtf::Run {
+            text: "This sentence is definitely longer than twenty characters.".into(),
+            style: rtf::CharStyle {
+                italic: true,
+                ..rtf::CharStyle::default()
+            },
+        });
+        project
+            .set_text(
+                &scene,
+                &RichText {
+                    paragraphs: vec![paragraph],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&path).unwrap();
+        let style = project
+            .default_style()
+            .expect("a long paragraph after eight short documents");
+        assert_eq!(style.0.align, rtf::Align::Center);
+        assert!(style.1.italic);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn default_style_uses_the_paragraph_and_its_dominant_run() {
+        let (runs_path, mut project) = temp_project("style-runs");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let first = project.add_item(Kind::Text, "Runs", &draft, None).unwrap();
+        let mut paragraph = rtf::Paragraph::default();
+        paragraph.style.align = rtf::Align::Center;
+        for i in 0..6 {
+            paragraph.runs.push(rtf::Run {
+                text: "abcdefghij".into(),
+                style: rtf::CharStyle {
+                    bold: i % 2 == 0,
+                    italic: i % 2 == 1,
+                    ..rtf::CharStyle::default()
+                },
+            });
+        }
+        project
+            .set_text(
+                &first,
+                &RichText {
+                    paragraphs: vec![paragraph],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        let later = project.add_item(Kind::Text, "Later", &draft, None).unwrap();
+        let mut later_par = rtf::Paragraph::default();
+        later_par.style.align = rtf::Align::Left;
+        later_par.runs.push(rtf::Run {
+            text: "This later sentence is longer than twenty characters.".into(),
+            style: rtf::CharStyle::default(),
+        });
+        project
+            .set_text(
+                &later,
+                &RichText {
+                    paragraphs: vec![later_par],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&runs_path).unwrap();
+        let style = project
+            .default_style()
+            .expect("six 10-character runs are one 60-character paragraph");
+        assert_eq!(style.0.align, rtf::Align::Center);
+        assert!(style.1.bold);
+        assert!(!style.1.italic);
+
+        let (lead_path, mut project) = temp_project("style-lead");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let scene = project.add_item(Kind::Text, "Scene", &draft, None).unwrap();
+        let mut paragraph = rtf::Paragraph::default();
+        paragraph.style.align = rtf::Align::Right;
+        paragraph.runs.push(rtf::Run {
+            text: "Go ".into(),
+            style: rtf::CharStyle {
+                bold: true,
+                ..rtf::CharStyle::default()
+            },
+        });
+        paragraph.runs.push(rtf::Run {
+            text: "This sentence is the body of the paragraph.".into(),
+            style: rtf::CharStyle {
+                italic: true,
+                ..rtf::CharStyle::default()
+            },
+        });
+        project
+            .set_text(
+                &scene,
+                &RichText {
+                    paragraphs: vec![paragraph],
+                    lossy: Vec::new(),
+                },
+            )
+            .unwrap();
+        project.save().unwrap();
+        let project = Project::open(&lead_path).unwrap();
+        let style = project.default_style().expect("the lead-in paragraph");
+        assert_eq!(style.0.align, rtf::Align::Right);
+        assert!(style.1.italic);
+        assert!(!style.1.bold);
+        let _ = std::fs::remove_dir_all(runs_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(lead_path.parent().unwrap());
+    }
+
+    #[test]
+    fn media_path_refuses_an_empty_id() {
+        let (path, mut project) = temp_project("media-empty");
+        let research = project.root_folder(Kind::Research).unwrap().uuid;
+        let id = project
+            .add_item(Kind::Image, "Plate", &research, None)
+            .unwrap();
+        project.save().unwrap();
+        let scrivx = std::fs::read_dir(&path)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.extension()
+                    .is_some_and(|ext| ext == "scrivx")
+                    .then_some(path)
+            })
+            .unwrap();
+        let mut doc = xml::parse(&std::fs::read_to_string(&scrivx).unwrap()).unwrap();
+        fn strip(el: &mut xml::Element, id: &str) {
+            if el.name == "BinderItem" && el.attr("UUID").as_deref() == Some(id) {
+                el.attrs.retain(|(key, _)| key != "UUID");
+                let mut meta = xml::Element::new("MetaData");
+                let mut ext = xml::Element::new("FileExtension");
+                ext.set_text("png");
+                meta.children.push(Node::Element(ext));
+                el.children.push(Node::Element(meta));
+            }
+            for child in &mut el.children {
+                if let Node::Element(el) = child {
+                    strip(el, id);
+                }
+            }
+        }
+        strip(&mut doc.root, &id);
+        std::fs::write(&scrivx, doc.to_xml()).unwrap();
+        let bait = path.join("Files/Data/content.png");
+        std::fs::write(&bait, b"BAIT").unwrap();
+        let project = Project::open(&path).unwrap();
+        assert!(project.item("").is_some());
+        assert!(project.media_path("").is_none());
+        assert_eq!(std::fs::read(&bait).unwrap(), b"BAIT");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

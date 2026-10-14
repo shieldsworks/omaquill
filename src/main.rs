@@ -14,7 +14,7 @@ mod ui;
 
 use omaquill::compile::{self, Format, Options};
 use omaquill::project::{Item, Kind, Project};
-use omaquill::rtf;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -74,40 +74,12 @@ fn open(path: Option<&String>) -> Result<Project, String> {
 /// Reads every document and reports what omaquill sees. Writes nothing.
 fn check(args: &[String]) -> Result<(), String> {
     let p = open(args.first())?;
-    let mut docs = 0;
-    let mut words = 0;
-    let mut lossy = Vec::new();
-    fn walk(
-        p: &Project,
-        items: &[Item],
-        docs: &mut usize,
-        words: &mut usize,
-        lossy: &mut Vec<String>,
-    ) -> Result<(), String> {
-        for i in items {
-            if i.kind.has_text() {
-                let t = p.text(&i.uuid).map_err(|e| format!("{}: {e}", i.title))?;
-                // Writing and reading back must give the same document.
-                let again = rtf::parse(rtf::write(&t).as_bytes());
-                if again.paragraphs != t.paragraphs {
-                    return Err(format!(
-                        "{} ({}) doesn't survive a rewrite",
-                        i.title, i.uuid
-                    ));
-                }
-                *docs += 1;
-                *words += rtf::word_count(&t.plain_text());
-                if !t.lossy.is_empty() {
-                    lossy.push(format!("  {} has {}", i.title, t.lossy.join(", ")));
-                }
-            }
-            walk(p, &i.children, docs, words, lossy)?;
-        }
-        Ok(())
-    }
-    walk(&p, &p.items(), &mut docs, &mut words, &mut lossy)?;
+    let mut cache = HashMap::new();
+    let survey = compile::survey(&p, &mut cache).map_err(|e| e.to_string())?;
     let opts = Options::for_project(&p);
-    let sections = compile::gather(&p, &opts).map_err(|e| e.to_string())?;
+    let sections = compile::gather_cached(&p, &opts, &mut cache).map_err(|e| e.to_string())?;
+    let docs = survey.docs;
+    let words = survey.words;
     println!("{}", p.name());
     println!("  {docs} documents, {words} words in all");
     println!(
@@ -122,11 +94,11 @@ fn check(args: &[String]) -> Result<(), String> {
             draft.title
         );
     }
-    if lossy.is_empty() {
+    if survey.lossy.is_empty() {
         println!("  every document reads fully");
     } else {
         println!("  shown as plain text (kept unless edited):");
-        for l in lossy {
+        for l in survey.lossy {
             println!("{l}");
         }
     }
