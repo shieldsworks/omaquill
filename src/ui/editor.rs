@@ -3061,6 +3061,337 @@ next}";
         }
     }
 
+    /// A file long enough to be held. A short body grows a breakless tail so
+    /// the editor keeps the plain text and searches it itself.
+    fn with_hold(body: &str) -> String {
+        let probe = RichText::from_plain(body);
+        if super::rich::needs_plain_view(&probe) && body.chars().count() > HELD_WINDOW {
+            return body.to_string();
+        }
+        let mut held = body.to_string();
+        held.push_str(&"q".repeat(super::rich::SYNC_BREAKLESS_CHARS + 1));
+        held
+    }
+
+    struct Walk<'a> {
+        text: &'a str,
+        needle: &'a str,
+        forward: bool,
+        caret: usize,
+        steps: usize,
+    }
+
+    fn place_file_caret(ed: &Editor, caret: usize) {
+        let total = ed.plain_text().chars().count();
+        let caret = caret.min(total);
+        if ed.held_bar.is_visible() {
+            let max_origin = total.saturating_sub(HELD_WINDOW);
+            let origin = caret.min(max_origin);
+            if origin != ed.held_origin.get() {
+                ed.held_bar.adjustment().set_value(origin as f64);
+            }
+            let local = caret - ed.held_origin.get();
+            let at = ed.buffer.iter_at_offset(text_offset(local));
+            ed.buffer.place_cursor(&at);
+            return;
+        }
+        let at = ed.buffer.iter_at_offset(text_offset(caret));
+        ed.buffer.place_cursor(&at);
+    }
+
+    /// The same steps [`Editor::find`] takes, on a real GTK buffer.
+    fn gtk_marks(walk: &Walk<'_>) -> Vec<(usize, usize, bool)> {
+        let buffer = gtk::TextBuffer::new(None);
+        buffer.set_text(walk.text);
+        let flags = gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY;
+        let total = walk.text.chars().count();
+        buffer.place_cursor(&buffer.iter_at_offset(text_offset(walk.caret.min(total))));
+        let mut marks = Vec::with_capacity(walk.steps);
+        for _ in 0..walk.steps {
+            let (sel_start, sel_end) = buffer.selection_bounds().unwrap_or_else(|| {
+                let i = buffer.iter_at_mark(&buffer.get_insert());
+                (i, i)
+            });
+            let found = if walk.forward {
+                sel_end
+                    .forward_search(walk.needle, flags, None)
+                    .or_else(|| buffer.start_iter().forward_search(walk.needle, flags, None))
+            } else {
+                sel_start
+                    .backward_search(walk.needle, flags, None)
+                    .or_else(|| buffer.end_iter().backward_search(walk.needle, flags, None))
+            };
+            let red = found.is_none();
+            if let Some((start, end)) = found {
+                buffer.select_range(&start, &end);
+            }
+            let (start, end) = buffer.selection_bounds().map_or_else(
+                || {
+                    let i = text_index(buffer.iter_at_mark(&buffer.get_insert()).offset());
+                    (i, i)
+                },
+                |(start, end)| (text_index(start.offset()), text_index(end.offset())),
+            );
+            marks.push((start, end, red));
+        }
+        marks
+    }
+
+    fn held_marks(ed: &Editor, walk: &Walk<'_>) -> Vec<(usize, usize, bool)> {
+        ed.load(RichText::from_plain(walk.text));
+        assert!(ed.held_bar.is_visible(), "the parity file has to be held");
+        place_file_caret(ed, walk.caret);
+        ed.search_entry.set_search_delay(60_000);
+        ed.search_entry.set_text(walk.needle);
+        let mut marks = Vec::with_capacity(walk.steps);
+        for _ in 0..walk.steps {
+            ed.find(walk.forward);
+            let red = ed.search_entry.has_css_class("error");
+            let origin = ed.held_origin.get();
+            let insert =
+                origin + text_index(ed.buffer.iter_at_mark(&ed.buffer.get_insert()).offset());
+            let (start, end) = file_span(ed).unwrap_or((insert, insert));
+            marks.push((start, end, red));
+        }
+        marks
+    }
+
+    fn assert_walk(ed: &Editor, walk: &Walk<'_>, expected: Option<&[(usize, usize, bool)]>) {
+        let gtk = gtk_marks(walk);
+        if let Some(expected) = expected {
+            assert_eq!(gtk, expected, "gtk needle {:?}", walk.needle);
+        }
+        let held = held_marks(ed, walk);
+        let preview: String = walk.text.chars().take(72).collect();
+        assert_eq!(
+            held, gtk,
+            "needle {:?} caret {} forward {} text {preview:?}",
+            walk.needle, walk.caret, walk.forward
+        );
+    }
+
+    /// Find Next and Find Previous on a held document follow GTK.
+    /// A fold at the end of the file, the second half of `ß` and `ﬀ`, a
+    /// caret between a base and its combining mark, and U+FFFC.
+    pub(crate) fn held_find_edges_match_gtk() {
+        let (ed, window) = presented_editor();
+
+        let gruss = format!("{}Gru\u{00df}", "a".repeat(10_001));
+        assert_eq!(gruss.chars().count(), 10_005);
+        let gruss = with_hold(&gruss);
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &gruss,
+                needle: "s",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[
+                (10004, 10005, false),
+                (10004, 10005, false),
+                (10004, 10005, false),
+            ]),
+        );
+
+        let cafe = format!("{}caf\u{00e9} caf\u{00e9} CAF\u{00c9}", "q".repeat(10_000));
+        assert_eq!(cafe.chars().count(), 10_014);
+        let cafe = with_hold(&cafe);
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &cafe,
+                needle: "\u{0301}",
+                forward: true,
+                caret: 0,
+                steps: 5,
+            },
+            Some(&[
+                (10004, 10005, false),
+                (10009, 10010, false),
+                (10014, 10014, false),
+                (10004, 10005, false),
+                (10009, 10010, false),
+            ]),
+        );
+
+        let strasse = with_hold(&format!("{}Stra\u{00df}e", "a".repeat(198)));
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &strasse,
+                needle: "s",
+                forward: true,
+                caret: 0,
+                steps: 4,
+            },
+            Some(&[
+                (198, 199, false),
+                (202, 203, false),
+                (198, 199, false),
+                (202, 203, false),
+            ]),
+        );
+
+        let staff = with_hold("Sta\u{fb00} next");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &staff,
+                needle: "f",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[(3, 4, false), (3, 4, false), (3, 4, false)]),
+        );
+
+        let mut marked = "a".repeat(199);
+        marked.push('e');
+        marked.push('\u{0301}');
+        let marked = with_hold(&marked);
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &marked,
+                needle: "E",
+                forward: false,
+                caret: 200,
+                steps: 2,
+            },
+            Some(&[(199, 200, false), (199, 200, true)]),
+        );
+
+        // U+FFFC is a character in the RTF and in the buffer. GTK's
+        // text-only search skips it while counting, so the span moves past it.
+        let sample = "pre \u{FFFC} post \u{FFFC}s";
+        let round = rtf::parse(rtf::write(&RichText::from_plain(sample)).as_bytes());
+        assert_eq!(round.plain_text(), sample);
+        let fffc = with_hold(sample);
+        ed.load(RichText::from_plain(&fffc));
+        let (start, end) = ed.buffer.bounds();
+        assert!(ed.buffer.text(&start, &end, false).contains('\u{FFFC}'));
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc,
+                needle: "post",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(7, 11, false), (7, 11, false)]),
+        );
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc,
+                needle: "s",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[(9, 10, false), (13, 14, false), (9, 10, false)]),
+        );
+        let ended = format!("{}{sample}", "q".repeat(10_000));
+        assert_eq!(ended.chars().count(), 10_013);
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &ended,
+                needle: "s",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[
+                (10009, 10010, false),
+                (10013, 10013, false),
+                (10009, 10010, false),
+            ]),
+        );
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc,
+                needle: "\u{FFFC}",
+                forward: true,
+                caret: 0,
+                steps: 3,
+            },
+            Some(&[(4, 6, false), (11, 13, false), (4, 6, false)]),
+        );
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &fffc,
+                needle: "e",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(2, 3, false), (2, 3, false)]),
+        );
+
+        drop(window);
+    }
+
+    /// Sequences of Find Next and Find Previous on random Unicode, including
+    /// the end of the file and a held window edge, follow GTK.
+    pub(crate) fn held_find_sequences_match_gtk() {
+        let (ed, window) = presented_editor();
+        let letters = [
+            'a', 'Z', ' ', '\n', 's', 'S', 'e', 'E', 'f', '\u{00df}', '\u{00e9}', '\u{0301}',
+            '\u{fb00}', '\u{FFFC}', '\u{2014}',
+        ];
+        let mut state = 0x0a11_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+        for case in 0..8 {
+            let len = 1 + (next() as usize % 40);
+            let mut body = String::new();
+            for _ in 0..len {
+                body.push(letters[next() as usize % letters.len()]);
+            }
+            if case % 2 == 0 {
+                body.push('\u{00df}');
+            } else {
+                body.push('\u{0301}');
+            }
+            let text = with_hold(&body);
+            let total = text.chars().count();
+            let Some(first) = body.chars().next() else {
+                continue;
+            };
+            let needles = [
+                first.to_string(),
+                letters[next() as usize % letters.len()].to_string(),
+            ];
+            let carets = [0usize, HELD_WINDOW, total];
+            for needle in &needles {
+                for caret in carets {
+                    for forward in [true, false] {
+                        assert_walk(
+                            &ed,
+                            &Walk {
+                                text: &text,
+                                needle,
+                                forward,
+                                caret,
+                                steps: 4,
+                            },
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        drop(window);
+    }
+
     /// Case folding follows GTK. `ß` matches `ss`, and a composed accent
     /// matches its decomposed form. The span is in original characters.
     pub(crate) fn held_find_folds_like_plain_find() {

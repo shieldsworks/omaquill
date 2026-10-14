@@ -2310,6 +2310,8 @@ fn gtk_checks() {
     editor::tests::find_next_on_a_long_needle_reaches_the_second_match();
     editor::tests::held_find_matches_plain_find();
     editor::tests::held_find_folds_like_plain_find();
+    editor::tests::held_find_edges_match_gtk();
+    editor::tests::held_find_sequences_match_gtk();
     editor::tests::held_menu_select_all_copies_the_document();
     editor::tests::held_cut_leaves_the_document();
     editor::tests::held_find_in_the_last_page_stays_on_the_bar();
