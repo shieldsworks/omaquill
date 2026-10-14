@@ -827,10 +827,6 @@ pub(crate) mod tests {
         assert!(labels.iter().any(|label| label == "Ignore"));
     }
 
-    /// A suggestion on a held document is offered at a word in the window.
-    /// The buffer is that window. Replacing there would show `hello` and
-    /// leave the file on `helo`. The menu is not installed, and the
-    /// replacement leaves both the window and the file.
     pub(crate) fn a_suggestion_does_not_change_a_held_document() {
         let editor = Editor::new(true);
         let window = gtk::Window::new();
@@ -943,7 +939,6 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&dict).unwrap(), before);
         assert!(!ignore.exists(), "Ignore wrote {}", ignore.display());
 
-        // The same window, menu, and file checks with no dictionary installed.
         *session.broker.borrow_mut() = None;
         assert!(!session.has_dictionary());
         editor.load(omaquill::rtf::RichText::from_plain(&body));

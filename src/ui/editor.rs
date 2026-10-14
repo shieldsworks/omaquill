@@ -53,8 +53,6 @@ pub struct Editor {
     held_origin: Cell<usize>,
     /// The bar is changing the buffer, so its own signal does not run again.
     held_adjusting: Cell<bool>,
-    /// Select All asked for the whole held document. The buffer is one
-    /// window, so Copy reads the model until the selection changes.
     copy_whole_model: Cell<bool>,
 }
 
@@ -63,8 +61,7 @@ pub struct Editor {
 /// x86_64 xvfb runner and 135.9 ms for the next page on aarch64, in
 /// `time_styled_paragraph_open` at `692be6b`. Two hundred characters wrap
 /// in the column and are the text that layout shapes. A held document
-/// longer than this shows this many of its own characters. The bar moves
-/// one window at a time.
+/// longer than this shows this many of its own characters.
 const HELD_WINDOW: usize = 200;
 
 /// The first draw of a mapped text view.
@@ -320,17 +317,14 @@ impl Editor {
             }
         });
         let weak = Rc::downgrade(self);
-        self.buffer.connect_mark_set(move |buffer, _, mark| {
+        self.buffer.connect_mark_set(move |_buffer, _, mark| {
             let Some(ed) = weak.upgrade() else {
                 return;
             };
             let name = mark.name();
             let caret = name.as_deref() == Some("insert");
-            // A selection that is not the whole window is the visible
-            // text. Select All's own mark changes run before its
-            // after-handler sets the flag, and a full-window selection
-            // does not clear it.
-            if (caret || name.as_deref() == Some("selection_bound")) && !selection_covers(buffer) {
+            // `select_range` of the bounds already selected still emits mark-set.
+            if caret || name.as_deref() == Some("selection_bound") {
                 ed.copy_whole_model.set(false);
             }
             if caret && !ed.inserting.get() {
@@ -391,7 +385,7 @@ impl Editor {
                 if ed.held_adjusting.get() || ed.painted_source.borrow().is_none() {
                     return;
                 }
-                let origin = bar_chars(adj.value()) * HELD_WINDOW;
+                let origin = bar_origin(adj);
                 if origin == ed.held_origin.get() {
                     return;
                 }
@@ -618,19 +612,19 @@ impl Editor {
     }
 
     fn place_held_bar(&self, total: usize, origin: usize) {
-        let pages = total.div_ceil(HELD_WINDOW).max(1);
-        let page = origin / HELD_WINDOW;
         let adj = self.held_bar.adjustment();
         self.held_adjusting.set(true);
+        let span = total.max(1);
+        let page = HELD_WINDOW.min(span);
         adj.set_lower(0.0);
-        adj.set_upper(pages as f64);
-        adj.set_page_size(1.0);
-        adj.set_page_increment(1.0);
+        adj.set_upper(span as f64);
+        adj.set_page_size(page as f64);
+        adj.set_page_increment(page as f64);
         adj.set_step_increment(1.0);
-        let max = (pages as f64 - 1.0).max(0.0);
-        adj.set_value((page as f64).min(max));
+        let max = (span - page) as f64;
+        adj.set_value((origin as f64).min(max));
         self.held_adjusting.set(false);
-        let show = pages > 1;
+        let show = total > HELD_WINDOW;
         if self.held_bar.is_visible() != show {
             self.held_bar.set_visible(show);
         }
@@ -1038,11 +1032,7 @@ impl Editor {
         let window_end = origin + HELD_WINDOW;
         if start < origin || end > window_end {
             let page = start / HELD_WINDOW * HELD_WINDOW;
-            let match_len = end.saturating_sub(start);
-            // A page-aligned window clips a match that crosses its edge.
-            // The buffer then ends before the match, and copy takes the
-            // visible prefix. Slide to the match when it fits in one window.
-            let next = if match_len <= HELD_WINDOW && end > page + HELD_WINDOW {
+            let next = if end > page + HELD_WINDOW {
                 start
             } else {
                 page
@@ -1067,19 +1057,20 @@ impl Editor {
     }
 }
 
-fn selection_covers(buffer: &gtk::TextBuffer) -> bool {
-    let Some((start, end)) = buffer.selection_bounds() else {
-        return false;
-    };
-    start.is_start() && end.is_end() && buffer.char_count() > 0
+fn bar_origin(adj: &gtk::Adjustment) -> usize {
+    let mut origin = bar_chars(adj.value());
+    let page = bar_chars(adj.page_size()).max(1);
+    let total = bar_chars(adj.upper());
+    if total > page {
+        origin = origin.min(total - page);
+    }
+    origin
 }
 
 fn bar_chars(value: f64) -> usize {
     if !value.is_finite() || value <= 0.0 {
         return 0;
     }
-    // The bar's value is a page index. A page is [`HELD_WINDOW`]
-    // characters, and the page count fits in the exact integer range of f64.
     value as usize
 }
 
@@ -2309,9 +2300,6 @@ next}";
         window.close();
     }
 
-    /// A needle longer than the window starts past the page boundary.
-    /// The buffer starts at the match. The selection is the visible
-    /// prefix, not the two characters that sat on the first page.
     pub(crate) fn find_of_a_long_needle_starts_at_the_match() {
         let ed = Editor::new(true);
         let window = gtk::Window::new();
@@ -2454,7 +2442,7 @@ next}";
 
     /// The first window in a fresh process, stopped on after-paint.
     /// `role` is `plain` (a 32-character sentence) or `held`.
-    pub(crate) fn cold_open_ms(role: &str) -> f64 {
+    pub(crate) fn cold_open_ms(role: &str, started: std::time::Instant) -> f64 {
         let sentence = "The lamp at the point stays lit.";
         assert_eq!(sentence.chars().count(), 32);
         let text = match role {
@@ -2479,7 +2467,6 @@ next}";
             clock.connect_after_paint(move |_| flag.set(true));
             clock.request_phase(gtk::gdk::FrameClockPhase::AFTER_PAINT);
         });
-        let started = std::time::Instant::now();
         ed.load(text);
         window.present();
         let context = gtk::glib::MainContext::default();
@@ -2506,33 +2493,31 @@ next}";
 
     /// A fresh process pays for the first window whether the text is one
     /// sentence or a held document. The difference is the held open.
-    ///
-    /// A single first-window sample moves by more than that difference.
-    /// The median of three fresh processes is the open, and the bound is
-    /// on the medians.
     fn held_cold_open_matches_a_short_sentence() {
-        let plain = median_cold_ms("plain");
-        let held = median_cold_ms("held");
-        let delta = held - plain;
-        eprintln!("gtk cold plain_ms={plain:.1} held_ms={held:.1} delta_ms={delta:.1}");
-        assert!(
-            delta < 20.0,
-            "held cold open was {delta:.1} ms slower than a 32-character sentence (plain {plain:.1}, held {held:.1})"
-        );
-    }
-
-    fn median_cold_ms(role: &str) -> f64 {
-        let mut samples = [
-            fresh_cold_ms(role),
-            fresh_cold_ms(role),
-            fresh_cold_ms(role),
-        ];
-        samples.sort_by(|a, b| a.partial_cmp(b).expect("cold times are numbers"));
+        let mut deltas = [0.0; 3];
+        for (i, delta) in deltas.iter_mut().enumerate() {
+            let plain = fresh_cold_ms("plain");
+            let held = fresh_cold_ms("held");
+            *delta = held - plain;
+            eprintln!(
+                "gtk cold pair={i} plain_ms={plain:.1} held_ms={held:.1} delta_ms={:.1}",
+                *delta
+            );
+        }
+        let mean = (deltas[0] + deltas[1] + deltas[2]) / 3.0;
+        let mut slowest = deltas[0];
+        let mut fastest = deltas[0];
+        for delta in deltas {
+            slowest = slowest.max(delta);
+            fastest = fastest.min(delta);
+        }
         eprintln!(
-            "gtk cold role={role} samples={:.1},{:.1},{:.1} median={:.1}",
-            samples[0], samples[1], samples[2], samples[1]
+            "gtk cold pairs=3 mean_delta_ms={mean:.1} min_delta_ms={fastest:.1} max_delta_ms={slowest:.1}"
         );
-        samples[1]
+        assert!(
+            mean < 20.0,
+            "held cold open mean was {mean:.1} ms slower than a 32-character sentence (deltas {deltas:.1?}, slowest {slowest:.1})"
+        );
     }
 
     fn fresh_cold_ms(role: &str) -> f64 {
@@ -2556,8 +2541,7 @@ next}";
     /// letters and its own tags, so every timed load and every scroll
     /// writes the buffer. Those opens are warm: the window is already
     /// painted, and each timer stops on after-paint. The cold comparison
-    /// is a fresh process for a 32-character sentence and a fresh process
-    /// for a held document.
+    /// is three plain-then-held pairs.
     /// Set OMAQUILL_GTK_OPEN to one of those counts to time only that size.
     /// Set it to `probe` to time word-char layout under the cap. A held
     /// paragraph stays one buffer line and wraps on characters.

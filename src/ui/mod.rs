@@ -54,7 +54,6 @@ pub struct Win {
     /// saved here, never to `current`, so a failed load or save can't send
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
-    /// The last sentence passed to the toast overlay.
     last_toast: RefCell<String>,
     dirty_text: Cell<bool>,
     backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
@@ -1179,6 +1178,25 @@ impl Win {
             self.reselect_current();
             return;
         }
+        let as_text = match item.kind {
+            Kind::Text => true,
+            ref kind if kind.is_folder() => {
+                self.folder_view.get() == FolderView::Text && kind.has_text()
+            }
+            _ => false,
+        };
+        let text = if as_text {
+            match self.load_text(&item.uuid) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.reselect_current();
+                    self.toast(&format!("Couldn't read {}: {e}", item.title));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.editor.release_plain();
         // Everything is saved; the editor and inspector are free.
         *self.editor_uuid.borrow_mut() = None;
@@ -1190,12 +1208,12 @@ impl Win {
         let is_folder = item.kind.is_folder();
         self.view_buttons.set_visible(is_folder);
         match item.kind {
-            Kind::Text => self.show_text(&item),
+            Kind::Text => self.show_text(&item, text),
             k if k.is_folder() => {
                 let view = self.folder_view.get();
                 self.sync_view_buttons(view);
                 match view {
-                    FolderView::Text if k.has_text() => self.show_text(&item),
+                    FolderView::Text if k.has_text() => self.show_text(&item, text),
                     FolderView::Outliner => self.show_outliner(&item),
                     _ => self.show_corkboard(&item),
                 }
@@ -1268,63 +1286,46 @@ impl Win {
         }
     }
 
-    fn show_text(self: &Rc<Self>, item: &Item) {
-        let text = self
-            .project
-            .borrow()
-            .as_ref()
-            .map(|p| p.text(&item.uuid))
-            .transpose();
-        match text {
-            Ok(Some(text)) => {
-                let stored = omaquill::project::is_uuid(&item.uuid);
-                if !stored {
-                    self.editor.set_editing(false);
-                    self.editor.load(rtf::RichText::from_plain(""));
-                    self.banner.set_title("This item has no file.");
-                    self.banner.set_revealed(true);
-                    self.dirty_text.set(false);
-                    *self.editor_uuid.borrow_mut() = None;
-                    self.format_bar.set_visible(false);
-                    self.stack.set_visible_child_name("editor");
-                    return;
-                }
-                self.editor.set_editing(true);
-                self.editor.load(text);
-                self.spell.rescan();
-                self.dirty_text.set(false);
-                *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
-                self.sync_editor_chrome();
-                self.stack.set_visible_child_name("editor");
-                // Browsing the binder with the keyboard keeps focus there.
-                // set_focus works before the window is shown; grab_focus doesn't.
-                let in_binder = gtk::prelude::RootExt::focus(&self.window)
-                    .is_some_and(|f| f.is_ancestor(&self.binder.root));
-                if !in_binder {
-                    GtkWindowExt::set_focus(&self.window, Some(&self.editor.view));
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Never leave another document's text editable here.
-                // `show_item` stored this id before the read. Leaving it,
-                // or leaving the row selected, makes the next click return
-                // without trying again. The empty page says to pick
-                // something; the banner is the read error.
-                *self.editor_uuid.borrow_mut() = None;
-                *self.current.borrow_mut() = None;
-                self.binder.select_quietly(None);
-                let message = format!("Couldn't read {}: {e}", item.title);
-                self.banner.set_title(&message);
-                self.banner.set_revealed(true);
-                self.format_bar.set_visible(false);
-                self.stack.set_visible_child_name("editor");
-                self.toast(&message);
-            }
+    fn load_text(&self, uuid: &str) -> omaquill::project::Result<Option<rtf::RichText>> {
+        let project = self.project.borrow();
+        let Some(project) = project.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(project.text(uuid)?))
+    }
+
+    fn show_text(self: &Rc<Self>, item: &Item, text: Option<rtf::RichText>) {
+        let Some(text) = text else {
+            return;
+        };
+        let stored = omaquill::project::is_uuid(&item.uuid);
+        if !stored {
+            self.editor.set_editing(false);
+            self.editor.load(rtf::RichText::from_plain(""));
+            self.banner.set_title("This item has no file.");
+            self.banner.set_revealed(true);
+            self.dirty_text.set(false);
+            *self.editor_uuid.borrow_mut() = None;
+            self.format_bar.set_visible(false);
+            self.stack.set_visible_child_name("editor");
+            return;
+        }
+        self.editor.set_editing(true);
+        self.editor.load(text);
+        self.spell.rescan();
+        self.dirty_text.set(false);
+        *self.editor_uuid.borrow_mut() = Some(item.uuid.clone());
+        self.sync_editor_chrome();
+        self.stack.set_visible_child_name("editor");
+        let in_binder = gtk::prelude::RootExt::focus(&self.window)
+            .is_some_and(|f| f.is_ancestor(&self.binder.root));
+        if !in_binder {
+            GtkWindowExt::set_focus(&self.window, Some(&self.editor.view));
         }
     }
 
     fn set_folder_view(self: &Rc<Self>, view: FolderView) {
+        let previous = self.folder_view.get();
         self.folder_view.set(view);
         self.sync_view_buttons(view);
         let Some(uuid) = self.current.borrow().clone() else {
@@ -1337,14 +1338,32 @@ impl Win {
         if !self.save_now() {
             return;
         }
+        if view == FolderView::Text && item.kind.has_text() {
+            let text = match self.load_text(&item.uuid) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.folder_view.set(previous);
+                    self.sync_view_buttons(previous);
+                    self.toast(&format!("Couldn't read {}: {e}", item.title));
+                    return;
+                }
+            };
+            self.editor.release_plain();
+            *self.editor_uuid.borrow_mut() = None;
+            self.dirty_text.set(false);
+            self.banner.set_revealed(false);
+            self.show_text(&item, text);
+            self.update_doc_words();
+            return;
+        }
         self.editor.release_plain();
         *self.editor_uuid.borrow_mut() = None;
         self.dirty_text.set(false);
         self.banner.set_revealed(false);
-        match view {
-            FolderView::Text if item.kind.has_text() => self.show_text(&item),
-            FolderView::Outliner => self.show_outliner(&item),
-            _ => self.show_corkboard(&item),
+        if view == FolderView::Outliner {
+            self.show_outliner(&item);
+        } else {
+            self.show_corkboard(&item);
         }
         self.update_doc_words();
     }
@@ -1965,9 +1984,6 @@ fn a_long_line_names_the_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A read error leaves the document that was already open. A held
-/// predecessor stays read-only, under its own title, and `save_now`
-/// does not replace its file. The broken row can be opened again.
 #[cfg(test)]
 fn a_failed_open_can_be_retried() {
     let dir = std::env::temp_dir().join(format!("omaquill-retry-win-{}", std::process::id()));
@@ -1976,9 +1992,7 @@ fn a_failed_open_can_be_retried() {
     let path = dir.join("Retry.scriv");
     let mut project = Project::create(&path).unwrap();
     let draft = project.root_folder(Kind::Draft).unwrap().uuid;
-    let long = project
-        .add_item(Kind::Text, "Long", &draft, None)
-        .unwrap();
+    let long = project.add_item(Kind::Text, "Long", &draft, None).unwrap();
     project
         .set_text(&long, &rtf::RichText::from_plain(&"a".repeat(10_000)))
         .unwrap();
@@ -2085,14 +2099,19 @@ fn a_failed_open_can_be_retried() {
 #[cfg(test)]
 #[test]
 fn gtk_checks() {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        eprintln!("no display; GTK checks skipped");
+    if let Ok(role) = std::env::var("OMAQUILL_GTK_COLD") {
+        let started = std::time::Instant::now();
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+            eprintln!("no display; GTK checks skipped");
+            return;
+        }
+        adw::init().unwrap();
+        let ms = editor::tests::cold_open_ms(&role, started);
+        println!("OMAQUILL_COLD_MS={ms:.3}");
         return;
     }
-    if let Ok(role) = std::env::var("OMAQUILL_GTK_COLD") {
-        adw::init().unwrap();
-        let ms = editor::tests::cold_open_ms(&role);
-        println!("OMAQUILL_COLD_MS={ms:.3}");
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        eprintln!("no display; GTK checks skipped");
         return;
     }
     adw::init().unwrap();
