@@ -44,6 +44,8 @@ pub struct Session {
     language: RefCell<String>,
     broker: RefCell<Option<Broker>>,
     dictionary: RefCell<BTreeSet<String>>,
+    /// Where added words are stored. A held document does not write this file.
+    dictionary_file: RefCell<PathBuf>,
     ignored: RefCell<BTreeSet<String>>,
     ignore_path: RefCell<Option<PathBuf>>,
     line: Cell<i32>,
@@ -73,6 +75,7 @@ impl Session {
             broker: RefCell::new(Broker::open(&tag)),
             language: RefCell::new(tag),
             dictionary: RefCell::new(state::load_words(&state::dictionary_path())),
+            dictionary_file: RefCell::new(state::dictionary_path()),
             ignored: RefCell::new(BTreeSet::new()),
             ignore_path: RefCell::new(None),
             line: Cell::new(0),
@@ -137,6 +140,9 @@ impl Session {
     /// cleared only when the index moves, so the next slice does not copy
     /// the line.
     pub fn after_edit(&self) {
+        if self.editor.is_too_formatted() {
+            return;
+        }
         let n = self.editor.buffer.char_count();
         let prev = self.chars.replace(n);
         let delta = n - prev;
@@ -166,7 +172,7 @@ impl Session {
 
     pub fn refresh_cursor(&self) {
         let policy = *self.policy.borrow();
-        if !spell::shown(&policy) {
+        if !spell::shown(&policy) || self.editor.is_too_formatted() {
             return;
         }
         let buffer = &self.editor.buffer;
@@ -190,8 +196,12 @@ impl Session {
         self.clear_scan_mark();
         self.left.set(None);
         self.chars.set(self.editor.buffer.char_count());
-        if !spell::shown(&self.policy.borrow()) {
+        if !spell::shown(&self.policy.borrow()) || self.editor.is_too_formatted() {
             self.clear_all();
+            self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
+            self.editor
+                .view
+                .insert_action_group("spell", None::<&gtk::gio::SimpleActionGroup>);
             return;
         }
         self.line.set(0);
@@ -328,7 +338,7 @@ impl Session {
     }
 
     fn pump(&self) -> glib::ControlFlow {
-        if !spell::shown(&self.policy.borrow()) {
+        if !spell::shown(&self.policy.borrow()) || self.editor.is_too_formatted() {
             self.idle.borrow_mut().take();
             return glib::ControlFlow::Break;
         }
@@ -469,6 +479,9 @@ impl Session {
     }
 
     fn remember(&self, word: &str, dictionary: bool) {
+        if self.editor.is_too_formatted() {
+            return;
+        }
         let key = spell::dictionary_key(word);
         if key.is_empty() {
             return;
@@ -476,7 +489,7 @@ impl Session {
         if dictionary {
             self.dictionary.borrow_mut().insert(key);
             let words = self.dictionary.borrow().clone();
-            let _ = state::save_words(&state::dictionary_path(), &words);
+            let _ = state::save_words(&self.dictionary_file.borrow(), &words);
         } else {
             self.ignored.borrow_mut().insert(key);
             if let Some(path) = self.ignore_path.borrow().clone() {
@@ -835,6 +848,66 @@ pub(crate) mod tests {
         replace_word(&editor, at, at + 4, "hello");
         assert_eq!(editor.plain_text(), plain);
         assert_eq!(editor.text().plain_text(), plain);
+    }
+
+    /// A held document is not spellchecked. The buffer is one window of the
+    /// file, so a mark or Add would keep a fragment cut at that edge. The
+    /// scan paints nothing, the text menu has no suggestion, Add, or Ignore,
+    /// and the dictionary file is left as it was.
+    pub(crate) fn a_held_document_is_not_spellchecked() {
+        let dir = std::env::temp_dir().join(format!("omaquill-spell-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dict = dir.join("dictionary");
+        std::fs::write(&dict, "alpha\n").unwrap();
+        let before = std::fs::read(&dict).unwrap();
+        let ignore = dir.join("ignored");
+
+        let editor = Editor::new(true);
+        let body = format!("helo {}", "a".repeat(10_000));
+        editor.load(omaquill::rtf::RichText::from_plain(&body));
+        assert!(editor.is_too_formatted());
+        let (start, end) = editor.buffer.bounds();
+        let shown = editor.buffer.text(&start, &end, false).to_string();
+        assert!(shown.starts_with("helo "));
+        assert!(shown.chars().count() < body.chars().count());
+        let fragment: String = shown
+            .chars()
+            .rev()
+            .take_while(|c| *c == 'a')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        assert!(!fragment.is_empty());
+        assert!(fragment.chars().count() < 10_000);
+
+        let session = Session::new(&editor, &Settings::default());
+        *session.dictionary.borrow_mut() = state::load_words(&dict);
+        *session.dictionary_file.borrow_mut() = dict.clone();
+        *session.ignore_path.borrow_mut() = Some(ignore.clone());
+        session.rescan();
+        drain(&session);
+        assert!(
+            marked_words(&editor.buffer).is_empty(),
+            "a held document was marked: {:?}",
+            marked_words(&editor.buffer)
+        );
+        let inside = editor.buffer.iter_at_offset(2);
+        assert!(!session.prepare_at(&inside));
+        assert!(editor.view.extra_menu().is_none());
+        session.remember("helo", true);
+        session.remember(&fragment, true);
+        session.remember("helo", false);
+        session.remember(&fragment, false);
+        assert!(
+            !session.dictionary.borrow().contains("helo"),
+            "Add stored a word from a held document"
+        );
+        assert!(!session.dictionary.borrow().contains(&fragment));
+        assert_eq!(std::fs::read(&dict).unwrap(), before);
+        assert!(!ignore.exists(), "Ignore wrote {}", ignore.display());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Spell walks `line_count`. One paragraph is one line, including when

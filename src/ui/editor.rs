@@ -56,12 +56,13 @@ pub struct Editor {
 }
 
 /// Characters of a held document placed in the buffer at once.
-/// Character wrap of a 10,000-character unspaced line took 114.6 ms on the
-/// x86_64 xvfb runner and 194.6 ms on aarch64, in the first frame of
-/// `a_held_long_line_wraps_on_characters` at `5b6469c`. A held document
+/// A 1,024-character window took 101.0 ms for the first layout on the
+/// x86_64 xvfb runner and 135.9 ms for the next page on aarch64, in
+/// `time_styled_paragraph_open` at `692be6b`. Two hundred characters wrap
+/// in the column and are the text that layout shapes. A held document
 /// longer than this shows this many of its own characters. The bar moves
 /// one window at a time.
-const HELD_WINDOW: usize = 1_024;
+const HELD_WINDOW: usize = 200;
 
 impl Editor {
     /// `page` is the main editor: centered column, find bar. Otherwise a

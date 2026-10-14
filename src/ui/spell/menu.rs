@@ -26,8 +26,11 @@ impl Session {
     pub(super) fn prepare_at(&self, click: &gtk::TextIter) -> bool {
         let mut policy = *self.policy.borrow();
         policy.hide_word_at_cursor = false;
-        if !spell::shown(&policy) {
+        if !spell::shown(&policy) || self.editor.is_too_formatted() {
             self.editor.view.set_extra_menu(None::<&gtk::gio::Menu>);
+            self.editor
+                .view
+                .insert_action_group("spell", None::<&gtk::gio::SimpleActionGroup>);
             return false;
         }
         let mut origin = *click;

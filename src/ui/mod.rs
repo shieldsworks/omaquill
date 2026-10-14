@@ -1995,6 +1995,7 @@ fn gtk_checks() {
     spell::tests::a_paste_marks_every_new_word();
     spell::tests::suggestions_share_the_text_view_menu();
     spell::tests::a_suggestion_does_not_change_a_held_document();
+    spell::tests::a_held_document_is_not_spellchecked();
     spell::tests::a_keystroke_ahead_of_the_scan_does_not_skip();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
     spell::tests::activating_spellcheck_flips_its_state();
