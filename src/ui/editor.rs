@@ -1657,7 +1657,6 @@ next}";
 
     /// `present` queues a frame. `pending()` can be false until that frame
     /// is ready, so a non-blocking drain returns without mapping the window.
-    /// On `f8810dd` the timed turn was still that map, 222.5 ms on aarch64.
     fn show_window(window: &gtk::Window) {
         window.present();
         let context = gtk::glib::MainContext::default();
@@ -1671,11 +1670,28 @@ next}";
         }
     }
 
+    /// The first painted frame of a newly mapped text view is the window
+    /// coming on screen. On `1f42f62` that frame was 126.9 ms on x86_64 and
+    /// 165.8 ms on aarch64 when the held line was the first text in the
+    /// view. A document opens into a view that has already been painted.
+    fn paint_editor(ed: &Editor) {
+        let context = gtk::glib::MainContext::default();
+        ed.view.set_wrap_mode(gtk::WrapMode::WordChar);
+        ed.buffer.set_text("Hello");
+        ed.buffer.place_cursor(&ed.buffer.start_iter());
+        for _ in 0..40 {
+            context.iteration(false);
+            if ed.view.iter_location(&ed.buffer.start_iter()).height() > 0 && !context.pending() {
+                return;
+            }
+        }
+    }
+
     /// A held unspaced line wraps on characters inside the column. The buffer
     /// is a window of the file text, and find matches that text.
     ///
-    /// The timed turns start after the window is mapped. A document opens
-    /// into a window that is already on screen.
+    /// The timed turns start after the view has been painted. A document
+    /// opens into a window that is already on screen.
     pub(crate) fn a_held_long_line_wraps_on_characters() {
         let ed = Editor::new(true);
         let window = gtk::Window::new();
@@ -1683,6 +1699,11 @@ next}";
         window.set_child(Some(&ed.root));
         show_window(&window);
         assert!(window.is_mapped(), "the window did not map");
+        paint_editor(&ed);
+        assert!(
+            ed.view.iter_location(&ed.buffer.start_iter()).height() > 0,
+            "the view was not painted"
+        );
         let context = gtk::glib::MainContext::default();
         let chars = 10_000usize;
         let body = "a".repeat(chars);
@@ -1834,6 +1855,7 @@ next}";
         window.set_child(Some(&ed.root));
         show_window(&window);
         assert!(window.is_mapped(), "the window did not map");
+        paint_editor(&ed);
         let context = gtk::glib::MainContext::default();
         if which == "probe" {
             probe_word_char(&ed, &context);
