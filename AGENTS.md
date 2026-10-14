@@ -34,8 +34,10 @@ mise test
 on x86_64 and on aarch64. It runs on pull requests and on pushes to `main`.
 Fix what a check reports. Do not weaken the check that reported it.
 
-There is no `.cursor/skills/verify` skill and no feature map. Do not claim
-you drove one.
+`.cursor/skills/verify-omaquill/` drives the window on a copy of the
+fixture. `mise lint` and `mise test` stay the code checks. Do not claim
+you drove the window unless that skill's helper exited 0 and its evidence
+files are still there.
 
 What the tests cover:
 

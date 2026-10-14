@@ -1,5 +1,5 @@
 #!/bin/bash
-set -u
+set -euo pipefail
 if [[ -z "${OMAQUILL_VERIFY_INNER:-}" ]]; then
   export OMAQUILL_VERIFY_INNER=1
   exec xvfb-run -a -s "-screen 0 1400x900x24" dbus-run-session -- bash "$0" "$@"
@@ -95,6 +95,7 @@ xdotool key --delay 30 ctrl+h
 sleep 0.5
 
 export ART="$art"
+set +e
 python3 - <<'PY'
 import os, sys, time, pyatspi
 art = os.environ["ART"]
@@ -172,6 +173,10 @@ open(os.path.join(art, "toast.txt"), "w").write("Replaced 1\n")
 print("editor updated")
 print("toast Replaced 1")
 PY
+drive_code=$?
+set -e
+echo "$drive_code" >"$art/drive.exit"
+test "$drive_code" = 0
 
 xwd -id "$wid" -silent -out "$art/after-click.xwd"
 xwdtopnm "$art/after-click.xwd" 2>/dev/null | pnmtopng >"$art/after-click.png"
@@ -213,9 +218,16 @@ for unchanged in "$keeper" "$morning" "$cutscene"; do
     exit 1
   fi
 done
+grep -q "lamp oil" "$keeper"
 
-"$bin" check "$proj" | tee "$art/check.txt"
-"$bin" compile "$proj" "$art/lighthouse.txt" --format txt | tee "$art/compile-stdout.txt"
+set +e
+"$bin" check "$proj" >"$art/check.txt" 2>"$art/check.err"
+echo $? >"$art/check.exit"
+"$bin" compile "$proj" "$art/lighthouse.txt" --format txt >"$art/compile-stdout.txt" 2>"$art/compile.err"
+echo $? >"$art/compile.exit"
+set -e
+test "$(cat "$art/check.exit")" = 0
+test "$(cat "$art/compile.exit")" = 0
 grep -q "every document reads fully" "$art/check.txt"
 grep -q "Mara lit the lantern" "$art/lighthouse.txt"
 grep -q "By morning the sea had gone flat" "$art/lighthouse.txt"
@@ -223,9 +235,13 @@ if grep -q "lamp oil" "$art/lighthouse.txt"; then
   echo "compile included the research folder" >&2
   exit 1
 fi
+git -C "$root" status --short -- tests/fixtures/Lighthouse.scriv >"$art/fixture-status.txt"
+test ! -s "$art/fixture-status.txt"
+cp "$RUN/app.log" "$art/app.log"
 test -s "$art/after-click.png"
 test -s "$art/saved.png"
 test -s "$art/editor.txt"
 test -s "$art/toast.txt"
+echo 0 >"$art/helper.exit"
 echo "evidence $art"
 echo "RUN=$RUN"

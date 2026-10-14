@@ -59,6 +59,8 @@ Lighthouse
 
 `lighthouse.txt` contained `Mara lit the lantern` and `By morning the sea had gone flat and gray`. `storm-after.rtf` contained `lantern` and did not contain `lamp`. The other three `content.rtf` hashes matched the pre-drive file. After the script exited, `after-click.png` and `editor.txt` were still in that directory.
 
+A second run, after the helper was changed to record exit codes and stop on a failed check, also exited 0. `drive.exit`, `check.exit`, `compile.exit`, and `helper.exit` were each `0`. `fixture-status.txt` was empty. The editor text matched the block above.
+
 `find-document` and `find-project` are not part of that helper. Drive them from the same launch if the change touches `Ctrl+F` or `Ctrl+Shift+F`. For project search, `Ctrl+Shift+F` focuses the box whose placeholder is `Search project`. The query `lamp` on an unmodified copy lists The Storm and Keeper's Log. The query `lantern` lists nothing until the replace above.
 
 ## Gotchas

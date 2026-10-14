@@ -67,8 +67,10 @@ xdotool search --name "Lighthouse — omaquill"
 The version line is this checkout's binary. The pid is the process this
 run started. The window title is `Lighthouse — omaquill`. In Python,
 `pyatspi.Registry.getDesktop(0)` has one app named `omaquill`. Drive only
-that app. `libEGL` and Adwaita warnings under Xvfb still leave a passed
-doctor when the pid is alive and the window title matches.
+that app. The app log under Xvfb can contain a `libEGL` warning, an
+Adwaita minimum-size warning, and `Theme parser error` for an unknown
+pseudo-class. Doctor still passes when the pid is alive and the window
+title matches.
 
 Spellcheck also needs `libenchant-2.so.2` and a dictionary such as
 `hunspell-en-us`. The binary loads Enchant with `dlopen`, so a missing

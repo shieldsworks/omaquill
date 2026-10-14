@@ -25,7 +25,7 @@ Preconditions:
 
 - **Window title.** Read the title after launch. `xdotool search --name "Lighthouse — omaquill"` prints a window id. The accessibility frame has that same name.
 - **First scene.** Read the editor text. The empty-named text widget starts with `The storm came in off the point at dusk.` The binder has a button named `The Storm`.
-- **Read-only check.** In another command, after the window is up or after it has quit, run `./target/debug/omaquill check "$run/Lighthouse.scriv"`. Exit code 0. Stdout on an unmodified copy is the four lines below.
+- **Read-only check.** In another command, after the window is up or after it has quit, run `./target/debug/omaquill check "$run/Lighthouse.scriv"`. Exit code 0. Stdout on an unmodified copy is the five lines below.
 
 ```
 Lighthouse
