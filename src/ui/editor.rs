@@ -408,9 +408,6 @@ impl Editor {
             if !ed.model_outruns_buffer() {
                 return;
             }
-            // The default handler copies the window and then deletes it.
-            // A held document is read-only, so cut copies the same text
-            // Copy would and leaves the buffer alone.
             let text = if ed.copy_whole_model.get() {
                 ed.painted_source
                     .borrow()
@@ -1204,14 +1201,6 @@ fn text_index(offset: i32) -> usize {
     usize::try_from(offset.max(0)).expect("a text offset is non-negative")
 }
 
-/// Character where a held scan starts.
-///
-/// A caret includes a match that begins there. A selection that is the
-/// current match, including one clipped by the window, starts after that
-/// match's end in the file. Any other selection starts at its own end.
-/// Backward search starts where a match can still end at the caret, so
-/// the step is the whole needle. `gtk_text_iter_backward_search` refuses
-/// a match whose end lies after the iter.
 fn scan_from(
     plain: &str,
     needle: &str,
@@ -1225,6 +1214,8 @@ fn scan_from(
     let model_end = origin + end_off;
     if !forward {
         let needle_len = needle.chars().count();
+        // find_ci starts one character before from_char. This index is the
+        // first one where a match can still end on the caret.
         return model_start.saturating_sub(needle_len.saturating_sub(1));
     }
     if start_off == end_off {
@@ -3092,15 +3083,12 @@ next}";
         window.close();
     }
 
-    /// One open, timed from just before `load` and `present` until the
-    /// first after-paint. `role` is `plain` or `held`.
-    fn cold_open_ms(role: &str) -> f64 {
+    fn cold_open_ms(role: ColdDoc) -> f64 {
         let sentence = "The lamp at the point stays lit.";
         assert_eq!(sentence.chars().count(), 32);
         let text = match role {
-            "plain" => RichText::from_plain(sentence),
-            "held" => one_line(10_000),
-            other => panic!("unknown cold role {other}"),
+            ColdDoc::Plain => RichText::from_plain(sentence),
+            ColdDoc::Held => one_line(10_000),
         };
         let ed = Editor::new(true);
         let window = gtk::Window::new();
@@ -3141,13 +3129,20 @@ next}";
             }
         }
         let ms = elapsed.get();
-        assert!(ms.is_finite(), "{role} cold open did not finish a paint");
-        if role == "held" {
-            assert!(ed.is_too_formatted());
-            assert_eq!(buffer_string(&ed).chars().count(), HELD_WINDOW);
-        } else {
-            assert!(!ed.is_too_formatted());
-            assert_eq!(buffer_string(&ed), sentence);
+        let name = match role {
+            ColdDoc::Plain => "plain",
+            ColdDoc::Held => "held",
+        };
+        assert!(ms.is_finite(), "{name} cold open did not finish a paint");
+        match role {
+            ColdDoc::Held => {
+                assert!(ed.is_too_formatted());
+                assert_eq!(buffer_string(&ed).chars().count(), HELD_WINDOW);
+            }
+            ColdDoc::Plain => {
+                assert!(!ed.is_too_formatted());
+                assert_eq!(buffer_string(&ed), sentence);
+            }
         }
         window.close();
         for _ in 0..5 {
@@ -3161,14 +3156,11 @@ next}";
         ms
     }
 
-    /// The first frame pays for GTK setup whichever document opens it.
-    /// A discarded plain window takes that cost. Each pair then opens
-    /// both documents here, alternating which one is first. One pair may
-    /// sit on a noisy frame. A second pair at or over 20 ms is the held
-    /// open. 20 ms stays the bound.
     fn held_cold_open_matches_a_short_sentence() {
         const PAIRS: usize = 7;
-        let _warmup = cold_open_ms("plain");
+        const SLOW_PAIR_MS: f64 = 20.0;
+        const ALLOWED_SLOW_PAIRS: usize = 1;
+        let _first_frame = cold_open_ms(ColdDoc::Plain);
         let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let load = load.split_whitespace().next().unwrap_or("?");
         let cores = std::thread::available_parallelism()
@@ -3179,12 +3171,12 @@ next}";
         for (i, delta_slot) in deltas.iter_mut().enumerate() {
             let held_first = i % 2 == 1;
             let (plain_ms, held_ms) = if held_first {
-                let held_ms = cold_open_ms("held");
-                let plain_ms = cold_open_ms("plain");
+                let held_ms = cold_open_ms(ColdDoc::Held);
+                let plain_ms = cold_open_ms(ColdDoc::Plain);
                 (plain_ms, held_ms)
             } else {
-                let plain_ms = cold_open_ms("plain");
-                let held_ms = cold_open_ms("held");
+                let plain_ms = cold_open_ms(ColdDoc::Plain);
+                let held_ms = cold_open_ms(ColdDoc::Held);
                 (plain_ms, held_ms)
             };
             let delta = held_ms - plain_ms;
@@ -3194,7 +3186,10 @@ next}";
                 "gtk cold pair={i} first={first} plain_ms={plain_ms:.1} held_ms={held_ms:.1} delta_ms={delta:.1}"
             ));
         }
-        let over = deltas.iter().filter(|delta| **delta >= 20.0).count();
+        let over = deltas
+            .iter()
+            .filter(|delta| **delta >= SLOW_PAIR_MS)
+            .count();
         let min_delta = deltas.iter().copied().fold(f64::INFINITY, f64::min);
         let max_delta = deltas.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         lines.push(format!(
@@ -3204,10 +3199,16 @@ next}";
             report_line(line);
         }
         assert!(
-            over < 2,
-            "held cold open was at least 20 ms slower than a 32-character sentence on {over} pairs\n{}",
+            over <= ALLOWED_SLOW_PAIRS,
+            "held cold open was at least {SLOW_PAIR_MS} ms slower than a 32-character sentence on {over} pairs\n{}",
             lines.join("\n")
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum ColdDoc {
+        Plain,
+        Held,
     }
 
     /// `cargo test` captures a passing test's stdout. The parent of this
