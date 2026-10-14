@@ -3410,6 +3410,87 @@ next}";
         );
     }
 
+    fn gtk_turns(
+        text: &str,
+        needle: &str,
+        caret: usize,
+        dirs: &[bool],
+    ) -> Vec<(usize, usize, bool)> {
+        let buffer = gtk::TextBuffer::new(None);
+        buffer.set_text(text);
+        let flags = gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY;
+        let total = text.chars().count();
+        buffer.place_cursor(&buffer.iter_at_offset(text_offset(caret.min(total))));
+        let mut marks = Vec::with_capacity(dirs.len());
+        for &forward in dirs {
+            let (sel_start, sel_end) = buffer.selection_bounds().unwrap_or_else(|| {
+                let i = buffer.iter_at_mark(&buffer.get_insert());
+                (i, i)
+            });
+            let found = if forward {
+                sel_end
+                    .forward_search(needle, flags, None)
+                    .or_else(|| buffer.start_iter().forward_search(needle, flags, None))
+            } else {
+                sel_start
+                    .backward_search(needle, flags, None)
+                    .or_else(|| buffer.end_iter().backward_search(needle, flags, None))
+            };
+            let red = found.is_none();
+            if let Some((start, end)) = found {
+                buffer.select_range(&start, &end);
+            }
+            let (start, end) = buffer.selection_bounds().map_or_else(
+                || {
+                    let i = text_index(buffer.iter_at_mark(&buffer.get_insert()).offset());
+                    (i, i)
+                },
+                |(start, end)| (text_index(start.offset()), text_index(end.offset())),
+            );
+            marks.push((start, end, red));
+        }
+        marks
+    }
+
+    fn held_turns(
+        ed: &Editor,
+        text: &str,
+        needle: &str,
+        caret: usize,
+        dirs: &[bool],
+    ) -> Vec<(usize, usize, bool)> {
+        ed.load(RichText::from_plain(text));
+        assert!(ed.held_bar.is_visible(), "the parity file has to be held");
+        place_file_caret(ed, caret);
+        ed.search_entry.set_search_delay(60_000);
+        ed.search_entry.set_text(needle);
+        let mut marks = Vec::with_capacity(dirs.len());
+        for &forward in dirs {
+            ed.find(forward);
+            let red = ed.search_entry.has_css_class("error");
+            let origin = ed.held_origin.get();
+            let insert =
+                origin + text_index(ed.buffer.iter_at_mark(&ed.buffer.get_insert()).offset());
+            let (start, end) = file_span(ed).unwrap_or((insert, insert));
+            marks.push((start, end, red));
+        }
+        marks
+    }
+
+    fn assert_turns(
+        ed: &Editor,
+        text: &str,
+        needle: &str,
+        caret: usize,
+        dirs: &[bool],
+        expected: &[(usize, usize, bool)],
+    ) {
+        let gtk = gtk_turns(text, needle, caret, dirs);
+        assert_eq!(gtk, expected, "gtk needle {needle:?}");
+        let held = held_turns(ed, text, needle, caret, dirs);
+        assert_eq!(held, gtk, "needle {needle:?} caret {caret}");
+    }
+
     /// Find Next and Find Previous on a held document follow GTK.
     /// A fold at the end of the file, the second half of `ß` and `ﬀ`, a
     /// caret between a base and its combining mark, and U+FFFC.
@@ -3676,6 +3757,105 @@ next}";
             Some(&[(3, 4, false), (3, 4, false)]),
         );
 
+        // U+FFFC is in the line text and in the needle, and the iterator
+        // skips it while counting. The next piece starts at that iterator.
+        let object_line = with_hold("\u{FFFC}\nZ");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &object_line,
+                needle: "\nZ",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(0, 0, true), (0, 0, true)]),
+        );
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &object_line,
+                needle: "\u{FFFC}\nZ",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(0, 0, true), (0, 0, true)]),
+        );
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &object_line,
+                needle: "\nZ",
+                forward: true,
+                caret: 1,
+                steps: 2,
+            },
+            Some(&[(1, 3, false), (1, 3, true)]),
+        );
+
+        let crlf_object = with_hold("a\u{FFFC}\r\nbY");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &crlf_object,
+                needle: "a\u{FFFC}\r\nbY",
+                forward: true,
+                caret: 0,
+                steps: 1,
+            },
+            Some(&[(0, 0, true)]),
+        );
+        let between = with_hold("pre\u{FFFC}\npost");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &between,
+                needle: "pre\u{FFFC}\npost",
+                forward: true,
+                caret: 0,
+                steps: 1,
+            },
+            Some(&[(0, 0, true)]),
+        );
+        let middle = with_hold("a\nb\u{FFFC}\ncY");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &middle,
+                needle: "a\nb\u{FFFC}\ncY",
+                forward: true,
+                caret: 0,
+                steps: 1,
+            },
+            Some(&[(0, 0, true)]),
+        );
+
+        let repeated = with_hold("a\u{FFFC}\nbYa\u{FFFC}\nbY");
+        assert_turns(
+            &ed,
+            &repeated,
+            "a\u{FFFC}\nbY",
+            0,
+            &[true, true, false],
+            &[(0, 0, true), (0, 0, true), (5, 11, false)],
+        );
+
+        // A piece that starts on the object still matches. The skip lands
+        // one padding character past the visible word.
+        let inside = with_hold("a\n\u{FFFC}b");
+        assert_walk(
+            &ed,
+            &Walk {
+                text: &inside,
+                needle: "a\n\u{FFFC}b",
+                forward: true,
+                caret: 0,
+                steps: 2,
+            },
+            Some(&[(0, 5, false), (0, 5, false)]),
+        );
+
         drop(window);
     }
 
@@ -3754,6 +3934,58 @@ next}";
                             let preview: String = body.chars().take(48).collect();
                             failures.push(format!(
                                 "needle {needle:?} caret {caret} forward {forward} text {preview:?}\n  held {held:?}\n  gtk  {gtk:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let objects = [
+            "\u{FFFC}\nZ",
+            "\u{FFFC}\rZ",
+            "\u{FFFC}\r\nZ",
+            "\u{FFFC}\u{2029}Z",
+            "a\u{FFFC}\nbY",
+            "a\u{FFFC}\rbY",
+            "a\u{FFFC}\r\nbY",
+            "a\u{FFFC}\u{2029}bY",
+            "pre\u{FFFC}\npost",
+            "a\nb\u{FFFC}\ncY",
+            "a\u{FFFC}\nbYa\u{FFFC}\nbY",
+            "Z\n\u{FFFC}a",
+            "\n\u{FFFC}Z",
+            "a\u{FFFC}\u{FFFC}\nb",
+        ];
+        let sequences: [&[bool]; 2] = [&[true, true, true, true], &[true, true, false, false]];
+        for (case, body) in objects.iter().enumerate() {
+            let text = with_hold(body);
+            let chars: Vec<char> = body.chars().collect();
+            let break_at = chars
+                .iter()
+                .position(|c| matches!(c, '\n' | '\r' | '\u{2029}'))
+                .unwrap_or(0);
+            let object_at = chars.iter().position(|c| *c == '\u{FFFC}').unwrap_or(0);
+            let from_break: String = chars[break_at..].iter().collect();
+            let around: String = chars[object_at..].iter().take(6).collect();
+            let needles = [(*body).to_string(), from_break, around];
+            let carets = [0usize, object_at, break_at];
+            for needle in &needles {
+                if needle.is_empty() {
+                    continue;
+                }
+                for caret in carets {
+                    for dirs in sequences {
+                        let gtk = gtk_turns(&text, needle, caret, dirs);
+                        let held = held_turns(&ed, &text, needle, caret, dirs);
+                        comparisons += dirs.len();
+                        for (got, want) in held.iter().zip(gtk.iter()) {
+                            if got != want {
+                                misses += 1;
+                            }
+                        }
+                        if held != gtk && failures.len() < 12 {
+                            failures.push(format!(
+                                "object case {case} needle {needle:?} caret {caret}\n  held {held:?}\n  gtk  {gtk:?}"
                             ));
                         }
                     }
