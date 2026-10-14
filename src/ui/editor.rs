@@ -1162,61 +1162,52 @@ fn fold_gtk(text: &str) -> String {
     .to_string()
 }
 
-struct FoldMap {
-    chars: Vec<char>,
-    /// Folded character index of each original character, then one past the end.
-    at: Vec<usize>,
+/// Folded length of one original character. GTK maps a hit with these
+/// lengths, and searches the whole-string fold.
+fn fold_len(c: char) -> usize {
+    if c.is_ascii() {
+        return 1;
+    }
+    let mut buf = [0u8; 4];
+    fold_gtk(c.encode_utf8(&mut buf)).chars().count()
 }
 
-fn fold_map(hay: &str) -> FoldMap {
-    if hay.is_ascii() {
-        return FoldMap {
-            chars: hay.chars().map(|c| c.to_ascii_lowercase()).collect(),
-            at: (0..=hay.len()).collect(),
-        };
-    }
-    let mut at = Vec::new();
-    let mut folded_len = 0usize;
-    for c in hay.chars() {
-        at.push(folded_len);
-        let mut buf = [0u8; 4];
-        folded_len += fold_gtk(c.encode_utf8(&mut buf)).chars().count();
-    }
-    at.push(folded_len);
-    let whole = fold_gtk(hay);
-    let mut chars: Vec<char> = whole.chars().collect();
-    // NFD can reorder marks across a character boundary. The per-character
-    // lengths then no longer address the whole-string fold, so the search
-    // text becomes the concatenation those lengths describe.
-    if chars.len() != folded_len {
-        let mut built = String::new();
-        folded_len = 0;
-        at.clear();
-        for c in hay.chars() {
-            at.push(folded_len);
-            let mut buf = [0u8; 4];
-            let piece = fold_gtk(c.encode_utf8(&mut buf));
-            folded_len += piece.chars().count();
-            built.push_str(&piece);
-        }
-        at.push(folded_len);
-        chars = built.chars().collect();
-    }
-    FoldMap { chars, at }
-}
-
-fn original_start(map: &FoldMap, folded_index: usize) -> usize {
-    map.at.partition_point(|&index| index < folded_index)
-}
-
-fn original_end(map: &FoldMap, start: usize, folded_len: usize) -> usize {
-    let mut index = start;
-    let mut left = folded_len;
-    let last = map.at.len() - 1;
-    while left > 0 && index < last {
-        let take = map.at[index + 1] - map.at[index];
+/// `pointer_from_offset_skipping_decomp`. A folded index inside a character
+/// lands on the following character.
+fn pointer_offset(lens: &[usize], folded_index: usize) -> usize {
+    let mut offset = isize::try_from(folded_index).expect("a folded index fits in isize");
+    let mut index = 0usize;
+    while offset > 0 && index < lens.len() {
+        let take = isize::try_from(lens[index]).expect("a fold length fits in isize");
+        offset -= take;
         index += 1;
-        left = left.saturating_sub(take);
+    }
+    index
+}
+
+/// `forward_chars_with_skipping`. Text-only search skips U+FFFC. With
+/// decomposition, one original character consumes its whole fold.
+fn walk_chars(
+    chars: &[char],
+    lens: &[usize],
+    start: usize,
+    count: usize,
+    skip_decomp: bool,
+) -> usize {
+    let mut left = isize::try_from(count).expect("a match length fits in isize");
+    let mut index = start;
+    while left > 0 && index < chars.len() {
+        if chars[index] == '\u{FFFC}' {
+            index += 1;
+            continue;
+        }
+        if skip_decomp {
+            let take = isize::try_from(lens[index]).expect("a fold length fits in isize");
+            left -= take;
+        } else {
+            left -= 1;
+        }
+        index += 1;
     }
     index
 }
@@ -1259,30 +1250,100 @@ fn folded_hits(text: &[char], needle: &[char]) -> Vec<usize> {
     hits
 }
 
-/// Character offsets of `needle` in `hay`. A forward scan includes a match
-/// that starts at `from_char`. A backward scan includes a match that ends
-/// there. The offsets are original characters, after case folding.
+fn line_end(chars: &[char], index: usize) -> usize {
+    match chars[index..].iter().position(|c| *c == '\n') {
+        Some(at) => index + at + 1,
+        None => chars.len(),
+    }
+}
+
+fn line_start(chars: &[char], index: usize) -> usize {
+    chars[..index]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map(|at| at + 1)
+        .unwrap_or(0)
+}
+
+/// The line GTK searches next when going backward. The text ends at `end`.
+/// A caret already at the start of a line takes the previous line.
+fn backward_line(chars: &[char], end: usize) -> Option<(usize, usize)> {
+    if end == 0 {
+        return None;
+    }
+    let start = line_start(chars, end);
+    if start < end {
+        return Some((start, end));
+    }
+    Some((line_start(chars, end - 1), end))
+}
+
+fn match_line(
+    chars: &[char],
+    lens: &[usize],
+    start: usize,
+    end: usize,
+    needle: &[char],
+    forward: bool,
+) -> Option<(usize, usize)> {
+    if start >= end || needle.is_empty() {
+        return None;
+    }
+    let region_str: String = chars[start..end].iter().collect();
+    let folded: Vec<char> = fold_gtk(&region_str).chars().collect();
+    let hits = folded_hits(&folded, needle);
+    let folded_at = if forward {
+        hits.first().copied()?
+    } else {
+        hits.last().copied()?
+    };
+    let offset = pointer_offset(&lens[start..end], folded_at);
+    let match_start = walk_chars(chars, lens, start, offset, false);
+    let match_end = walk_chars(chars, lens, match_start, needle.len(), true);
+    Some((match_start, match_end))
+}
+
+/// Character offsets of `needle` in `hay`, in original characters.
+///
+/// GTK searches one line at a time. Forward search starts at `from_char`.
+/// Backward search stops at `from_char`. The second half of a fold that
+/// sits before that point is not part of the line, so it is not a new hit.
 fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
     }
-    let map = fold_map(hay);
     let needle_chars: Vec<char> = fold_gtk(needle).chars().collect();
-    let span = |folded_at: usize| {
-        let start = original_start(&map, folded_at);
-        let end = original_end(&map, start, needle_chars.len());
-        (start, end)
-    };
-    let hits = folded_hits(&map.chars, &needle_chars);
-    if forward {
-        return hits
-            .into_iter()
-            .map(span)
-            .find(|(start, _)| *start >= from_char);
+    if needle_chars.is_empty() {
+        return None;
     }
-    hits.into_iter()
-        .map(span)
-        .rfind(|(_, end)| *end <= from_char)
+    let chars: Vec<char> = hay.chars().collect();
+    let lens: Vec<usize> = chars.iter().copied().map(fold_len).collect();
+    let from = from_char.min(chars.len());
+    if forward {
+        let mut origin = from;
+        while origin < chars.len() {
+            let end = line_end(&chars, origin);
+            if let Some(span) = match_line(&chars, &lens, origin, end, &needle_chars, true) {
+                return Some(span);
+            }
+            if end == origin {
+                break;
+            }
+            origin = end;
+        }
+        return None;
+    }
+    let mut limit = from;
+    while let Some((start, end)) = backward_line(&chars, limit) {
+        if let Some(span) = match_line(&chars, &lens, start, end, &needle_chars, false) {
+            return Some(span);
+        }
+        if start == 0 {
+            break;
+        }
+        limit = start;
+    }
+    None
 }
 
 fn text_index(offset: i32) -> usize {
@@ -1318,25 +1379,8 @@ fn scan_from(
 }
 
 fn match_end(hay: &str, at: usize, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    let map = fold_map(hay);
-    let needle_chars: Vec<char> = fold_gtk(needle).chars().collect();
-    let folded_at = *map.at.get(at)?;
-    let followed_by_mark = map
-        .chars
-        .get(folded_at + needle_chars.len())
-        .is_some_and(|next| next.is_mark());
-    if followed_by_mark
-        || map.chars.get(folded_at..folded_at + needle_chars.len()) != Some(needle_chars.as_slice())
-    {
-        return None;
-    }
-    if original_start(&map, folded_at) != at {
-        return None;
-    }
-    Some(original_end(&map, at, needle_chars.len()))
+    let (start, end) = find_ci(hay, needle, true, at)?;
+    (start == at).then_some(end)
 }
 
 fn text_offset(n: usize) -> i32 {
