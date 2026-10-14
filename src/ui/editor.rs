@@ -4,6 +4,7 @@
 
 use super::rich;
 use gtk::glib;
+use gtk::glib::Unichar;
 use gtk::prelude::*;
 use omaquill::rtf::{Align, RichText};
 use std::cell::{Cell, RefCell};
@@ -1147,54 +1148,141 @@ fn bar_chars(value: f64) -> usize {
     value as usize
 }
 
-fn eq_ci(a: char, b: char) -> bool {
-    if a == b || a.eq_ignore_ascii_case(&b) {
-        return true;
+/// GTK case-insensitive search. `g_utf8_casefold`, then NFD.
+/// ASCII stays on the lowercase letters so a long plain line does not
+/// call into GLib once per character.
+fn fold_gtk(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
     }
-    let mut ac = a.to_lowercase();
-    let mut bc = b.to_lowercase();
-    loop {
-        match (ac.next(), bc.next()) {
-            (None, None) => return true,
-            (Some(x), Some(y)) if x == y => {}
-            _ => return false,
-        }
-    }
+    gtk::glib::normalize(
+        gtk::glib::casefold(text).as_str(),
+        gtk::glib::NormalizeMode::Default,
+    )
+    .to_string()
 }
 
-/// Character offsets of `needle` in `hay`. `from_char` is where the scan
-/// starts. A forward scan begins there. A backward scan begins on the
-/// character before it.
-fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(usize, usize)> {
-    let hay: Vec<char> = hay.chars().collect();
-    let needle: Vec<char> = needle.chars().collect();
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
+struct FoldMap {
+    chars: Vec<char>,
+    /// Folded character index of each original character, then one past the end.
+    at: Vec<usize>,
+}
+
+fn fold_map(hay: &str) -> FoldMap {
+    if hay.is_ascii() {
+        return FoldMap {
+            chars: hay.chars().map(|c| c.to_ascii_lowercase()).collect(),
+            at: (0..=hay.len()).collect(),
+        };
     }
-    let last = hay.len() - needle.len();
-    let matches = |i: usize| {
-        hay[i..i + needle.len()]
-            .iter()
-            .zip(needle.iter())
-            .all(|(a, b)| eq_ci(*a, *b))
-    };
-    if forward {
-        let start = from_char.min(hay.len());
-        if start > last {
-            return None;
+    let mut at = Vec::new();
+    let mut folded_len = 0usize;
+    for c in hay.chars() {
+        at.push(folded_len);
+        let mut buf = [0u8; 4];
+        folded_len += fold_gtk(c.encode_utf8(&mut buf)).chars().count();
+    }
+    at.push(folded_len);
+    let whole = fold_gtk(hay);
+    let mut chars: Vec<char> = whole.chars().collect();
+    // NFD can reorder marks across a character boundary. The per-character
+    // lengths then no longer address the whole-string fold, so the search
+    // text becomes the concatenation those lengths describe.
+    if chars.len() != folded_len {
+        let mut built = String::new();
+        folded_len = 0;
+        at.clear();
+        for c in hay.chars() {
+            at.push(folded_len);
+            let mut buf = [0u8; 4];
+            let piece = fold_gtk(c.encode_utf8(&mut buf));
+            folded_len += piece.chars().count();
+            built.push_str(&piece);
         }
-        return (start..=last)
-            .find(|&i| matches(i))
-            .map(|i| (i, i + needle.len()));
+        at.push(folded_len);
+        chars = built.chars().collect();
     }
-    if from_char == 0 {
+    FoldMap { chars, at }
+}
+
+fn original_start(map: &FoldMap, folded_index: usize) -> usize {
+    map.at.partition_point(|&index| index < folded_index)
+}
+
+fn original_end(map: &FoldMap, start: usize, folded_len: usize) -> usize {
+    let mut index = start;
+    let mut left = folded_len;
+    let last = map.at.len() - 1;
+    while left > 0 && index < last {
+        let take = map.at[index + 1] - map.at[index];
+        index += 1;
+        left = left.saturating_sub(take);
+    }
+    index
+}
+
+fn folded_hits(text: &[char], needle: &[char]) -> Vec<usize> {
+    if needle.is_empty() || text.len() < needle.len() {
+        return Vec::new();
+    }
+    let mut fail = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for i in 1..needle.len() {
+        while matched > 0 && needle[i] != needle[matched] {
+            matched = fail[matched - 1];
+        }
+        if needle[i] == needle[matched] {
+            matched += 1;
+            fail[i] = matched;
+        }
+    }
+    let mut hits = Vec::new();
+    matched = 0;
+    for (i, &ch) in text.iter().enumerate() {
+        while matched > 0 && ch != needle[matched] {
+            matched = fail[matched - 1];
+        }
+        if ch == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            let start = i + 1 - needle.len();
+            let followed_by_mark = text
+                .get(start + needle.len())
+                .is_some_and(|next| next.is_mark());
+            if !followed_by_mark {
+                hits.push(start);
+            }
+            matched = fail[matched - 1];
+        }
+    }
+    hits
+}
+
+/// Character offsets of `needle` in `hay`. A forward scan includes a match
+/// that starts at `from_char`. A backward scan includes a match that ends
+/// there. The offsets are original characters, after case folding.
+fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() {
         return None;
     }
-    let start = from_char.saturating_sub(1).min(last);
-    (0..=start)
-        .rev()
-        .find(|&i| matches(i))
-        .map(|i| (i, i + needle.len()))
+    let map = fold_map(hay);
+    let needle_chars: Vec<char> = fold_gtk(needle).chars().collect();
+    let span = |folded_at: usize| {
+        let start = original_start(&map, folded_at);
+        let end = original_end(&map, start, needle_chars.len());
+        (start, end)
+    };
+    let hits = folded_hits(&map.chars, &needle_chars);
+    if forward {
+        return hits
+            .into_iter()
+            .map(span)
+            .find(|(start, _)| *start >= from_char);
+    }
+    hits.into_iter()
+        .map(span)
+        .rfind(|(_, end)| *end <= from_char)
 }
 
 fn text_index(offset: i32) -> usize {
@@ -1213,10 +1301,7 @@ fn scan_from(
     let model_start = origin + start_off;
     let model_end = origin + end_off;
     if !forward {
-        let needle_len = needle.chars().count();
-        // find_ci starts one character before from_char. This index is the
-        // first one where a match can still end on the caret.
-        return model_start.saturating_sub(needle_len.saturating_sub(1));
+        return model_start;
     }
     if start_off == end_off {
         return model_start;
@@ -1236,16 +1321,22 @@ fn match_end(hay: &str, at: usize, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    let mut rest = hay.chars().skip(at);
-    let mut matched = 0usize;
-    for n in needle.chars() {
-        let c = rest.next()?;
-        if !eq_ci(c, n) {
-            return None;
-        }
-        matched += 1;
+    let map = fold_map(hay);
+    let needle_chars: Vec<char> = fold_gtk(needle).chars().collect();
+    let folded_at = *map.at.get(at)?;
+    let followed_by_mark = map
+        .chars
+        .get(folded_at + needle_chars.len())
+        .is_some_and(|next| next.is_mark());
+    if followed_by_mark
+        || map.chars.get(folded_at..folded_at + needle_chars.len()) != Some(needle_chars.as_slice())
+    {
+        return None;
     }
-    Some(at + matched)
+    if original_start(&map, folded_at) != at {
+        return None;
+    }
+    Some(original_end(&map, at, needle_chars.len()))
 }
 
 fn text_offset(n: usize) -> i32 {
@@ -2991,13 +3082,7 @@ next}";
                 (0, 6)
             };
             type_query(&held, needle);
-            expect_hit(
-                &mut failures,
-                &format!("held {needle}"),
-                &held,
-                start,
-                end,
-            );
+            expect_hit(&mut failures, &format!("held {needle}"), &held, start, end);
             type_query(&plain, needle);
             expect_hit(
                 &mut failures,
@@ -3020,37 +3105,13 @@ next}";
         )));
         plain_cafe.load(RichText::from_plain(cafe));
         type_query(&held_cafe, decomposed);
-        expect_hit(
-            &mut failures,
-            "held composed cafe",
-            &held_cafe,
-            0,
-            4,
-        );
+        expect_hit(&mut failures, "held composed cafe", &held_cafe, 0, 4);
         type_query(&plain_cafe, decomposed);
-        expect_hit(
-            &mut failures,
-            "plain composed cafe",
-            &plain_cafe,
-            0,
-            4,
-        );
+        expect_hit(&mut failures, "plain composed cafe", &plain_cafe, 0, 4);
         type_query(&held_cafe, "CAF\u{00c9}");
-        expect_hit(
-            &mut failures,
-            "held composed needle",
-            &held_cafe,
-            0,
-            4,
-        );
+        expect_hit(&mut failures, "held composed needle", &held_cafe, 0, 4);
         type_query(&plain_cafe, "CAF\u{00c9}");
-        expect_hit(
-            &mut failures,
-            "plain composed needle",
-            &plain_cafe,
-            0,
-            4,
-        );
+        expect_hit(&mut failures, "plain composed needle", &plain_cafe, 0, 4);
 
         let parts = "cafe\u{0301} x";
         assert_eq!("cafe\u{0301}".chars().count(), 5);
@@ -3062,37 +3123,13 @@ next}";
         )));
         plain_parts.load(RichText::from_plain(parts));
         type_query(&held_parts, "CAF\u{00c9}");
-        expect_hit(
-            &mut failures,
-            "held decomposed cafe",
-            &held_parts,
-            0,
-            5,
-        );
+        expect_hit(&mut failures, "held decomposed cafe", &held_parts, 0, 5);
         type_query(&plain_parts, "CAF\u{00c9}");
-        expect_hit(
-            &mut failures,
-            "plain decomposed cafe",
-            &plain_parts,
-            0,
-            5,
-        );
+        expect_hit(&mut failures, "plain decomposed cafe", &plain_parts, 0, 5);
         type_query(&held_parts, decomposed);
-        expect_hit(
-            &mut failures,
-            "held decomposed needle",
-            &held_parts,
-            0,
-            5,
-        );
+        expect_hit(&mut failures, "held decomposed needle", &held_parts, 0, 5);
         type_query(&plain_parts, decomposed);
-        expect_hit(
-            &mut failures,
-            "plain decomposed needle",
-            &plain_parts,
-            0,
-            5,
-        );
+        expect_hit(&mut failures, "plain decomposed needle", &plain_parts, 0, 5);
 
         let word = "Stra\u{00df}e";
         let at = HELD_WINDOW - 2;
@@ -3102,7 +3139,10 @@ next}";
         assert_eq!((at, fold_end), (198, 204));
         let (edge, edge_window) = presented_editor();
         let (plain_edge, plain_edge_window) = presented_editor();
-        edge.load(RichText::from_plain(&format!("{body}{}", "q".repeat(10_000))));
+        edge.load(RichText::from_plain(&format!(
+            "{body}{}",
+            "q".repeat(10_000)
+        )));
         plain_edge.load(RichText::from_plain(&body));
         type_query(&edge, "STRASSE");
         expect_hit(
