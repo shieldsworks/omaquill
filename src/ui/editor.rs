@@ -2970,6 +2970,215 @@ next}";
         }
     }
 
+    /// Case folding follows GTK. `ß` matches `ss`, and a composed accent
+    /// matches its decomposed form. The span is in original characters.
+    pub(crate) fn held_find_folds_like_plain_find() {
+        let mut failures = Vec::new();
+        let street = "Stra\u{00df}e x";
+        assert_eq!(street.chars().count(), 8);
+        let (held, held_window) = presented_editor();
+        let (plain, plain_window) = presented_editor();
+        held.load(RichText::from_plain(&format!(
+            "{street}{}",
+            "q".repeat(10_000)
+        )));
+        plain.load(RichText::from_plain(street));
+        assert!(held.held_bar.is_visible());
+        for needle in ["STRASSE", "strasse", "SS", "ss"] {
+            let (start, end) = if needle.chars().count() == 2 {
+                (4, 5)
+            } else {
+                (0, 6)
+            };
+            type_query(&held, needle);
+            expect_hit(
+                &mut failures,
+                &format!("held {needle}"),
+                &held,
+                start,
+                end,
+            );
+            type_query(&plain, needle);
+            expect_hit(
+                &mut failures,
+                &format!("plain {needle}"),
+                &plain,
+                start,
+                end,
+            );
+        }
+
+        let cafe = "caf\u{00e9} x";
+        let decomposed = "CAFE\u{0301}";
+        assert_eq!("caf\u{00e9}".chars().count(), 4);
+        assert_eq!(decomposed.chars().count(), 5);
+        let (held_cafe, held_cafe_window) = presented_editor();
+        let (plain_cafe, plain_cafe_window) = presented_editor();
+        held_cafe.load(RichText::from_plain(&format!(
+            "{cafe}{}",
+            "q".repeat(10_000)
+        )));
+        plain_cafe.load(RichText::from_plain(cafe));
+        type_query(&held_cafe, decomposed);
+        expect_hit(
+            &mut failures,
+            "held composed cafe",
+            &held_cafe,
+            0,
+            4,
+        );
+        type_query(&plain_cafe, decomposed);
+        expect_hit(
+            &mut failures,
+            "plain composed cafe",
+            &plain_cafe,
+            0,
+            4,
+        );
+        type_query(&held_cafe, "CAF\u{00c9}");
+        expect_hit(
+            &mut failures,
+            "held composed needle",
+            &held_cafe,
+            0,
+            4,
+        );
+        type_query(&plain_cafe, "CAF\u{00c9}");
+        expect_hit(
+            &mut failures,
+            "plain composed needle",
+            &plain_cafe,
+            0,
+            4,
+        );
+
+        let parts = "cafe\u{0301} x";
+        assert_eq!("cafe\u{0301}".chars().count(), 5);
+        let (held_parts, held_parts_window) = presented_editor();
+        let (plain_parts, plain_parts_window) = presented_editor();
+        held_parts.load(RichText::from_plain(&format!(
+            "{parts}{}",
+            "q".repeat(10_000)
+        )));
+        plain_parts.load(RichText::from_plain(parts));
+        type_query(&held_parts, "CAF\u{00c9}");
+        expect_hit(
+            &mut failures,
+            "held decomposed cafe",
+            &held_parts,
+            0,
+            5,
+        );
+        type_query(&plain_parts, "CAF\u{00c9}");
+        expect_hit(
+            &mut failures,
+            "plain decomposed cafe",
+            &plain_parts,
+            0,
+            5,
+        );
+        type_query(&held_parts, decomposed);
+        expect_hit(
+            &mut failures,
+            "held decomposed needle",
+            &held_parts,
+            0,
+            5,
+        );
+        type_query(&plain_parts, decomposed);
+        expect_hit(
+            &mut failures,
+            "plain decomposed needle",
+            &plain_parts,
+            0,
+            5,
+        );
+
+        let word = "Stra\u{00df}e";
+        let at = HELD_WINDOW - 2;
+        let mut body = "a".repeat(at);
+        body.push_str(word);
+        let fold_end = at + word.chars().count();
+        assert_eq!((at, fold_end), (198, 204));
+        let (edge, edge_window) = presented_editor();
+        let (plain_edge, plain_edge_window) = presented_editor();
+        edge.load(RichText::from_plain(&format!("{body}{}", "q".repeat(10_000))));
+        plain_edge.load(RichText::from_plain(&body));
+        type_query(&edge, "STRASSE");
+        expect_hit(
+            &mut failures,
+            "held folded match across the window edge",
+            &edge,
+            at,
+            fold_end,
+        );
+        type_query(&plain_edge, "STRASSE");
+        expect_hit(
+            &mut failures,
+            "plain folded match across the window edge",
+            &plain_edge,
+            at,
+            fold_end,
+        );
+
+        let pair = "Stra\u{00df}e Stra\u{00df}e";
+        assert_eq!(pair.chars().count(), 13);
+        let (back, back_window) = presented_editor();
+        let (plain_back, plain_back_window) = presented_editor();
+        back.load(RichText::from_plain(&format!(
+            "{pair}{}",
+            "q".repeat(10_000)
+        )));
+        plain_back.load(RichText::from_plain(pair));
+        back.search_entry.set_search_delay(60_000);
+        plain_back.search_entry.set_search_delay(60_000);
+        back.search_entry.set_text("STRASSE");
+        plain_back.search_entry.set_text("STRASSE");
+        let caret = back.buffer.iter_at_offset(text_offset(13));
+        back.buffer.place_cursor(&caret);
+        let caret = plain_back.buffer.iter_at_offset(text_offset(13));
+        plain_back.buffer.place_cursor(&caret);
+        for (n, (start, end)) in [(7usize, 13usize), (0, 6), (7, 13), (0, 6)]
+            .into_iter()
+            .enumerate()
+        {
+            back.find(false);
+            expect_hit(
+                &mut failures,
+                &format!("held fold previous {n}"),
+                &back,
+                start,
+                end,
+            );
+            plain_back.find(false);
+            expect_hit(
+                &mut failures,
+                &format!("plain fold previous {n}"),
+                &plain_back,
+                start,
+                end,
+            );
+        }
+
+        for window in [
+            held_window,
+            plain_window,
+            held_cafe_window,
+            plain_cafe_window,
+            held_parts_window,
+            plain_parts_window,
+            edge_window,
+            plain_edge_window,
+            back_window,
+            plain_back_window,
+        ] {
+            window.close();
+        }
+        if !failures.is_empty() {
+            panic!("{}", failures.join("\n"));
+        }
+    }
+
     /// The context menu's Select All is the `selection.select-all` action.
     /// Copy after it takes the held file, as the keyboard shortcut does.
     pub(crate) fn held_menu_select_all_copies_the_document() {
