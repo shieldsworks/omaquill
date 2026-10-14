@@ -2452,8 +2452,8 @@ next}";
             "the wrap dropped the match: {selected}"
         );
         assert!(
-            ed.search_entry.has_css_class("error"),
-            "the only long match wrapped onto itself with no mark on the search entry"
+            !ed.search_entry.has_css_class("error"),
+            "a wrap that still finds the only long match painted the search entry red"
         );
         ed.load(RichText::from_plain("one unique word"));
         assert!(!ed.held_bar.is_visible());
@@ -2466,8 +2466,14 @@ next}";
             .expect("Find Next cleared the only word");
         assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "unique");
         assert!(
+            !ed.search_entry.has_css_class("error"),
+            "Find Next on the only word painted the search entry red"
+        );
+        ed.search_entry.set_text("missing");
+        ed.find(true);
+        assert!(
             ed.search_entry.has_css_class("error"),
-            "Find Next on the only word wrapped with no mark on the search entry"
+            "a query with no match left the search entry unmarked"
         );
         window.close();
     }
@@ -2571,6 +2577,423 @@ next}";
         let (start, end) = ed.buffer.selection_bounds().expect("find missed the tail");
         assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "TAIL");
         assert!(ed.plain_text().ends_with("TAIL"));
+        window.close();
+    }
+
+    fn presented_editor() -> (Rc<Editor>, gtk::Window) {
+        let ed = Editor::new(true);
+        let window = gtk::Window::new();
+        window.set_default_size(800, 600);
+        window.set_child(Some(&ed.root));
+        show_window(&window);
+        (ed, window)
+    }
+
+    fn file_span(ed: &Editor) -> Option<(usize, usize)> {
+        let (s, e) = ed.buffer.selection_bounds()?;
+        let origin = if ed.held_bar.is_visible() {
+            ed.held_origin.get()
+        } else {
+            0
+        };
+        Some((
+            origin + text_index(s.offset()),
+            origin + text_index(e.offset()),
+        ))
+    }
+
+    /// `search-changed` calls [`Editor::find_from_start`]. GTK delays that
+    /// signal, so the test holds the delay off and calls the handler itself.
+    fn type_query(ed: &Editor, query: &str) {
+        ed.search_entry.set_search_delay(60_000);
+        ed.search_entry.set_text(query);
+        ed.find_from_start();
+    }
+
+    fn expect_hit(failures: &mut Vec<String>, label: &str, ed: &Editor, start: usize, end: usize) {
+        let span = file_span(ed);
+        let red = ed.search_entry.has_css_class("error");
+        if span != Some((start, end)) || red {
+            let insert = text_index(ed.buffer.iter_at_mark(&ed.buffer.get_insert()).offset());
+            failures.push(format!(
+                "{label}: span {span:?} red={red} origin={} insert={insert} entry={:?}, expected ({start}, {end}) and no red mark",
+                ed.held_origin.get(),
+                ed.search_entry.text()
+            ));
+        }
+    }
+
+    /// Held Find follows plain Find. Typing and the first Find include the
+    /// match at the caret. Find Next steps past a selected match. A wrap
+    /// that still finds a match is not red.
+    pub(crate) fn held_find_matches_plain_find() {
+        let mut failures = Vec::new();
+        let prefix = "xx WORD yy WORD zz ";
+        let (held, held_window) = presented_editor();
+        let (plain, plain_window) = presented_editor();
+        held.load(RichText::from_plain(&format!(
+            "{prefix}{}",
+            "q".repeat(10_000)
+        )));
+        plain.load(RichText::from_plain(prefix));
+        assert!(held.held_bar.is_visible());
+        assert!(!plain.held_bar.is_visible());
+        for (query, end) in [("W", 4usize), ("WO", 5), ("WOR", 6), ("WORD", 7)] {
+            type_query(&held, query);
+            expect_hit(&mut failures, &format!("held type {query}"), &held, 3, end);
+            type_query(&plain, query);
+            expect_hit(
+                &mut failures,
+                &format!("plain type {query}"),
+                &plain,
+                3,
+                end,
+            );
+        }
+
+        let (wordword, wordword_window) = presented_editor();
+        let (plain_word, plain_word_window) = presented_editor();
+        wordword.load(RichText::from_plain(&format!(
+            "WORDWORD{}",
+            "q".repeat(10_000)
+        )));
+        plain_word.load(RichText::from_plain("WORDWORD"));
+        type_query(&wordword, "WORD");
+        expect_hit(&mut failures, "held WORDWORD", &wordword, 0, 4);
+        type_query(&plain_word, "WORD");
+        expect_hit(&mut failures, "plain WORDWORD", &plain_word, 0, 4);
+
+        let (only, only_window) = presented_editor();
+        let (plain_only, plain_only_window) = presented_editor();
+        only.load(RichText::from_plain(&format!("WORD{}", "q".repeat(10_000))));
+        plain_only.load(RichText::from_plain("WORD"));
+        type_query(&only, "WORD");
+        expect_hit(&mut failures, "held only match at 0", &only, 0, 4);
+        type_query(&plain_only, "WORD");
+        expect_hit(&mut failures, "plain only match at 0", &plain_only, 0, 4);
+        only.find(true);
+        expect_hit(&mut failures, "held wrap onto the only match", &only, 0, 4);
+        plain_only.find(true);
+        expect_hit(
+            &mut failures,
+            "plain wrap onto the only match",
+            &plain_only,
+            0,
+            4,
+        );
+
+        let mut body = "a".repeat(HELD_WINDOW - 2);
+        body.push_str("EDXY");
+        body.push_str(&"b".repeat(400));
+        body.push_str("EDXY");
+        let second = (HELD_WINDOW - 2) + 4 + 400;
+        assert_eq!(second, 602);
+        let (edge, edge_window) = presented_editor();
+        let (plain_edge, plain_edge_window) = presented_editor();
+        edge.load(RichText::from_plain(&format!(
+            "{body}{}",
+            "c".repeat(10_000)
+        )));
+        plain_edge.load(RichText::from_plain(&body));
+        edge.held_bar
+            .adjustment()
+            .set_value((HELD_WINDOW - 2) as f64);
+        assert_eq!(edge.held_origin.get(), HELD_WINDOW - 2);
+        let at = plain_edge
+            .buffer
+            .iter_at_offset(text_offset(HELD_WINDOW - 2));
+        plain_edge.buffer.place_cursor(&at);
+        type_query(&edge, "EDXY");
+        expect_hit(
+            &mut failures,
+            "held EDXY already at the window start",
+            &edge,
+            HELD_WINDOW - 2,
+            HELD_WINDOW - 2 + 4,
+        );
+        if edge.held_origin.get() != HELD_WINDOW - 2 {
+            failures.push(format!(
+                "held Find left the EDXY window at {}, the later match is at {second}",
+                edge.held_origin.get()
+            ));
+        }
+        type_query(&plain_edge, "EDXY");
+        expect_hit(
+            &mut failures,
+            "plain EDXY at the caret",
+            &plain_edge,
+            HELD_WINDOW - 2,
+            HELD_WINDOW - 2 + 4,
+        );
+
+        let (enter, enter_window) = presented_editor();
+        let (plain_enter, plain_enter_window) = presented_editor();
+        enter.load(RichText::from_plain(&format!(
+            "{prefix}{}",
+            "q".repeat(10_000)
+        )));
+        plain_enter.load(RichText::from_plain(prefix));
+        enter.search_entry.set_search_delay(60_000);
+        plain_enter.search_entry.set_search_delay(60_000);
+        enter.search_entry.set_text("WORD");
+        plain_enter.search_entry.set_text("WORD");
+        let at = enter.buffer.iter_at_offset(3);
+        enter.buffer.place_cursor(&at);
+        let at = plain_enter.buffer.iter_at_offset(3);
+        plain_enter.buffer.place_cursor(&at);
+        enter.search_entry.emit_activate();
+        expect_hit(&mut failures, "held Enter on the caret", &enter, 3, 7);
+        plain_enter.search_entry.emit_activate();
+        expect_hit(
+            &mut failures,
+            "plain Enter on the caret",
+            &plain_enter,
+            3,
+            7,
+        );
+
+        let (ctrl_f, ctrl_f_window) = presented_editor();
+        let (plain_ctrl, plain_ctrl_window) = presented_editor();
+        ctrl_f.load(RichText::from_plain(&format!(
+            "{prefix}{}",
+            "q".repeat(10_000)
+        )));
+        plain_ctrl.load(RichText::from_plain(prefix));
+        ctrl_f.search_entry.set_search_delay(60_000);
+        plain_ctrl.search_entry.set_search_delay(60_000);
+        ctrl_f.search_entry.set_text("");
+        plain_ctrl.search_entry.set_text("");
+        let s = ctrl_f.buffer.iter_at_offset(3);
+        let e = ctrl_f.buffer.iter_at_offset(7);
+        ctrl_f.buffer.select_range(&s, &e);
+        ctrl_f.show_find();
+        ctrl_f.find_from_start();
+        expect_hit(&mut failures, "held Ctrl+F on a selection", &ctrl_f, 3, 7);
+        let s = plain_ctrl.buffer.iter_at_offset(3);
+        let e = plain_ctrl.buffer.iter_at_offset(7);
+        plain_ctrl.buffer.select_range(&s, &e);
+        plain_ctrl.show_find();
+        plain_ctrl.find_from_start();
+        expect_hit(
+            &mut failures,
+            "plain Ctrl+F on a selection",
+            &plain_ctrl,
+            3,
+            7,
+        );
+
+        let (back, back_window) = presented_editor();
+        let (plain_back, plain_back_window) = presented_editor();
+        back.load(RichText::from_plain(&format!(
+            "aaaaaa{}",
+            "q".repeat(10_000)
+        )));
+        plain_back.load(RichText::from_plain("aaaaaa"));
+        back.search_entry.set_search_delay(60_000);
+        plain_back.search_entry.set_search_delay(60_000);
+        back.search_entry.set_text("aa");
+        plain_back.search_entry.set_text("aa");
+        let at = back.buffer.iter_at_offset(2);
+        back.buffer.place_cursor(&at);
+        let at = plain_back.buffer.iter_at_offset(2);
+        plain_back.buffer.place_cursor(&at);
+        for (n, (start, end)) in [(0usize, 2usize), (4, 6), (2, 4), (0, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            back.find(false);
+            expect_hit(
+                &mut failures,
+                &format!("held aa previous {n}"),
+                &back,
+                start,
+                end,
+            );
+            plain_back.find(false);
+            expect_hit(
+                &mut failures,
+                &format!("plain aa previous {n}"),
+                &plain_back,
+                start,
+                end,
+            );
+        }
+
+        let needle = "N".repeat(250);
+        let (run, run_window) = presented_editor();
+        let (plain_run, plain_run_window) = presented_editor();
+        run.load(RichText::from_plain(&"N".repeat(10_000)));
+        plain_run.load(RichText::from_plain(&"N".repeat(1_000)));
+        run.search_entry.set_search_delay(60_000);
+        plain_run.search_entry.set_search_delay(60_000);
+        run.search_entry.set_text(&needle);
+        plain_run.search_entry.set_text(&needle);
+        plain_run.find(true);
+        let plain_first = file_span(&plain_run);
+        if plain_first != Some((0, 250)) {
+            failures.push(format!("plain 250-N first hit: span {plain_first:?}"));
+        }
+        run.find(true);
+        if run.held_origin.get() != 0 || run.search_entry.has_css_class("error") {
+            failures.push(format!(
+                "held 250-N first hit: origin {} red={}",
+                run.held_origin.get(),
+                run.search_entry.has_css_class("error")
+            ));
+        }
+        run.find(true);
+        if run.held_origin.get() != 250 || run.search_entry.has_css_class("error") {
+            failures.push(format!(
+                "held 250-N next: origin {} red={}",
+                run.held_origin.get(),
+                run.search_entry.has_css_class("error")
+            ));
+        }
+        run.find(false);
+        if run.held_origin.get() != 0 || run.search_entry.has_css_class("error") {
+            failures.push(format!(
+                "held 250-N previous: origin {} red={} (a one-character step stays inside the run)",
+                run.held_origin.get(),
+                run.search_entry.has_css_class("error")
+            ));
+        }
+        plain_run.find(false);
+        if file_span(&plain_run).is_none() {
+            failures.push("plain 250-N previous cleared the selection".into());
+        }
+
+        for window in [
+            held_window,
+            plain_window,
+            wordword_window,
+            plain_word_window,
+            only_window,
+            plain_only_window,
+            edge_window,
+            plain_edge_window,
+            enter_window,
+            plain_enter_window,
+            ctrl_f_window,
+            plain_ctrl_window,
+            back_window,
+            plain_back_window,
+            run_window,
+            plain_run_window,
+        ] {
+            window.close();
+        }
+        if !failures.is_empty() {
+            panic!("{}", failures.join("\n"));
+        }
+    }
+
+    /// The context menu's Select All is the `selection.select-all` action.
+    /// Copy after it takes the held file, as the keyboard shortcut does.
+    pub(crate) fn held_menu_select_all_copies_the_document() {
+        let (ed, window) = presented_editor();
+        let body = format!("Hello {}", "a".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        ed.view.grab_focus();
+        ed.view
+            .activate_action("selection.select-all", None)
+            .expect("the text view menu Select All action");
+        ed.view.emit_copy_clipboard();
+        let copied = clipboard_text(&ed.view);
+        assert_eq!(
+            copied.chars().count(),
+            body.chars().count(),
+            "menu Select All copied {} characters of the window",
+            copied.chars().count()
+        );
+        assert_eq!(copied, body);
+        let (start, end) = ed.buffer.bounds();
+        ed.buffer.select_range(&start, &end);
+        ed.view.emit_copy_clipboard();
+        assert_eq!(
+            clipboard_text(&ed.view).chars().count(),
+            HELD_WINDOW,
+            "a hand selection after menu Select All copied the file"
+        );
+        window.close();
+    }
+
+    /// Cut on a held document copies what Copy would copy and leaves the
+    /// window and the file text in place.
+    pub(crate) fn held_cut_leaves_the_document() {
+        let (ed, window) = presented_editor();
+        let body = format!("Hello {}", "a".repeat(10_000));
+        ed.load(RichText::from_plain(&body));
+        let before = buffer_string(&ed);
+        let model = ed.plain_text();
+        ed.view.grab_focus();
+        ed.view.emit_select_all(true);
+        ed.view.emit_cut_clipboard();
+        assert_eq!(buffer_string(&ed), before, "Cut deleted the held window");
+        assert_eq!(ed.plain_text(), model, "Cut changed the held file text");
+        let copied = clipboard_text(&ed.view);
+        assert_eq!(
+            copied.chars().count(),
+            body.chars().count(),
+            "Cut after Select All copied {} characters of the window",
+            copied.chars().count()
+        );
+        assert_eq!(copied, body);
+        let from = ed.buffer.iter_at_offset(0);
+        let to = ed.buffer.iter_at_offset(5);
+        ed.buffer.select_range(&from, &to);
+        ed.view.emit_cut_clipboard();
+        assert_eq!(buffer_string(&ed), before, "Cut deleted a held selection");
+        assert_eq!(
+            ed.plain_text(),
+            model,
+            "Cut of a selection changed the file"
+        );
+        assert_eq!(clipboard_text(&ed.view), "Hello");
+        let _ = ed.view.activate_action("clipboard.cut", None);
+        assert_eq!(
+            buffer_string(&ed),
+            before,
+            "menu Cut deleted the held window"
+        );
+        assert_eq!(
+            ed.plain_text(),
+            model,
+            "menu Cut changed the held file text"
+        );
+        window.close();
+    }
+
+    /// A short match in the last page stays on the scrollbar's last legal
+    /// window. The bar's value is that window's character origin.
+    pub(crate) fn held_find_in_the_last_page_stays_on_the_bar() {
+        let (ed, window) = presented_editor();
+        let total = 10_050usize;
+        let mut body = "a".repeat(total - 4);
+        body.push_str("TAIL");
+        assert_eq!(body.chars().count(), total);
+        let at = total - 4;
+        ed.load(RichText::from_plain(&body));
+        ed.search_entry.set_text("TAIL");
+        ed.find(true);
+        let max = total - HELD_WINDOW;
+        let origin = ed.held_origin.get();
+        let bar = ed.held_bar.adjustment().value();
+        assert!(
+            origin <= max,
+            "find parked the window at {origin}, past the bar maximum {max}"
+        );
+        assert!(
+            (bar - origin as f64).abs() < f64::EPSILON,
+            "the bar sat at {bar} while the window origin was {origin}"
+        );
+        let (start, end) = ed.buffer.selection_bounds().expect("find missed TAIL");
+        assert_eq!(ed.buffer.text(&start, &end, false).as_str(), "TAIL");
+        assert_eq!(file_span(&ed), Some((at, at + 4)));
+        let (buf_start, buf_end) = ed.buffer.bounds();
+        assert!(
+            ed.buffer.text(&buf_start, &buf_end, false).contains("TAIL"),
+            "TAIL was selected from a window that does not show it"
+        );
         window.close();
     }
 

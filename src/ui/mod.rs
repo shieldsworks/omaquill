@@ -2317,6 +2317,10 @@ fn gtk_checks() {
     editor::tests::find_across_a_held_page_edge_selects_the_whole_match();
     editor::tests::find_of_a_long_needle_starts_at_the_match();
     editor::tests::find_next_on_a_long_needle_reaches_the_second_match();
+    editor::tests::held_find_matches_plain_find();
+    editor::tests::held_menu_select_all_copies_the_document();
+    editor::tests::held_cut_leaves_the_document();
+    editor::tests::held_find_in_the_last_page_stays_on_the_bar();
     editor::tests::find_next_on_the_only_long_needle_wraps();
     editor::tests::select_all_copies_the_held_document();
     editor::tests::a_zero_width_space_survives_edit_and_replace();
