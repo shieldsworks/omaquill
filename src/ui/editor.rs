@@ -1250,100 +1250,296 @@ fn folded_hits(text: &[char], needle: &[char]) -> Vec<usize> {
     hits
 }
 
-fn line_end(chars: &[char], index: usize) -> usize {
-    match chars[index..].iter().position(|c| *c == '\n') {
-        Some(at) => index + at + 1,
-        None => chars.len(),
+/// Length of the GTK line break at `index`.
+/// `\r\n` is one break. `\n`, a lone `\r`, and U+2029 are one character.
+/// U+2028 and U+0085 stay inside the line.
+fn break_len(chars: &[char], index: usize) -> usize {
+    match chars.get(index) {
+        Some('\r') if chars.get(index + 1) == Some(&'\n') => 2,
+        Some('\n' | '\r' | '\u{2029}') => 1,
+        _ => 0,
     }
 }
 
-fn line_start(chars: &[char], index: usize) -> usize {
-    chars[..index]
-        .iter()
-        .rposition(|c| *c == '\n')
-        .map(|at| at + 1)
-        .unwrap_or(0)
+/// Lines in the order GTK walks them. Each line includes its break.
+/// A break at the end of the buffer does not add a line past the end.
+fn line_bounds(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let n = break_len(chars, index);
+        if n == 0 {
+            index += 1;
+            continue;
+        }
+        lines.push((start, index + n));
+        index += n;
+        start = index;
+    }
+    if start < chars.len() {
+        lines.push((start, chars.len()));
+    }
+    lines
 }
 
-/// The line GTK searches next when going backward. The text ends at `end`.
-/// A caret already at the start of a line takes the previous line.
-fn backward_line(chars: &[char], end: usize) -> Option<(usize, usize)> {
-    if end == 0 {
-        return None;
+/// `strbreakup` on `\n` only. The delimiter stays on the preceding piece.
+/// `\r` and U+2029 stay inside a piece, so they cannot cross a line.
+fn needle_parts(needle: &str) -> Vec<Vec<char>> {
+    let mut parts = Vec::new();
+    let mut rest = needle;
+    while let Some(at) = rest.find('\n') {
+        let (piece, tail) = rest.split_at(at + 1);
+        parts.push(fold_gtk(piece).chars().collect());
+        rest = tail;
     }
-    let start = line_start(chars, end);
-    if start < end {
-        return Some((start, end));
+    if !rest.is_empty() {
+        parts.push(fold_gtk(rest).chars().collect());
     }
-    Some((line_start(chars, end - 1), end))
+    parts
 }
 
-fn match_line(
+fn fold_chars(chars: &[char]) -> Vec<char> {
+    let text: String = chars.iter().collect();
+    fold_gtk(&text).chars().collect()
+}
+
+/// First or last hit of `part` in `chars[start..end]`, as an original offset.
+fn part_at(
     chars: &[char],
     lens: &[usize],
     start: usize,
     end: usize,
-    needle: &[char],
+    part: &[char],
     forward: bool,
-) -> Option<(usize, usize)> {
-    if start >= end || needle.is_empty() {
+) -> Option<usize> {
+    if part.is_empty() {
+        return Some(start);
+    }
+    if start >= end {
         return None;
     }
-    let region_str: String = chars[start..end].iter().collect();
-    let folded: Vec<char> = fold_gtk(&region_str).chars().collect();
-    let hits = folded_hits(&folded, needle);
+    let folded = fold_chars(&chars[start..end]);
+    let hits = folded_hits(&folded, part);
     let folded_at = if forward {
         hits.first().copied()?
     } else {
         hits.last().copied()?
     };
     let offset = pointer_offset(&lens[start..end], folded_at);
-    let match_start = walk_chars(chars, lens, start, offset, false);
-    let match_end = walk_chars(chars, lens, match_start, needle.len(), true);
-    Some((match_start, match_end))
+    Some(walk_chars(chars, lens, start, offset, false))
+}
+
+fn span_end(chars: &[char], lens: &[usize], start: usize, parts: &[Vec<char>]) -> usize {
+    let count = parts.iter().map(Vec::len).sum();
+    walk_chars(chars, lens, start, count, true)
+}
+
+/// Later pieces of a forward needle. Each must be a non-empty prefix of the
+/// next full line. GTK does not check a combining mark on these lines, and
+/// it does not try another hit on the line the first piece came from.
+fn forward_rest(
+    chars: &[char],
+    lines: &[(usize, usize)],
+    line_i: usize,
+    parts: &[Vec<char>],
+) -> bool {
+    for (step, part) in parts.iter().enumerate().skip(1) {
+        if part.is_empty() {
+            return true;
+        }
+        let Some(&(start, end)) = lines.get(line_i + step) else {
+            return false;
+        };
+        let folded = fold_chars(&chars[start..end]);
+        if folded.is_empty() || !folded.starts_with(part) {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_forward(
+    chars: &[char],
+    lens: &[usize],
+    lines: &[(usize, usize)],
+    parts: &[Vec<char>],
+    from: usize,
+) -> Option<(usize, usize)> {
+    if lines.is_empty() || parts.is_empty() {
+        return None;
+    }
+    if parts[0].is_empty() {
+        return Some((from, from));
+    }
+    let mut line_i = lines.partition_point(|&(_, end)| end <= from);
+    let mut clip = Some(from);
+    while line_i < lines.len() {
+        let (line_start, line_end) = lines[line_i];
+        let region = clip.take().unwrap_or(line_start).max(line_start);
+        if let Some(start) = part_at(chars, lens, region, line_end, &parts[0], true)
+            && forward_rest(chars, lines, line_i, parts)
+        {
+            return Some((start, span_end(chars, lens, start, parts)));
+        }
+        line_i += 1;
+    }
+    None
+}
+
+/// `vectors_equal_ignoring_trailing`. A middle line must start with the
+/// piece. The last line may instead be a prefix of the piece.
+fn backward_agrees(line: &[char], part: &[char], is_last: bool) -> bool {
+    if line.is_empty() || part.is_empty() {
+        return false;
+    }
+    if line.starts_with(part) {
+        return true;
+    }
+    is_last && part.starts_with(line)
+}
+
+fn line_slice<'a>(
+    chars: &'a [char],
+    lines: &[(usize, usize)],
+    index: usize,
+    last: usize,
+    cut: Option<usize>,
+) -> &'a [char] {
+    let (start, end) = lines[index];
+    let limit = if index == last {
+        cut.unwrap_or(end).clamp(start, end)
+    } else {
+        end
+    };
+    &chars[start..limit]
+}
+
+fn backward_rest(
+    chars: &[char],
+    lines: &[(usize, usize)],
+    first: usize,
+    last: usize,
+    cut: Option<usize>,
+    parts: &[Vec<char>],
+) -> bool {
+    for (step, part) in parts.iter().enumerate().skip(1) {
+        if part.is_empty() {
+            return true;
+        }
+        let line_i = first + step;
+        if line_i > last {
+            return false;
+        }
+        let folded = fold_chars(line_slice(chars, lines, line_i, last, cut));
+        if !backward_agrees(&folded, part, step + 1 == parts.len()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn match_window(
+    chars: &[char],
+    lens: &[usize],
+    lines: &[(usize, usize)],
+    parts: &[Vec<char>],
+    first: usize,
+    last: usize,
+    cut: Option<usize>,
+) -> Option<(usize, usize)> {
+    let (start, end) = lines[first];
+    let limit = if first == last {
+        cut.unwrap_or(end).clamp(start, end)
+    } else {
+        end
+    };
+    let start = part_at(chars, lens, start, limit, &parts[0], false)?;
+    if !backward_rest(chars, lines, first, last, cut, parts) {
+        return None;
+    }
+    Some((start, span_end(chars, lens, start, parts)))
+}
+
+/// Line that holds `from`. The end of the buffer belongs to the last line.
+fn caret_line(lines: &[(usize, usize)], from: usize) -> Option<usize> {
+    if let Some(index) = lines
+        .iter()
+        .position(|&(start, end)| from >= start && from < end)
+    {
+        return Some(index);
+    }
+    lines
+        .last()
+        .is_some_and(|&(_, end)| from == end)
+        .then_some(lines.len().saturating_sub(1))
+}
+
+fn find_backward(
+    chars: &[char],
+    lens: &[usize],
+    lines: &[(usize, usize)],
+    parts: &[Vec<char>],
+    from: usize,
+) -> Option<(usize, usize)> {
+    if from == 0 || lines.is_empty() || parts.is_empty() {
+        return None;
+    }
+    if parts[0].is_empty() {
+        return Some((from, from));
+    }
+    let caret = caret_line(lines, from)?;
+    // GTK gives up before stepping back when the caret's line cannot
+    // hold this many needle lines.
+    if caret + 1 < parts.len() {
+        return None;
+    }
+    // A caret at the start of a line takes the previous line as the end
+    // of the window. The first window cuts its last line at the caret.
+    // Later windows are full lines, one line further back.
+    let (mut last, mut cut) = if from == lines[caret].0 {
+        (caret - 1, None)
+    } else {
+        (caret, Some(from))
+    };
+    loop {
+        if last + 1 < parts.len() {
+            break;
+        }
+        let first = last + 1 - parts.len();
+        if let Some(span) = match_window(chars, lens, lines, parts, first, last, cut.take()) {
+            return Some(span);
+        }
+        if first == 0 {
+            break;
+        }
+        last -= 1;
+    }
+    None
 }
 
 /// Character offsets of `needle` in `hay`, in original characters.
 ///
-/// GTK searches one line at a time. Forward search starts at `from_char`.
-/// Backward search stops at `from_char`. The second half of a fold that
-/// sits before that point is not part of the line, so it is not a new hit.
+/// Lines break where GTK breaks them. The needle splits only on `\n`.
+/// Forward search starts at `from_char` and takes the first hit on a line.
+/// Backward search stops at `from_char`.
 fn find_ci(hay: &str, needle: &str, forward: bool, from_char: usize) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
     }
-    let needle_chars: Vec<char> = fold_gtk(needle).chars().collect();
-    if needle_chars.is_empty() {
+    let parts = needle_parts(needle);
+    if parts.is_empty() || parts.iter().all(Vec::is_empty) {
         return None;
     }
     let chars: Vec<char> = hay.chars().collect();
     let lens: Vec<usize> = chars.iter().copied().map(fold_len).collect();
+    let lines = line_bounds(&chars);
     let from = from_char.min(chars.len());
     if forward {
-        let mut origin = from;
-        while origin < chars.len() {
-            let end = line_end(&chars, origin);
-            if let Some(span) = match_line(&chars, &lens, origin, end, &needle_chars, true) {
-                return Some(span);
-            }
-            if end == origin {
-                break;
-            }
-            origin = end;
-        }
-        return None;
+        find_forward(&chars, &lens, &lines, &parts, from)
+    } else {
+        find_backward(&chars, &lens, &lines, &parts, from)
     }
-    let mut limit = from;
-    while let Some((start, end)) = backward_line(&chars, limit) {
-        if let Some(span) = match_line(&chars, &lens, start, end, &needle_chars, false) {
-            return Some(span);
-        }
-        if start == 0 {
-            break;
-        }
-        limit = start;
-    }
-    None
 }
 
 fn text_index(offset: i32) -> usize {
