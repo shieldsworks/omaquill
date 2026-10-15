@@ -273,7 +273,9 @@ impl Doc<'_> {
     /// One line of text with its baseline at `baseline`, across the text
     /// block.
     fn line_at(&self, text: &str, size: f64, align: Align, baseline: f64) -> Result<()> {
-        let layout = self.layout(text, size, align, self.g.text_width());
+        let mut texts = [text.to_string()];
+        breakable(&mut texts);
+        let layout = self.layout(&texts[0], size, align, self.g.text_width());
         let first = layout.baseline() as f64 / pango::SCALE as f64;
         self.cr.move_to(self.left(), baseline - first);
         pangocairo::functions::show_layout(&self.cr, &layout);
@@ -304,6 +306,7 @@ impl Doc<'_> {
                 }
             })
             .collect();
+        breakable(&mut texts);
         let layout = loop {
             let text: String = texts.concat();
             let layout = self.layout(&text, size, align, self.g.text_width());
@@ -460,6 +463,34 @@ fn keep_dashes_attached(text: &str) -> String {
     out
 }
 
+/// Characters of one stretch with no break opportunity before a zero-width
+/// space is added. Pango's word-char wrap of such a stretch takes time that
+/// grows with its square: 20,000 letters took 0.18 s to compile and 80,000
+/// took 2.1 s, against 0.25 s with a zero-width space every 64. A line of
+/// the book holds fewer characters than this, and no word is this long.
+const BREAKLESS: usize = 64;
+
+/// Adds a zero-width space after every [`BREAKLESS`] characters that have
+/// no break between them, counted across runs. It is not drawn.
+fn breakable(texts: &mut [String]) {
+    let mut run = 0;
+    for t in texts.iter_mut() {
+        let mut out = String::with_capacity(t.len());
+        for c in t.chars() {
+            out.push(c);
+            let breaks = (c.is_whitespace()
+                && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}' | '\u{feff}'))
+                || matches!(c, '\u{200b}' | '\u{ad}');
+            run = if breaks { 0 } else { run + 1 };
+            if run == BREAKLESS {
+                out.push('\u{200b}');
+                run = 0;
+            }
+        }
+        *t = out;
+    }
+}
+
 /// Most hyphenated lines allowed in a row.
 const MAX_HYPHENS_IN_A_ROW: usize = 2;
 
@@ -561,6 +592,19 @@ mod tests {
             "ago\u{2060}\u{2014}never"
         );
         assert_eq!(keep_dashes_attached("a \u{2013} b"), "a \u{2013} b");
+    }
+
+    #[test]
+    fn a_long_stretch_without_breaks_gets_one_every_breakless_chars() {
+        let mut texts = vec!["a".repeat(100), format!("{} b", "a".repeat(40))];
+        breakable(&mut texts);
+        let zw = |n| format!("{}\u{200b}", "a".repeat(n));
+        assert_eq!(texts[0], format!("{}{}", zw(BREAKLESS), "a".repeat(36)));
+        assert_eq!(texts[1], format!("{}{} b", zw(28), "a".repeat(12)));
+        let mut prose = vec!["a\u{a0}".repeat(40), "word ".repeat(40)];
+        breakable(&mut prose);
+        assert_eq!(prose[0].matches('\u{200b}').count(), 1);
+        assert!(!prose[1].contains('\u{200b}'));
     }
 
     #[test]

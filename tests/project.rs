@@ -775,3 +775,34 @@ fn short_declarations_before_the_root_still_open() {
     assert_eq!(p.item(MORNING).unwrap().title, "Morning & After");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), xml);
 }
+
+/// `open` on a FIFO waits for a writer. A project that ships one in place
+/// of a document, an image, or the `.scrivx` gets an error instead.
+#[test]
+fn a_fifo_in_the_project_is_refused_without_blocking() {
+    let img = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
+    let fifo = |p: &Path| {
+        std::fs::remove_file(p).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(p).status();
+        assert!(made.unwrap().success(), "mkfifo {}", p.display());
+    };
+    let within = |f: Box<dyn FnOnce() -> bool + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(f()).unwrap());
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO blocked")
+    };
+    let c = copy_fixture("fifo");
+    let data = c.0.join("Files/Data");
+    fifo(&data.join(SCENE).join("content.rtf"));
+    fifo(&data.join(img).join("content.png"));
+    let path = c.0.clone();
+    assert!(within(Box::new(move || {
+        let p = Project::open(&path).unwrap();
+        p.text(SCENE).is_err() && p.media_path(img).is_none()
+    })));
+    let c = copy_fixture("fifo-scrivx");
+    fifo(&c.0.join("Lighthouse.scrivx"));
+    let path = c.0.clone();
+    assert!(within(Box::new(move || Project::open(&path).is_err())));
+}

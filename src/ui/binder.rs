@@ -243,6 +243,15 @@ impl Win {
 
             // Drop target.
             let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+            // Rows move only for a drag of another row. GTK reads a drop
+            // from another program in full before `drop` runs.
+            drop.connect_accept(|target, drop| {
+                drop.drag().is_some()
+                    && drop.actions().intersects(target.actions())
+                    && target
+                        .formats()
+                        .is_some_and(|formats| formats.match_(&drop.formats()))
+            });
             let exp_weak = expander.downgrade();
             let li_weak = li.downgrade();
             let w = weak.clone();

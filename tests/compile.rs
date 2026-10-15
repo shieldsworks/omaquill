@@ -531,6 +531,34 @@ fn rtf_output_reads_back() {
     );
 }
 
+/// A scene of one 160,000-letter word: Pango's wrap of a stretch with no
+/// break takes time that grows with its square: 7.9 s before.
+#[test]
+fn a_pdf_of_one_huge_word_compiles_quickly() {
+    let dir = scratch("huge-word");
+    let mut p = Project::create(&dir.0.join("Huge.scriv")).unwrap();
+    let draft = p.root_folder(Kind::Draft).unwrap().uuid;
+    let chapter = p.add_item(Kind::Folder, "Chapter", &draft, None).unwrap();
+    let scene = p.add_item(Kind::Text, "Scene", &chapter, None).unwrap();
+    p.set_text(&scene, &RichText::from_plain(&"a".repeat(160_000)))
+        .unwrap();
+    p.save().unwrap();
+    for manuscript in [true, false] {
+        let o = Options {
+            manuscript,
+            ..Options::for_project(&p)
+        };
+        let started = std::time::Instant::now();
+        let bytes = compile::compile(&p, &o, Format::Pdf).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(
+            started.elapsed().as_secs() < 4,
+            "manuscript {manuscript}: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
 /// Both PDF layouts: a real PDF with the text, the right page size, the
 /// title and author set. Text is checked with pdftotext when installed.
 #[test]
