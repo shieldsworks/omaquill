@@ -72,6 +72,8 @@ pub(crate) fn guard(root: &gtk::Widget) {
     while let Some(widget) = stack.pop() {
         if (widget.is::<gtk::Text>() || widget.is::<gtk::TextView>()) && !is_guarded(&widget) {
             guard_one(&widget);
+        } else if widget.type_().name() == "GtkFileChooserWidget" && !is_guarded(&widget) {
+            guard_chooser(&widget);
         }
         let mut child = widget.first_child();
         while let Some(c) = child {
@@ -181,6 +183,68 @@ fn guard_one(widget: &gtk::Widget) {
         true
     });
     widget.add_controller(target);
+}
+
+/// GTK's own file chooser, which `gtk::FileDialog` opens only when no
+/// portal answers, reads the clipboard in full when Ctrl+V lands outside
+/// its location entry. A key controller on its window, which runs before
+/// the chooser's binding, reads it here and hands the text to the same
+/// location popup.
+fn guard_chooser(chooser: &gtk::Widget) {
+    GUARDED.with_borrow_mut(|list| list.push(chooser.downgrade()));
+    let Some(window) = chooser.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = chooser.downgrade();
+    keys.connect_key_pressed(move |keys, key, _, state| {
+        let Some(chooser) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        let in_text = keys
+            .widget()
+            .and_then(|w| w.root())
+            .and_then(|r| r.focus())
+            .is_some_and(|f| f.is::<gtk::Text>() || f.is::<gtk::TextView>());
+        let clipboard = chooser.clipboard();
+        if !is_paste(key, state) || in_text || clipboard.is_local() {
+            return glib::Propagation::Proceed;
+        }
+        if READING.replace(true) {
+            chooser.error_bell();
+            return glib::Propagation::Stop;
+        }
+        let weak = chooser.downgrade();
+        glib::spawn_future_local(async move {
+            let open = clipboard.read_future(&MIME_TYPES, glib::Priority::DEFAULT);
+            let text = read(open, LIMIT, DEADLINE).await;
+            READING.set(false);
+            match (weak.upgrade(), text) {
+                (Some(chooser), Some(text)) => {
+                    chooser.emit_by_name::<()>("location-popup", &[&text]);
+                }
+                (Some(chooser), None) => chooser.error_bell(),
+                (None, _) => {}
+            }
+        });
+        glib::Propagation::Stop
+    });
+    window.add_controller(keys);
+}
+
+/// The keys `GtkText` binds to paste: Ctrl+V, Shift+Insert, and Paste.
+fn is_paste(key: gdk::Key, state: gdk::ModifierType) -> bool {
+    let mods = state
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::ALT_MASK);
+    match key.to_lower() {
+        gdk::Key::v => mods == gdk::ModifierType::CONTROL_MASK,
+        gdk::Key::Insert | gdk::Key::KP_Insert => mods == gdk::ModifierType::SHIFT_MASK,
+        gdk::Key::Paste => mods.is_empty(),
+        _ => false,
+    }
 }
 
 fn editable(widget: &gtk::Widget) -> bool {
@@ -543,11 +607,12 @@ pub(crate) mod tests {
         (!clipboard.is_local()).then_some((other, sent))
     }
 
-    fn find_field(ed: &super::super::Editor) -> gtk::Text {
-        let mut stack = vec![ed.root.clone().upcast::<gtk::Widget>()];
+    fn texts_under(root: &gtk::Widget) -> Vec<gtk::Text> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.clone()];
         while let Some(w) = stack.pop() {
             if let Ok(text) = w.clone().downcast::<gtk::Text>() {
-                return text;
+                found.push(text);
             }
             let mut child = w.first_child();
             while let Some(c) = child {
@@ -555,7 +620,14 @@ pub(crate) mod tests {
                 stack.push(c);
             }
         }
-        panic!("the editor has no Find field");
+        found
+    }
+
+    fn find_field(ed: &super::super::Editor) -> gtk::Text {
+        texts_under(ed.root.upcast_ref())
+            .into_iter()
+            .next()
+            .expect("the editor has a Find field")
     }
 
     fn paste_into(text: &gtk::Text, by_menu: bool) {
@@ -614,5 +686,59 @@ pub(crate) mod tests {
             "the unbroken paste reached the editor"
         );
         other.close();
+    }
+
+    /// Ctrl+V and Shift+Insert on GTK's own file chooser, outside its
+    /// entry, as `xdotool` types them on the X display. GTK's binding opens
+    /// no location entry for a run of letters, so text there came through
+    /// [`read`].
+    pub(crate) fn a_paste_in_a_file_chooser_is_bounded() {
+        let press = |keys: &str| {
+            std::process::Command::new("xdotool")
+                .args([
+                    "mousemove",
+                    "700",
+                    "700",
+                    "mousemove",
+                    "200",
+                    "200",
+                    "key",
+                    keys,
+                ])
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !press("Escape") {
+            eprintln!("no xdotool; file chooser paste check skipped");
+            return;
+        }
+        let window = gtk::Window::new();
+        window.set_default_size(600, 400);
+        #[allow(deprecated)]
+        let chooser = gtk::FileChooserWidget::new(gtk::FileChooserAction::Open);
+        window.set_child(Some(&chooser));
+        window.present();
+        guard(window.upcast_ref());
+        pump_until(|| false, Duration::from_millis(500));
+        let entry_holds = |n: usize| {
+            texts_under(chooser.upcast_ref())
+                .iter()
+                .any(|t| t.text().len() == n)
+        };
+        let (other, _) = foreign_clipboard(Some(2 * LIMIT)).expect("the clipboard answered");
+        assert!(press("ctrl+v"));
+        pump_until(|| false, Duration::from_millis(300));
+        pump_until(|| !READING.get(), DEADLINE + Duration::from_secs(1));
+        assert!(!entry_holds(65_535), "the oversized paste arrived");
+        other.close();
+        for (keys, n) in [("ctrl+v", 300), ("shift+Insert", 400)] {
+            gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+            let (other, _) = foreign_clipboard(Some(n)).expect("the clipboard answered again");
+            assert!(press(keys));
+            pump_until(|| entry_holds(n), DEADLINE);
+            assert!(entry_holds(n), "{keys}: the paste did not reach the entry");
+            other.close();
+        }
+        window.destroy();
     }
 }

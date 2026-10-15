@@ -2421,5 +2421,6 @@ fn gtk_checks() {
     spell::tests::activating_spellcheck_flips_its_state();
     paste::tests::an_oversized_foreign_paste_into_find_is_refused();
     paste::tests::a_foreign_paste_under_the_limit_reaches_find_and_the_editor();
+    paste::tests::a_paste_in_a_file_chooser_is_bounded();
     every_editable_in_the_window_and_its_dialogs_is_guarded();
 }

@@ -1559,9 +1559,10 @@ fn outside_error(p: &Path) -> io::Error {
 /// Reads `p` if it resolves inside the project and is a regular file. A
 /// FIFO blocks `open` until a writer appears and a device can read without
 /// end. `O_NONBLOCK` lets the open return, and the opened file's own type
-/// decides.
+/// decides. A regular file is then read in blocking mode, as `fs::read` does.
 fn read_inside(root: &Path, p: &Path) -> io::Result<Vec<u8>> {
     use io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     if !p.exists() {
         return Err(io::ErrorKind::NotFound.into());
@@ -1578,6 +1579,14 @@ fn read_inside(root: &Path, p: &Path) -> io::Result<Vec<u8>> {
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", p.display()),
         ));
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: fcntl reads and sets the flags of a descriptor `file` owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
