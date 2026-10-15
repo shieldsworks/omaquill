@@ -123,8 +123,9 @@ impl Hyphenator {
         let flush = |word: &mut String, out: &mut String| {
             if word.len() >= SHORTEST && word.chars().all(|c| c.is_ascii_lowercase()) {
                 let points = self.points(word);
+                let mut next = points.iter().peekable();
                 for (i, c) in word.chars().enumerate() {
-                    if points.contains(&i) {
+                    if next.next_if_eq(&&i).is_some() {
                         out.push('\u{ad}');
                     }
                     out.push(c);
@@ -194,5 +195,20 @@ mod tests {
             out.replace('\u{ad}', ""),
             "The windshield wipers cleared Nick's CONCENTRATION, well-known."
         );
+    }
+
+    /// One word of 240,000 letters, as a hostile project could hold. Each
+    /// letter used to search every break point: 93 s in a debug build.
+    #[test]
+    fn a_huge_word_hyphenates_in_linear_time() {
+        let word = "concentrated".repeat(20_000);
+        let started = std::time::Instant::now();
+        let out = en_us().soft_hyphens(&word);
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.replace('\u{ad}', ""), word);
     }
 }

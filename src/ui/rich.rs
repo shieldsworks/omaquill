@@ -486,7 +486,7 @@ fn is_cjk_break(ch: char) -> bool {
     )
 }
 
-fn breakless_len(chars: impl Iterator<Item = char>) -> usize {
+pub(crate) fn breakless_len(chars: impl Iterator<Item = char>) -> usize {
     let mut heavy = 0usize;
     let mut run = 0usize;
     for ch in chars {

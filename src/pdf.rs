@@ -273,7 +273,9 @@ impl Doc<'_> {
     /// One line of text with its baseline at `baseline`, across the text
     /// block.
     fn line_at(&self, text: &str, size: f64, align: Align, baseline: f64) -> Result<()> {
-        let layout = self.layout(text, size, align, self.g.text_width());
+        let mut texts = [text.to_string()];
+        breakable(&mut texts);
+        let layout = self.layout(&texts[0], size, align, self.g.text_width());
         let first = layout.baseline() as f64 / pango::SCALE as f64;
         self.cr.move_to(self.left(), baseline - first);
         pangocairo::functions::show_layout(&self.cr, &layout);
@@ -304,6 +306,7 @@ impl Doc<'_> {
                 }
             })
             .collect();
+        breakable(&mut texts);
         let layout = loop {
             let text: String = texts.concat();
             let layout = self.layout(&text, size, align, self.g.text_width());
@@ -460,6 +463,72 @@ fn keep_dashes_attached(text: &str) -> String {
     out
 }
 
+/// Characters of one stretch with no break opportunity before a zero-width
+/// space is added. Pango's word-char wrap of such a stretch takes time that
+/// grows with its square: 20,000 letters took 0.18 s to compile and 80,000
+/// took 2.1 s, against 0.25 s with a zero-width space every 64. A line of
+/// the book holds fewer characters than this, and no word is this long.
+const BREAKLESS: usize = 64;
+
+/// Adds a zero-width space after every [`BREAKLESS`] characters that have
+/// no break between them, counted across runs. It is not drawn. Han, Kana,
+/// Hangul, and Thai break between their own letters, so they end a stretch.
+/// The space waits for a boundary between two clusters, since Pango breaks
+/// a line after a zero-width space even before a mark.
+fn breakable(texts: &mut [String]) {
+    let mut run = 0;
+    let mut prev = None;
+    for t in texts.iter_mut() {
+        let mut out = String::with_capacity(t.len());
+        for c in t.chars() {
+            if run >= BREAKLESS && prev.is_some_and(|p| !leads(p) && !follows(c)) {
+                out.push('\u{200b}');
+                run = 0;
+            }
+            out.push(c);
+            run = if breaks(c) { 0 } else { run + 1 };
+            prev = Some(c);
+        }
+        *t = out;
+    }
+}
+
+fn breaks(c: char) -> bool {
+    use pango::glib::{Unichar, UnicodeBreakType as B};
+    (c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}' | '\u{feff}'))
+        || matches!(c, '\u{200b}' | '\u{ad}')
+        || matches!(
+            c.break_type(),
+            B::Ideographic | B::HangulLvSyllable | B::HangulLvtSyllable | B::ComplexContext
+        )
+}
+
+/// Whether `c` joins the cluster of the character before it.
+fn follows(c: char) -> bool {
+    use pango::glib::{Unichar, UnicodeBreakType as B};
+    c.is_mark()
+        || matches!(
+            c.break_type(),
+            B::CombiningMark
+                | B::ZeroWidthJoiner
+                | B::EmojiModifier
+                | B::RegionalIndicator
+                | B::HangulVJamo
+                | B::HangulTJamo
+        )
+}
+
+/// Whether `c` joins the cluster of the character after it. A virama
+/// joins the next consonant into one conjunct.
+fn leads(c: char) -> bool {
+    use pango::glib::{Unichar, UnicodeBreakType as B};
+    c.combining_class() == 9
+        || matches!(
+            c.break_type(),
+            B::ZeroWidthJoiner | B::RegionalIndicator | B::HangulLJamo | B::HangulVJamo
+        )
+}
+
 /// Most hyphenated lines allowed in a row.
 const MAX_HYPHENS_IN_A_ROW: usize = 2;
 
@@ -561,6 +630,39 @@ mod tests {
             "ago\u{2060}\u{2014}never"
         );
         assert_eq!(keep_dashes_attached("a \u{2013} b"), "a \u{2013} b");
+    }
+
+    #[test]
+    fn a_long_stretch_without_breaks_gets_one_every_breakless_chars() {
+        let mut texts = vec!["a".repeat(100), format!("{} b", "a".repeat(40))];
+        breakable(&mut texts);
+        let zw = |n| format!("{}\u{200b}", "a".repeat(n));
+        assert_eq!(texts[0], format!("{}{}", zw(BREAKLESS), "a".repeat(36)));
+        assert_eq!(texts[1], format!("{}{} b", zw(28), "a".repeat(12)));
+        let mut prose = vec!["a\u{a0}".repeat(40), "word ".repeat(40)];
+        breakable(&mut prose);
+        assert_eq!(prose[0].matches('\u{200b}').count(), 1);
+        assert!(!prose[1].contains('\u{200b}'));
+    }
+
+    #[test]
+    fn breakable_leaves_clusters_and_scripts_without_spaces_whole() {
+        let thai = "ภาษาไทยเป็นภาษาที่มีระดับเสียงของคำแน่นอน".repeat(8);
+        let han = "吾輩は猫である。名前はまだ無い。".repeat(8);
+        let flags = "\u{1f1fa}\u{1f1f8}".repeat(100);
+        let mut texts = vec![thai.clone(), han.clone(), flags.clone()];
+        breakable(&mut texts);
+        assert_eq!(texts, [thai, han, flags]);
+        for unit in ["e\u{301}", "\u{915}\u{94d}\u{937}", "\u{633}\u{64e}"] {
+            let mut texts = vec![unit.repeat(200)];
+            breakable(&mut texts);
+            let pieces: Vec<&str> = texts[0].split('\u{200b}').collect();
+            assert!(pieces.len() > 1, "no break in {unit:?}");
+            assert!(
+                pieces.iter().all(|p| p.len() % unit.len() == 0),
+                "a break inside {unit:?}"
+            );
+        }
     }
 
     #[test]

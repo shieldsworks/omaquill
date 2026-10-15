@@ -12,6 +12,7 @@ mod dialogs;
 mod editor;
 mod find_replace;
 mod inspector;
+mod paste;
 pub mod rich;
 mod spell;
 mod theme;
@@ -116,6 +117,7 @@ pub fn run() -> glib::ExitCode {
             *theme.borrow_mut() = Some(theme::Theme::install());
             install_base_css();
             icon_fallback();
+            paste::install();
             set_accels(app);
             let quit = gio::ActionEntry::builder("quit")
                 .activate(|app: &adw::Application, _, _| {
@@ -2286,6 +2288,75 @@ fn a_failed_open_can_be_retried() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(test)]
+fn every_editable_in_the_window_and_its_dialogs_is_guarded() {
+    let dir = std::env::temp_dir().join(format!("omaquill-guarded-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Guarded.scriv");
+    let mut project = Project::create(&path).unwrap();
+    let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+    let chapter = project
+        .add_item(Kind::Text, "Chapter", &draft, None)
+        .unwrap();
+    project.save().unwrap();
+    drop(project);
+    let app = adw::Application::builder()
+        .application_id("io.github.shieldsworks.Omaquill.Guarded")
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    paste::install();
+    let win = Win::new(&app);
+    win.open_project(&path);
+    win.window.present();
+    pump_layout(&win);
+    let unguarded = |win: &Win| {
+        let mut found = (0, Vec::new());
+        let mut stack = vec![win.window.clone().upcast::<gtk::Widget>()];
+        while let Some(w) = stack.pop() {
+            if w.is::<gtk::Text>() || w.is::<gtk::TextView>() {
+                found.0 += 1;
+                if !paste::is_guarded(&w) {
+                    found.1.push(w.type_().name().to_string());
+                }
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        found
+    };
+    let (editables, missed) = unguarded(&win);
+    assert!(editables >= 5, "found {editables} editables");
+    assert!(missed.is_empty(), "unguarded in the window: {missed:?}");
+    let context = gtk::glib::MainContext::default();
+    for name in ["rename", "preferences", "compile", "find and replace"] {
+        match name {
+            "rename" => dialogs::rename(&win, &chapter),
+            "preferences" => win.show_preferences(),
+            "compile" => win.show_compile(),
+            _ => find_replace::present(&win),
+        }
+        for _ in 0..20 {
+            context.iteration(false);
+        }
+        let (inside, missed) = unguarded(&win);
+        assert!(inside > editables, "the {name} dialog added no editable");
+        assert!(missed.is_empty(), "unguarded in {name}: {missed:?}");
+        if let Some(dialog) = win.window.visible_dialog() {
+            dialog.force_close();
+        }
+        for _ in 0..20 {
+            context.iteration(false);
+        }
+    }
+    win.window.close();
+    win.join_backup_reader();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every GTK check, from one test: gtk-rs allows GTK only on the thread
 /// that started it, and each #[test] gets its own thread. Needs a display.
 /// xvfb provides one. Without a display the test returns.
@@ -2348,4 +2419,8 @@ fn gtk_checks() {
     spell::tests::a_keystroke_ahead_of_the_scan_does_not_skip();
     spell::tests::the_same_spelling_settings_do_not_restart_the_scan();
     spell::tests::activating_spellcheck_flips_its_state();
+    paste::tests::an_oversized_foreign_paste_into_find_is_refused();
+    paste::tests::a_foreign_paste_under_the_limit_reaches_find_and_the_editor();
+    paste::tests::a_paste_in_a_file_chooser_is_bounded();
+    every_editable_in_the_window_and_its_dialogs_is_guarded();
 }

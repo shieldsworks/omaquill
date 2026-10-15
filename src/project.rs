@@ -963,7 +963,8 @@ impl Project {
             return None;
         }
         let p = self.data_dir(uuid).join(format!("content.{ext}"));
-        (p.exists() && inside(&self.root, &p)).then_some(p)
+        // A FIFO named like an image blocks the reader that opens it.
+        (p.is_file() && inside(&self.root, &p)).then_some(p)
     }
 
     fn read_rtf(&self, uuid: &str, file: &str) -> Result<RichText> {
@@ -1555,14 +1556,41 @@ fn outside_error(p: &Path) -> io::Error {
     )
 }
 
+/// Reads `p` if it resolves inside the project and is a regular file. A
+/// FIFO blocks `open` until a writer appears and a device can read without
+/// end. `O_NONBLOCK` lets the open return, and the opened file's own type
+/// decides. A regular file is then read in blocking mode, as `fs::read` does.
 fn read_inside(root: &Path, p: &Path) -> io::Result<Vec<u8>> {
+    use io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     if !p.exists() {
         return Err(io::ErrorKind::NotFound.into());
     }
     if !inside(root, p) {
         return Err(outside_error(p));
     }
-    std::fs::read(p)
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(p)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", p.display()),
+        ));
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: fcntl reads and sets the flags of a descriptor `file` owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Writes `p` if its folder is inside the project. A file that's a symlink
