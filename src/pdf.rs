@@ -471,24 +471,62 @@ fn keep_dashes_attached(text: &str) -> String {
 const BREAKLESS: usize = 64;
 
 /// Adds a zero-width space after every [`BREAKLESS`] characters that have
-/// no break between them, counted across runs. It is not drawn.
+/// no break between them, counted across runs. It is not drawn. Han, Kana,
+/// Hangul, and Thai break between their own letters, so they end a stretch.
+/// The space waits for a boundary between two clusters, since Pango breaks
+/// a line after a zero-width space even before a mark.
 fn breakable(texts: &mut [String]) {
     let mut run = 0;
+    let mut prev = None;
     for t in texts.iter_mut() {
         let mut out = String::with_capacity(t.len());
         for c in t.chars() {
-            out.push(c);
-            let breaks = (c.is_whitespace()
-                && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}' | '\u{feff}'))
-                || matches!(c, '\u{200b}' | '\u{ad}');
-            run = if breaks { 0 } else { run + 1 };
-            if run == BREAKLESS {
+            if run >= BREAKLESS && prev.is_some_and(|p| !leads(p) && !follows(c)) {
                 out.push('\u{200b}');
                 run = 0;
             }
+            out.push(c);
+            run = if breaks(c) { 0 } else { run + 1 };
+            prev = Some(c);
         }
         *t = out;
     }
+}
+
+fn breaks(c: char) -> bool {
+    use pango::glib::{Unichar, UnicodeBreakType as B};
+    (c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{202f}' | '\u{2007}' | '\u{feff}'))
+        || matches!(c, '\u{200b}' | '\u{ad}')
+        || matches!(
+            c.break_type(),
+            B::Ideographic | B::HangulLvSyllable | B::HangulLvtSyllable | B::ComplexContext
+        )
+}
+
+/// Whether `c` joins the cluster of the character before it.
+fn follows(c: char) -> bool {
+    use pango::glib::{Unichar, UnicodeBreakType as B};
+    c.is_mark()
+        || matches!(
+            c.break_type(),
+            B::CombiningMark
+                | B::ZeroWidthJoiner
+                | B::EmojiModifier
+                | B::RegionalIndicator
+                | B::HangulVJamo
+                | B::HangulTJamo
+        )
+}
+
+/// Whether `c` joins the cluster of the character after it. A virama
+/// joins the next consonant into one conjunct.
+fn leads(c: char) -> bool {
+    use pango::glib::{Unichar, UnicodeBreakType as B};
+    c.combining_class() == 9
+        || matches!(
+            c.break_type(),
+            B::ZeroWidthJoiner | B::RegionalIndicator | B::HangulLJamo | B::HangulVJamo
+        )
 }
 
 /// Most hyphenated lines allowed in a row.
@@ -605,6 +643,26 @@ mod tests {
         breakable(&mut prose);
         assert_eq!(prose[0].matches('\u{200b}').count(), 1);
         assert!(!prose[1].contains('\u{200b}'));
+    }
+
+    #[test]
+    fn breakable_leaves_clusters_and_scripts_without_spaces_whole() {
+        let thai = "ภาษาไทยเป็นภาษาที่มีระดับเสียงของคำแน่นอน".repeat(8);
+        let han = "吾輩は猫である。名前はまだ無い。".repeat(8);
+        let flags = "\u{1f1fa}\u{1f1f8}".repeat(100);
+        let mut texts = vec![thai.clone(), han.clone(), flags.clone()];
+        breakable(&mut texts);
+        assert_eq!(texts, [thai, han, flags]);
+        for unit in ["e\u{301}", "\u{915}\u{94d}\u{937}", "\u{633}\u{64e}"] {
+            let mut texts = vec![unit.repeat(200)];
+            breakable(&mut texts);
+            let pieces: Vec<&str> = texts[0].split('\u{200b}').collect();
+            assert!(pieces.len() > 1, "no break in {unit:?}");
+            assert!(
+                pieces.iter().all(|p| p.len() % unit.len() == 0),
+                "a break inside {unit:?}"
+            );
+        }
     }
 
     #[test]

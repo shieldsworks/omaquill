@@ -124,7 +124,9 @@ fn guard_one(widget: &gtk::Widget) {
     );
 
     // GTK pastes the primary selection from its own click gesture, without
-    // a signal, so this one claims the press first.
+    // a signal, so this one claims the press first. It claims a double
+    // click's second press too: GTK's gesture never saw the first, so it
+    // would take the second for a first and paste.
     let click = gtk::GestureClick::new();
     click.set_button(gdk::BUTTON_MIDDLE);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -133,13 +135,16 @@ fn guard_one(widget: &gtk::Widget) {
             return;
         };
         let clipboard = widget.primary_clipboard();
-        if n_press != 1 || !widget.settings().is_gtk_enable_primary_paste() {
+        if !widget.settings().is_gtk_enable_primary_paste() {
             return;
         }
         if clipboard.is_local() && !local_too_long(&widget, &clipboard) {
             return;
         }
         gesture.set_state(gtk::EventSequenceState::Claimed);
+        if n_press != 1 {
+            return;
+        }
         if clipboard.is_local() || !editable(&widget) {
             widget.error_bell();
             return;
