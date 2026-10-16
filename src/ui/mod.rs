@@ -1842,7 +1842,7 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
         .add_item(Kind::Text, "Hostile", &draft, None)
         .unwrap();
     let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
-    let link: Rc<str> = Rc::from("https://example.test/chapter");
+    let link: std::sync::Arc<str> = std::sync::Arc::from("https://example.test/chapter");
     let mut paragraph = rtf::Paragraph::default();
     paragraph.style.align = rtf::Align::Center;
     for i in 0..2_000 {
@@ -1850,7 +1850,7 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
             text: "a".into(),
             style: rtf::CharStyle {
                 bold: i % 2 == 0,
-                link: Some(Rc::clone(&link)),
+                link: Some(std::sync::Arc::clone(&link)),
                 ..rtf::CharStyle::default()
             },
         });
