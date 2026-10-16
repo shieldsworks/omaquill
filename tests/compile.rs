@@ -559,6 +559,45 @@ fn a_pdf_of_one_huge_word_compiles_quickly() {
     }
 }
 
+/// A paperback paragraph of 88,000 letters in long words that hyphenate
+/// at nearly every line end. Each word that would make a third hyphenated
+/// line in a row used to send the whole paragraph back through Pango:
+/// 18 s in a release build.
+#[test]
+fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
+    let words = "incomprehensibilities uncharacteristically internationalization \
+                 counterrevolutionaries electroencephalography ";
+    let text = words.repeat(800);
+    for (tag, text) in [
+        ("hyphenating", text.clone()),
+        ("hyphenated-word", "concentrated".repeat(10_000)),
+        (
+            "word-after-words",
+            format!("{}{}", words.repeat(2), "concentrated".repeat(10_000)),
+        ),
+    ] {
+        let dir = scratch(tag);
+        let mut p = Project::create(&dir.0.join("Hyphens.scriv")).unwrap();
+        let draft = p.root_folder(Kind::Draft).unwrap().uuid;
+        let chapter = p.add_item(Kind::Folder, "Chapter", &draft, None).unwrap();
+        let scene = p.add_item(Kind::Text, "Scene", &chapter, None).unwrap();
+        p.set_text(&scene, &RichText::from_plain(&text)).unwrap();
+        p.save().unwrap();
+        let o = Options {
+            manuscript: false,
+            ..Options::for_project(&p)
+        };
+        let started = std::time::Instant::now();
+        let bytes = compile::compile(&p, &o, Format::Pdf).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(
+            started.elapsed().as_secs() < 4,
+            "{tag}: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
 /// Both PDF layouts: a real PDF with the text, the right page size, the
 /// title and author set. Text is checked with pdftotext when installed.
 #[test]

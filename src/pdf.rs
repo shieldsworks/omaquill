@@ -73,6 +73,9 @@ struct Doc<'a> {
     cr: cairo::Context,
     surface: cairo::PdfSurface,
     ctx: pango::Context,
+    /// The same setup as `ctx`, with the base direction of the paragraph
+    /// a window is cut from.
+    windows: pango::Context,
     g: Geometry,
     book: bool,
     family: String,
@@ -153,11 +156,14 @@ pub fn pdf(sections: &[Section], opts: &Options) -> Result<Vec<u8>> {
     let ctx = pangocairo::functions::create_context(&cr);
     // One Pango unit of size is then one point, the PDF's own unit.
     pangocairo::functions::context_set_resolution(&ctx, 72.0);
+    let windows = pangocairo::functions::create_context(&cr);
+    pangocairo::functions::context_set_resolution(&windows, 72.0);
 
     let mut doc = Doc {
         cr,
         surface,
         ctx,
+        windows,
         g,
         book,
         family,
@@ -255,27 +261,18 @@ impl Doc<'_> {
         Ok(())
     }
 
-    fn layout(&self, text: &str, size: f64, align: Align, width: f64) -> pango::Layout {
-        let layout = pango::Layout::new(&self.ctx);
-        layout.set_font_description(Some(&self.font(size)));
-        layout.set_width((width * pango::SCALE as f64) as i32);
-        layout.set_wrap(pango::WrapMode::WordChar);
-        layout.set_alignment(match align {
-            Align::Center => pango::Alignment::Center,
-            Align::Right => pango::Alignment::Right,
-            _ => pango::Alignment::Left,
-        });
-        layout.set_justify(align == Align::Justify);
-        layout.set_text(text);
-        layout
-    }
-
     /// One line of text with its baseline at `baseline`, across the text
     /// block.
     fn line_at(&self, text: &str, size: f64, align: Align, baseline: f64) -> Result<()> {
         let mut texts = [text.to_string()];
         breakable(&mut texts);
-        let layout = self.layout(&texts[0], size, align, self.g.text_width());
+        let layout = layout(
+            &self.ctx,
+            &self.font(size),
+            self.g.text_width(),
+            align,
+            &texts[0],
+        );
         let first = layout.baseline() as f64 / pango::SCALE as f64;
         self.cr.move_to(self.left(), baseline - first);
         pangocairo::functions::show_layout(&self.cr, &layout);
@@ -307,18 +304,15 @@ impl Doc<'_> {
             })
             .collect();
         breakable(&mut texts);
-        let layout = loop {
-            let text: String = texts.concat();
-            let layout = self.layout(&text, size, align, self.g.text_width());
-            layout.set_indent((indent * pango::SCALE as f64) as i32);
-            layout.set_attributes(Some(&attributes(p, &texts)));
-            // At most two hyphenated lines in a row: the word that would
-            // make a third loses its break points and moves down whole.
-            match third_hyphen(&layout, &text) {
-                Some(at) if unhyphenate_word(&mut texts, at) => continue,
-                _ => break layout,
-            }
+        let setting = Setting {
+            ctx: &self.ctx,
+            windows: &self.windows,
+            font: self.font(size),
+            width: self.g.text_width(),
+            align,
+            indent,
         };
+        let layout = setting.paragraph(p, texts);
         let mut iter = layout.iter();
         loop {
             if self.y + leading > self.bottom_limit() + 0.01 {
@@ -445,8 +439,6 @@ impl Doc<'_> {
     }
 }
 
-/// Emphasis from the runs as Pango attributes. Fonts and sizes come from
-/// the layout, not the draft: a compiled book has one typeface.
 /// A word joiner (U+2060) before each em or en dash that follows a
 /// letter: line breaking may otherwise start a line with the dash, which
 /// books never do. It's invisible and doesn't change the text.
@@ -529,94 +521,377 @@ fn leads(c: char) -> bool {
         )
 }
 
+fn layout(
+    ctx: &pango::Context,
+    font: &pango::FontDescription,
+    width: f64,
+    align: Align,
+    text: &str,
+) -> pango::Layout {
+    let layout = pango::Layout::new(ctx);
+    layout.set_font_description(Some(font));
+    layout.set_width((width * pango::SCALE as f64) as i32);
+    layout.set_wrap(pango::WrapMode::WordChar);
+    layout.set_alignment(match align {
+        Align::Center => pango::Alignment::Center,
+        Align::Right => pango::Alignment::Right,
+        _ => pango::Alignment::Left,
+    });
+    layout.set_justify(align == Align::Justify);
+    layout.set_text(text);
+    layout
+}
+
 /// Most hyphenated lines allowed in a row.
 const MAX_HYPHENS_IN_A_ROW: usize = 2;
 
-/// The byte offset (in `text`) of the soft hyphen ending a line that
-/// would be the third hyphenated line in a row, if any.
-fn third_hyphen(layout: &pango::Layout, text: &str) -> Option<usize> {
-    let mut run = 0;
-    for line in layout.lines_readonly() {
-        let end = (line.start_index() + line.length()) as usize;
-        if text.get(..end).is_some_and(|t| t.ends_with('\u{ad}')) {
-            run += 1;
-            if run > MAX_HYPHENS_IN_A_ROW {
-                return Some(end - '\u{ad}'.len_utf8());
-            }
-        } else {
-            run = 0;
-        }
-    }
-    None
+/// Bytes of a paragraph laid out at once while the line after a third
+/// hyphenated one is found again. Each removal of a word's soft hyphens
+/// lays out this much, not the whole paragraph, so the work stays linear
+/// in the paragraph's length.
+const WINDOW: usize = 1024;
+
+/// How a paragraph is set: everything but its text.
+struct Setting<'a> {
+    ctx: &'a pango::Context,
+    windows: &'a pango::Context,
+    font: pango::FontDescription,
+    width: f64,
+    align: Align,
+    /// The first line's indent in points.
+    indent: f64,
 }
 
-/// Removes the soft hyphens from the word around byte `at` of the joined
-/// `texts`. False if there was nothing to remove.
-fn unhyphenate_word(texts: &mut [String], at: usize) -> bool {
+impl Setting<'_> {
+    fn lay_out(&self, ctx: &pango::Context, slice: &Slice, first: bool) -> pango::Layout {
+        let layout = layout(ctx, &self.font, self.width, self.align, &slice.text);
+        let indent = if first { self.indent } else { 0.0 };
+        layout.set_indent((indent * pango::SCALE as f64) as i32);
+        layout.set_attributes(Some(&slice.attrs));
+        layout
+    }
+
+    /// `p` laid out from `texts`, its runs' text. At most two hyphenated
+    /// lines in a row: the word that would make a third loses its break
+    /// points and moves down whole. A word that starts on an earlier line
+    /// is longer than a line and cannot move down whole, so it keeps them.
+    ///
+    /// Pango breaks lines first-fit, so the lines above the one that loses
+    /// a word stay put. After each removal only the text from that line on
+    /// is laid out again, a [`WINDOW`] at a time, and a window keeps the
+    /// lines its cut end cannot change. One layout of the whole paragraph
+    /// then draws it.
+    fn paragraph(&self, p: &Paragraph, texts: Vec<String>) -> pango::Layout {
+        let mut joined = Joined::new(texts);
+        let layout = self.whole(p, &joined);
+        let lines = layout.lines_readonly();
+        let Err(line) = cap_lines(&lines, &layout.text(), 0, |start, at| {
+            joined.unhyphenate_word(start, at)
+        }) else {
+            return layout;
+        };
+        self.cap_from(p, &mut joined, lines[line].start_index() as usize);
+        joined.compact();
+        self.whole(p, &joined)
+    }
+
+    fn whole(&self, p: &Paragraph, joined: &Joined) -> pango::Layout {
+        self.lay_out(self.ctx, &joined.slice(p, 0..joined.text.len()), true)
+    }
+
+    /// Caps the hyphenated lines of `joined` from byte `from`, the start of
+    /// a line that just lost a word, so two hyphenated lines are before it.
+    fn cap_from(&self, p: &Paragraph, joined: &mut Joined, mut from: usize) {
+        let directions = directions(&joined.text, self.ctx.base_dir());
+        let mut run = MAX_HYPHENS_IN_A_ROW;
+        let mut size = WINDOW;
+        while from < joined.text.len() {
+            let (to, ends) = joined.window_end(from, size);
+            let slice = joined.slice(p, from..to);
+            let (start, direction) =
+                directions[directions.partition_point(|&(s, _)| s <= from) - 1];
+            self.windows.set_base_dir(direction);
+            let layout = self.lay_out(self.windows, &slice, start == from);
+            layout.set_auto_dir(false);
+            let lines = layout.lines_readonly();
+            // Text past `to` could still move the last lines' breaks, and
+            // a cut paragraph leaves an empty line after its delimiter.
+            let keep = if to == joined.text.len() {
+                lines.len()
+            } else if ends {
+                lines.len() - 1
+            } else {
+                lines.len().saturating_sub(2)
+            };
+            if keep == 0 {
+                size *= 2;
+                continue;
+            }
+            size = WINDOW;
+            let capped = cap_lines(&lines[..keep], &slice.text, run, |start, at| {
+                joined.unhyphenate_word(slice.src[start], slice.src[at])
+            });
+            match capped {
+                Ok(after) => {
+                    run = after;
+                    from = match lines.get(keep) {
+                        Some(next) => slice.src[next.start_index() as usize],
+                        None => to,
+                    };
+                }
+                Err(line) => {
+                    run = MAX_HYPHENS_IN_A_ROW;
+                    from = slice.src[lines[line].start_index() as usize];
+                }
+            }
+        }
+    }
+}
+
+/// Walks `lines` counting hyphenated lines in a row, from `run` before
+/// the first. At each one past the limit, `unhyphenate` gets the line's
+/// first byte and its last, the soft hyphen, in `text`, and says whether
+/// it took that word's soft hyphens out. Err: the line that lost a word.
+/// Ok: the run after the last line.
+fn cap_lines(
+    lines: &[pango::LayoutLine],
+    text: &str,
+    mut run: usize,
+    mut unhyphenate: impl FnMut(usize, usize) -> bool,
+) -> std::result::Result<usize, usize> {
+    for (i, line) in lines.iter().enumerate() {
+        let start = line.start_index() as usize;
+        let end = start + line.length() as usize;
+        if !text.get(..end).is_some_and(|t| t.ends_with('\u{ad}')) {
+            run = 0;
+            continue;
+        }
+        run += 1;
+        if run > MAX_HYPHENS_IN_A_ROW && unhyphenate(start, end - '\u{ad}'.len_utf8()) {
+            return Err(i);
+        }
+    }
+    Ok(run)
+}
+
+/// Pango starts a paragraph after each of these, and after "\r\n".
+fn delimits(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2029}')
+}
+
+/// Where each of Pango's paragraphs in `text` starts, with the base
+/// direction a layout of all of `text` gives it: its first strong
+/// letter's, else the paragraph before's, else the whole text's first
+/// strong letter's, else `base`, the context's.
+fn directions(text: &str, base: pango::Direction) -> Vec<(usize, pango::Direction)> {
+    let strong =
+        |t: &str| Some(pango::find_base_dir(t)).filter(|&d| d != pango::Direction::Neutral);
+    let mut before = strong(text).unwrap_or(base);
+    let mut out = Vec::new();
     let mut start = 0;
-    for t in texts.iter_mut() {
-        if at < start + t.len() {
-            let local = at - start;
-            let in_word = |c: char| c.is_alphabetic() || c == '\u{ad}';
-            let from = t[..local]
-                .char_indices()
-                .rev()
-                .find(|&(_, c)| !in_word(c))
-                .map_or(0, |(i, c)| i + c.len_utf8());
-            let to = t[local..]
-                .char_indices()
-                .find(|&(_, c)| !in_word(c))
-                .map_or(t.len(), |(i, _)| local + i);
-            let word: String = t[from..to].chars().filter(|&c| c != '\u{ad}').collect();
-            if word.len() == to - from {
+    loop {
+        let end = text[start..]
+            .find(delimits)
+            .map_or(text.len(), |i| start + i);
+        before = strong(&text[start..end]).unwrap_or(before);
+        out.push((start, before));
+        let Some(c) = text[end..].chars().next() else {
+            return out;
+        };
+        start = end + c.len_utf8();
+        if c == '\r' && text[start..].starts_with('\n') {
+            start += 1;
+        }
+    }
+}
+
+/// A paragraph's runs joined into one string, with the soft hyphens taken
+/// out so far marked, not yet removed.
+struct Joined {
+    text: String,
+    /// Run `i` ends at byte `ends[i]` and starts where run `i - 1` ends.
+    ends: Vec<usize>,
+    /// True at the first byte of each soft hyphen taken out.
+    gone: Vec<bool>,
+}
+
+/// Part of a [`Joined`] as Pango lays it out, without the soft hyphens
+/// taken out.
+struct Slice {
+    text: String,
+    /// The `Joined` byte for each byte of `text`, then the slice's end.
+    src: Vec<usize>,
+    attrs: pango::AttrList,
+}
+
+impl Joined {
+    fn new(texts: Vec<String>) -> Joined {
+        let ends = texts
+            .iter()
+            .scan(0, |end, t| {
+                *end += t.len();
+                Some(*end)
+            })
+            .collect();
+        let text = texts.concat();
+        let gone = vec![false; text.len()];
+        Joined { text, ends, gone }
+    }
+
+    fn run_start(&self, i: usize) -> usize {
+        if i == 0 { 0 } else { self.ends[i - 1] }
+    }
+
+    /// `range` of the text with the attributes of every run that touches
+    /// it, as the whole paragraph's layout gets them.
+    fn slice(&self, p: &Paragraph, range: std::ops::Range<usize>) -> Slice {
+        let mut text = String::with_capacity(range.len());
+        let mut src = Vec::with_capacity(range.len() + 1);
+        let attrs = pango::AttrList::new();
+        let first = self.ends.partition_point(|&e| e < range.start);
+        for (i, r) in p.runs.iter().enumerate().skip(first) {
+            let start = self.run_start(i);
+            if start > range.end {
+                break;
+            }
+            let (from, to) = (start.max(range.start), self.ends[i].min(range.end));
+            let at = text.len();
+            for (j, c) in self.text[from..to].char_indices() {
+                if c == '\u{ad}' && self.gone[from + j] {
+                    continue;
+                }
+                text.push(c);
+                src.extend(from + j..from + j + c.len_utf8());
+            }
+            style_attributes(&attrs, &r.style, at as u32, text.len() as u32);
+        }
+        src.push(range.end);
+        Slice { text, src, attrs }
+    }
+
+    /// Where a window from `from` ends: about `size` bytes on, the end of
+    /// the text, or just past the first paragraph delimiter. True when it
+    /// ends at a delimiter before the end of the text.
+    fn window_end(&self, from: usize, size: usize) -> (usize, bool) {
+        let len = self.text.len();
+        let mut to = (from + size).min(len);
+        while !self.text.is_char_boundary(to) {
+            to += 1;
+        }
+        let Some((i, c)) = self.text[from..to]
+            .char_indices()
+            .find(|&(_, c)| delimits(c))
+        else {
+            return (to, false);
+        };
+        let mut end = from + i + c.len_utf8();
+        if c == '\r' && self.text[end..].starts_with('\n') {
+            end += 1;
+        }
+        (end, end < len)
+    }
+
+    /// Takes out the soft hyphens of the word around byte `at`, within the
+    /// run that holds it. A word that starts before byte `line`, on an
+    /// earlier line, or that has more than [`BREAKLESS`] letters cannot
+    /// move down whole and keeps them. False if it took nothing out.
+    fn unhyphenate_word(&mut self, line: usize, at: usize) -> bool {
+        let run = self.ends.partition_point(|&e| e <= at);
+        let Some(&end) = self.ends.get(run) else {
+            return false;
+        };
+        let start = self.run_start(run).max(line);
+        let in_word = |c: char| c.is_alphabetic() || c == '\u{ad}';
+        let from = match self.text[start..at]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !in_word(c))
+        {
+            Some((i, c)) => start + i + c.len_utf8(),
+            None if start == line && self.text[..line].chars().next_back().is_some_and(in_word) => {
                 return false;
             }
-            t.replace_range(from..to, &word);
-            return true;
+            None => start,
+        };
+        let mut letters = self.text[from..at]
+            .chars()
+            .filter(|&c| c != '\u{ad}')
+            .count();
+        let mut to = end;
+        for (i, c) in self.text[at..end].char_indices() {
+            if !in_word(c) {
+                to = at + i;
+                break;
+            }
+            if c != '\u{ad}' {
+                letters += 1;
+            }
+            if letters > BREAKLESS {
+                return false;
+            }
         }
-        start += t.len();
+        let mut any = false;
+        for (i, c) in self.text[from..to].char_indices() {
+            if c == '\u{ad}' && !self.gone[from + i] {
+                self.gone[from + i] = true;
+                any = true;
+            }
+        }
+        any
     }
-    false
+
+    /// Removes the soft hyphens taken out.
+    fn compact(&mut self) {
+        let mut text = String::with_capacity(self.text.len());
+        let mut ends = Vec::with_capacity(self.ends.len());
+        let mut start = 0;
+        for &end in &self.ends {
+            for (i, c) in self.text[start..end].char_indices() {
+                if !(c == '\u{ad}' && self.gone[start + i]) {
+                    text.push(c);
+                }
+            }
+            ends.push(text.len());
+            start = end;
+        }
+        self.gone = vec![false; text.len()];
+        self.text = text;
+        self.ends = ends;
+    }
 }
 
-/// `texts`: each run's text as laid out (hyphenated or not), for offsets.
-fn attributes(p: &Paragraph, texts: &[String]) -> pango::AttrList {
-    let list = pango::AttrList::new();
-    let mut at = 0u32;
-    for (r, text) in p.runs.iter().zip(texts) {
-        let end = at + text.len() as u32;
-        let add = |mut a: pango::Attribute| {
-            a.set_start_index(at);
-            a.set_end_index(end);
-            list.insert(a);
-        };
-        let s = &r.style;
-        if s.bold {
-            add(pango::AttrInt::new_weight(pango::Weight::Bold).upcast());
-        }
-        if s.italic {
-            add(pango::AttrInt::new_style(pango::Style::Italic).upcast());
-        }
-        if s.underline {
-            add(pango::AttrInt::new_underline(pango::Underline::Single).upcast());
-        }
-        if s.strike {
-            add(pango::AttrInt::new_strikethrough(true).upcast());
-        }
-        match s.script {
-            Script::Super => {
-                add(pango::AttrInt::new_rise(3 * pango::SCALE).upcast());
-                add(pango::AttrFloat::new_scale(0.7).upcast());
-            }
-            Script::Sub => {
-                add(pango::AttrInt::new_rise(-2 * pango::SCALE).upcast());
-                add(pango::AttrFloat::new_scale(0.7).upcast());
-            }
-            Script::Normal => {}
-        }
-        at = end;
+/// Emphasis from a run as Pango attributes over `start..end`. Fonts and
+/// sizes come from the layout, not the draft: a compiled book has one
+/// typeface.
+fn style_attributes(list: &pango::AttrList, s: &crate::rtf::CharStyle, start: u32, end: u32) {
+    let add = |mut a: pango::Attribute| {
+        a.set_start_index(start);
+        a.set_end_index(end);
+        list.insert(a);
+    };
+    if s.bold {
+        add(pango::AttrInt::new_weight(pango::Weight::Bold).upcast());
     }
-    list
+    if s.italic {
+        add(pango::AttrInt::new_style(pango::Style::Italic).upcast());
+    }
+    if s.underline {
+        add(pango::AttrInt::new_underline(pango::Underline::Single).upcast());
+    }
+    if s.strike {
+        add(pango::AttrInt::new_strikethrough(true).upcast());
+    }
+    match s.script {
+        Script::Super => {
+            add(pango::AttrInt::new_rise(3 * pango::SCALE).upcast());
+            add(pango::AttrFloat::new_scale(0.7).upcast());
+        }
+        Script::Sub => {
+            add(pango::AttrInt::new_rise(-2 * pango::SCALE).upcast());
+            add(pango::AttrFloat::new_scale(0.7).upcast());
+        }
+        Script::Normal => {}
+    }
 }
 
 #[cfg(test)]
@@ -667,41 +942,209 @@ mod tests {
 
     #[test]
     fn unhyphenates_one_word() {
-        let mut texts = vec![
+        let mut joined = Joined::new(vec![
             "a con\u{ad}cen\u{ad}trated ".to_string(),
             "sto\u{ad}ry".to_string(),
-        ];
-        assert!(unhyphenate_word(&mut texts, "a con\u{ad}cen".len()));
-        assert_eq!(texts[0], "a concentrated ");
-        assert_eq!(texts[1], "sto\u{ad}ry");
-        assert!(!unhyphenate_word(&mut texts, 3));
+        ]);
+        assert!(joined.unhyphenate_word(2, "a con\u{ad}cen".len()));
+        joined.compact();
+        assert_eq!(joined.text, "a concentrated sto\u{ad}ry");
+        assert_eq!(joined.ends, ["a concentrated ".len(), joined.text.len()]);
+        assert!(!joined.unhyphenate_word(0, 3));
+        let mut started = Joined::new(vec!["con\u{ad}cen\u{ad}trated".to_string()]);
+        assert!(!started.unhyphenate_word("con\u{ad}".len(), "con\u{ad}cen".len()));
+        let mut split = Joined::new(vec!["con\u{ad}".to_string(), "cen\u{ad}trated".to_string()]);
+        assert!(split.unhyphenate_word(0, "con\u{ad}cen".len()));
+        split.compact();
+        assert_eq!(split.text, "con\u{ad}centrated");
+        let huge = crate::hyphen::en_us().soft_hyphens(&"concentrated".repeat(6));
+        let mut huge = Joined::new(vec![huge]);
+        assert!(!huge.unhyphenate_word(0, "con".len()));
+    }
+
+    fn context() -> pango::Context {
+        let ctx = pangocairo::FontMap::default().create_context();
+        pangocairo::functions::context_set_resolution(&ctx, 72.0);
+        ctx
+    }
+
+    fn setting<'a>(
+        ctx: &'a pango::Context,
+        windows: &'a pango::Context,
+        width: f64,
+        indent: f64,
+    ) -> Setting<'a> {
+        Setting {
+            ctx,
+            windows,
+            font: pango::FontDescription::from_string("serif 11"),
+            width,
+            align: Align::Justify,
+            indent,
+        }
+    }
+
+    /// Runs as the paperback prepares them, bold on every other one.
+    fn prepared(runs: &[&str]) -> (Paragraph, Vec<String>) {
+        let p = Paragraph {
+            runs: runs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| crate::rtf::Run {
+                    text: t.to_string(),
+                    style: crate::rtf::CharStyle {
+                        bold: i % 2 == 1,
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut texts: Vec<String> = runs
+            .iter()
+            .map(|t| crate::hyphen::en_us().soft_hyphens(&keep_dashes_attached(t)))
+            .collect();
+        breakable(&mut texts);
+        (p, texts)
+    }
+
+    /// Each line's text and logical extents.
+    fn lines(layout: &pango::Layout) -> Vec<(String, i32, i32, i32)> {
+        let text = layout.text();
+        let mut out = Vec::new();
+        let mut iter = layout.iter();
+        loop {
+            let line = iter.line_readonly().expect("an iterator stands on a line");
+            let (_, logical) = iter.line_extents();
+            let start = line.start_index() as usize;
+            let end = start + line.length() as usize;
+            out.push((
+                text[start..end].to_string(),
+                logical.x(),
+                logical.width(),
+                iter.baseline(),
+            ));
+            if !iter.next_line() {
+                return out;
+            }
+        }
+    }
+
+    /// Whether a third hyphenated line in a row ends in a word that
+    /// starts on that line.
+    fn third_in_a_row(layout: &pango::Layout) -> bool {
+        let text = layout.text();
+        let mut joined = Joined::new(vec![text.to_string()]);
+        cap_lines(&layout.lines_readonly(), &text, 0, |start, at| {
+            joined.unhyphenate_word(start, at)
+        })
+        .is_err()
     }
 
     /// A narrow column of long words would hyphenate line after line;
     /// never more than two in a row.
     #[test]
     fn at_most_two_hyphenated_lines_in_a_row() {
-        let ctx = pangocairo::FontMap::default().create_context();
+        let (ctx, windows) = (context(), context());
         let words = "concentrated uncomfortable illuminated anticipation \
                      investigations transportation extraordinary \
                      metronome interrogation neighborhood ";
         let base = words.repeat(6);
-        let mut texts = vec![crate::hyphen::en_us().soft_hyphens(&base)];
-        let mut rounds = 0;
-        let layout = loop {
-            let text = texts.concat();
-            let layout = pango::Layout::new(&ctx);
-            layout.set_width(90 * pango::SCALE);
-            layout.set_justify(true);
-            layout.set_text(&text);
-            match third_hyphen(&layout, &text) {
-                Some(at) if unhyphenate_word(&mut texts, at) => rounds += 1,
-                _ => break layout,
-            }
-        };
-        assert!(rounds > 0, "the test column never needed the cap");
-        let text = texts.concat();
-        assert_eq!(third_hyphen(&layout, &text), None);
+        let (p, texts) = prepared(&[&base]);
+        let hyphens = texts[0].matches('\u{ad}').count();
+        let layout = setting(&ctx, &windows, 90.0, 0.0).paragraph(&p, texts);
+        let text = layout.text();
+        assert!(
+            text.matches('\u{ad}').count() < hyphens,
+            "the test column never needed the cap"
+        );
+        assert!(!third_in_a_row(&layout));
         assert_eq!(text.replace('\u{ad}', ""), base);
+    }
+
+    /// A word longer than a line cannot move down whole, so it keeps its
+    /// break points rather than run on unbroken.
+    #[test]
+    fn a_word_longer_than_a_line_keeps_its_hyphens() {
+        let (ctx, windows) = (context(), context());
+        let word = "concentrated".repeat(200);
+        let (p, texts) = prepared(&[&format!("{} {word}", "incomprehensibilities ".repeat(4))]);
+        let hyphens = texts[0].matches('\u{ad}').count();
+        let layout = setting(&ctx, &windows, 330.0, 0.0).paragraph(&p, texts);
+        assert_eq!(layout.text().matches('\u{ad}').count(), hyphens);
+        assert!(layout.line_count() > 20);
+    }
+
+    /// The cap as one loop over the whole paragraph: lay out, take the
+    /// soft hyphens out of the word ending the first third hyphenated
+    /// line, and lay out again.
+    fn capped_whole(s: &Setting, p: &Paragraph, texts: Vec<String>) -> (pango::Layout, usize) {
+        let mut joined = Joined::new(texts);
+        let mut rounds = 0;
+        loop {
+            let layout = s.whole(p, &joined);
+            let capped = cap_lines(&layout.lines_readonly(), &layout.text(), 0, |start, at| {
+                joined.unhyphenate_word(start, at)
+            });
+            if capped.is_ok() {
+                return (layout, rounds);
+            }
+            joined.compact();
+            rounds += 1;
+        }
+    }
+
+    /// Laying out a window at a time after each removal breaks every line
+    /// where the whole-paragraph loop does, with the same extents.
+    #[test]
+    fn windows_set_lines_as_the_whole_paragraph_does() {
+        let (ctx, windows) = (context(), context());
+        let long = "incomprehensibilities uncharacteristically \
+                    internationalization counterrevolutionaries \
+                    electroencephalography ";
+        let english = long.repeat(50);
+        let mix = |other: &str| format!("{}{other} ", long.repeat(3)).repeat(15);
+        let thai = mix("ภาษาไทยเป็นภาษาที่มีระดับเสียงของคำแน่นอน");
+        let japanese = mix("吾輩は猫である。名前はまだ無い。");
+        let hebrew = mix("שלום עולם, \u{5de}\u{5d4} \u{5e9}\u{5dc}\u{5d5}\u{5de}\u{5da}?");
+        let arabic = mix("\u{627}\u{644}\u{633}\u{644}\u{627}\u{645}");
+        let marks = mix("e\u{301}te\u{301} ago\u{2014}never \u{915}\u{94d}\u{937}");
+        let paragraphs = format!(
+            "{}\n{}\u{2029}{}\r\n{}\r{}\u{2028}{}",
+            long.repeat(8),
+            long.repeat(10),
+            long.repeat(6),
+            long.repeat(9),
+            long.repeat(7),
+            long.repeat(6)
+        );
+        let rtl = format!("שלום {}", format!("{long}שלום 😀. {long}").repeat(15));
+        let split: Vec<&str> = english.split_inclusive("ties").collect();
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("english", vec![&english]),
+            ("runs", split),
+            ("thai", vec![&thai]),
+            ("japanese", vec![&japanese]),
+            ("hebrew", vec![&hebrew]),
+            ("arabic", vec![&arabic]),
+            ("marks", vec![&marks]),
+            ("paragraphs", vec![&paragraphs]),
+            ("rtl", vec![&rtl]),
+        ];
+        for (name, runs) in &cases {
+            for (width, indent) in [(330.0, 16.0), (150.0, 0.0), (90.0, 0.0)] {
+                let s = setting(&ctx, &windows, width, indent);
+                let (p, texts) = prepared(runs);
+                assert!(
+                    texts.concat().len() > 3 * WINDOW,
+                    "{name}: shorter than three windows"
+                );
+                let (whole, rounds) = capped_whole(&s, &p, texts.clone());
+                assert!(rounds > 3, "{name} at {width}: {rounds} rounds");
+                let windowed = s.paragraph(&p, texts);
+                assert_eq!(windowed.text(), whole.text(), "{name} at {width}");
+                assert_eq!(lines(&windowed), lines(&whole), "{name} at {width}");
+            }
+        }
     }
 }
