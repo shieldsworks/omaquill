@@ -559,6 +559,243 @@ fn a_pdf_of_one_huge_word_compiles_quickly() {
     }
 }
 
+/// A paperback paragraph of 88,000 letters in long words that hyphenate
+/// at nearly every line end. Each word that would make a third hyphenated
+/// line in a row used to send the whole paragraph back through Pango:
+/// 18 s in a release build. The five long words make third lines in a row
+/// in P052, which stands in for Palatino where installed; in DejaVu Serif
+/// the 45-letter words do.
+#[test]
+fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
+    let words = "incomprehensibilities uncharacteristically internationalization \
+                 counterrevolutionaries electroencephalography ";
+    let text = words.repeat(800);
+    for (tag, text, font) in [
+        ("hyphenating", text.clone(), None),
+        (
+            "45-letter-words",
+            "pneumonoultramicroscopicsilicovolcanoconiosis ".repeat(1_950),
+            Some("DejaVu Serif"),
+        ),
+        ("hyphenated-word", "concentrated".repeat(10_000), None),
+        (
+            "word-after-words",
+            format!("{}{}", words.repeat(2), "concentrated".repeat(10_000)),
+            None,
+        ),
+    ] {
+        let dir = scratch(tag);
+        let mut p = Project::create(&dir.0.join("Hyphens.scriv")).unwrap();
+        let draft = p.root_folder(Kind::Draft).unwrap().uuid;
+        let chapter = p.add_item(Kind::Folder, "Chapter", &draft, None).unwrap();
+        let scene = p.add_item(Kind::Text, "Scene", &chapter, None).unwrap();
+        let mut text = RichText::from_plain(&text);
+        if let Some(font) = font {
+            assert_installed(font);
+            for run in text.paragraphs.iter_mut().flat_map(|p| p.runs.iter_mut()) {
+                run.style.font = Some(font.into());
+            }
+        }
+        p.set_text(&scene, &text).unwrap();
+        p.save().unwrap();
+        let o = Options {
+            manuscript: false,
+            ..Options::for_project(&p)
+        };
+        let started = std::time::Instant::now();
+        let bytes = compile::compile(&p, &o, Format::Pdf).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(
+            started.elapsed().as_secs() < 4,
+            "{tag}: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// Checks that Pango finds `family` itself rather than another font in its
+/// place: where a test's lines break depends on the font's widths.
+fn assert_installed(family: &str) {
+    use pango::prelude::*;
+    let found = pangocairo::FontMap::default()
+        .create_context()
+        .load_font(&pango::FontDescription::from_string(family))
+        .and_then(|font| font.describe().family());
+    assert_eq!(
+        found.as_deref(),
+        Some(family),
+        "{family} is not installed: the test needs fonts-dejavu-core"
+    );
+}
+
+/// A paperback paragraph of 88,000 bytes of long hyphenating words with
+/// a Hindi word every 400 bytes or so, every other one ending in a virama.
+/// With Pango 1.56, a stretch of it laid out alone breaks some lines
+/// otherwise than the whole paragraph does, and setting those lines again
+/// from the paragraph's start took 6 s in a release build. With Pango 1.52
+/// the stretch breaks them as the whole paragraph does;
+/// `a_long_paragraph_the_windows_set_wrong_is_capped_quickly` in the pdf
+/// module covers every version.
+#[test]
+fn a_pdf_of_a_long_paragraph_with_hindi_words_compiles_quickly() {
+    use omaquill::compile::Section;
+    use omaquill::rtf::{CharStyle, Paragraph, Run};
+    let words = "incomprehensibilities uncharacteristically internationalization \
+                 counterrevolutionaries electroencephalography";
+    let mut text = String::new();
+    while text.len() < 88_000 {
+        for word in words.split(' ') {
+            text.push_str(word);
+            text.push(' ');
+            match text.len() / 20 % 40 {
+                39 => text.push_str("\u{905}\u{930}\u{94d}\u{925}\u{93e}\u{924}\u{94d} "),
+                19 => text.push_str("\u{935}\u{93f}\u{926}\u{94d}\u{92f}\u{93e}\u{932}\u{92f} "),
+                _ => {}
+            }
+        }
+    }
+    let p = Paragraph {
+        runs: vec![Run {
+            text,
+            style: CharStyle {
+                font: Some("DejaVu Serif".into()),
+                size: 22,
+                ..Default::default()
+            },
+        }],
+        ..Default::default()
+    };
+    let o = Options {
+        title: "Hindi".into(),
+        author: String::new(),
+        manuscript: false,
+        headings: Headings::None,
+        scene_separator: "#".into(),
+    };
+    let section = Section {
+        heading: None,
+        scenes: vec![RichText {
+            paragraphs: vec![p],
+            lossy: Vec::new(),
+        }],
+    };
+    assert_installed("DejaVu Serif");
+    let started = std::time::Instant::now();
+    let bytes = omaquill::pdf::pdf(&[section], &o).unwrap();
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(started.elapsed().as_secs() < 4, "{:?}", started.elapsed());
+}
+
+/// A styled lead-in, then a plain run of long words with a tab after every
+/// seventh. Pango sizes a tab from the font of the first byte it lays out,
+/// so a stretch of the paragraph set again on its own must size tabs from
+/// the lead-in too, or its lines break elsewhere and the cap takes the
+/// soft hyphens out of the wrong words. The paperback keeps at most two
+/// hyphenated lines in a row. Lines are checked with pdftotext when
+/// installed.
+#[test]
+fn a_pdf_with_tabs_after_a_styled_lead_in_keeps_two_hyphenated_lines_at_most() {
+    use omaquill::compile::Section;
+    use omaquill::rtf::{CharStyle, Paragraph, Run, Script};
+    let words = [
+        "incomprehensibilities",
+        "uncharacteristically",
+        "internationalization",
+        "counterrevolutionaries",
+        "electroencephalography",
+    ];
+    let mut body = String::new();
+    for i in 0..400 {
+        body.push_str(words[i % words.len()]);
+        body.push(if i % 7 == 6 { '\t' } else { ' ' });
+    }
+    let leads = [
+        (
+            "DejaVu Serif",
+            CharStyle {
+                bold: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "DejaVu Sans",
+            CharStyle {
+                bold: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "DejaVu Sans Mono",
+            CharStyle {
+                script: Script::Super,
+                ..Default::default()
+            },
+        ),
+    ];
+    for (font, lead) in leads {
+        assert_installed(font);
+        let style = |s: CharStyle| CharStyle {
+            font: Some(font.to_string()),
+            size: 22,
+            ..s
+        };
+        let p = Paragraph {
+            runs: vec![
+                Run {
+                    text: "Lo ".into(),
+                    style: style(lead),
+                },
+                Run {
+                    text: body.clone(),
+                    style: style(CharStyle::default()),
+                },
+            ],
+            ..Default::default()
+        };
+        let text = RichText {
+            paragraphs: vec![p],
+            lossy: Vec::new(),
+        };
+        let o = Options {
+            title: "Tabs".into(),
+            author: String::new(),
+            manuscript: false,
+            headings: Headings::None,
+            scene_separator: "#".into(),
+        };
+        let section = Section {
+            heading: None,
+            scenes: vec![text],
+        };
+        let bytes = omaquill::pdf::pdf(&[section], &o).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        if !have("pdftotext") {
+            continue;
+        }
+        let dir = scratch(&format!("tabs-{}", font.replace(' ', "-")));
+        let file = dir.0.join("out.pdf");
+        std::fs::write(&file, &bytes).unwrap();
+        let out = Command::new("pdftotext")
+            .arg(&file)
+            .arg("-")
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let (mut run, mut most, mut hyphenated) = (0, 0, 0);
+        for line in text.lines() {
+            if line.trim_end().ends_with('\u{ad}') {
+                run += 1;
+                hyphenated += 1;
+                most = most.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert!(hyphenated > 20, "{font}: {hyphenated} hyphenated lines");
+        assert!(most <= 2, "{font}: {most} hyphenated lines in a row");
+    }
+}
+
 /// Both PDF layouts: a real PDF with the text, the right page size, the
 /// title and author set. Text is checked with pdftotext when installed.
 #[test]
