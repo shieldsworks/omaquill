@@ -1838,14 +1838,14 @@ next}";
     }
 
     fn toggled(runs: usize) -> RichText {
-        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let link: std::sync::Arc<str> = std::sync::Arc::from("https://example.test/chapter");
         let mut paragraph = Paragraph::default();
         for i in 0..runs {
             paragraph.runs.push(Run {
                 text: "a".into(),
                 style: CharStyle {
                     bold: i % 2 == 0,
-                    link: Some(Rc::clone(&link)),
+                    link: Some(std::sync::Arc::clone(&link)),
                     ..CharStyle::default()
                 },
             });
@@ -2217,7 +2217,7 @@ next}";
     /// the buffer.
     pub(crate) fn a_held_load_clears_the_previous_tags_and_selection() {
         let ed = Editor::new(true);
-        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let link: std::sync::Arc<str> = std::sync::Arc::from("https://example.test/chapter");
         let styled = RichText {
             paragraphs: vec![Paragraph {
                 style: ParaStyle {
@@ -2229,7 +2229,7 @@ next}";
                     text: "a".repeat(HELD_WINDOW),
                     style: CharStyle {
                         bold: true,
-                        link: Some(Rc::clone(&link)),
+                        link: Some(std::sync::Arc::clone(&link)),
                         ..CharStyle::default()
                     },
                 }],
@@ -2323,7 +2323,7 @@ next}";
             1 => CharStyle {
                 bold: page.is_multiple_of(2),
                 italic: !page.is_multiple_of(2),
-                link: Some(Rc::from(format!("https://example.test/{page}"))),
+                link: Some(std::sync::Arc::from(format!("https://example.test/{page}"))),
                 ..CharStyle::default()
             },
             _ => CharStyle {

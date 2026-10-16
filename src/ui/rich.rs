@@ -17,6 +17,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[cfg(test)]
 thread_local! {
@@ -306,16 +307,16 @@ pub fn para_tags(s: &ParaStyle) -> Vec<String> {
     out
 }
 
-fn shared_link(links: &mut HashMap<String, Rc<str>>, value: &str) -> Rc<str> {
+fn shared_link(links: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
     if let Some(link) = links.get(value) {
-        return Rc::clone(link);
+        return Arc::clone(link);
     }
-    let link = Rc::<str>::from(value);
-    links.insert(value.to_string(), Rc::clone(&link));
+    let link = Arc::<str>::from(value);
+    links.insert(value.to_string(), Arc::clone(&link));
     link
 }
 
-fn char_style(names: &[String], links: &mut HashMap<String, Rc<str>>) -> CharStyle {
+fn char_style(names: &[String], links: &mut HashMap<String, Arc<str>>) -> CharStyle {
     let mut s = CharStyle::default();
     for n in names {
         let Some(rest) = n.strip_prefix("c:") else {
@@ -404,7 +405,7 @@ fn style_names(style: &CharStyle, links: &mut HashMap<*const str, Rc<str>>) -> V
     bare.link = None;
     let mut names: Vec<Rc<str>> = char_tags(&bare).into_iter().map(Rc::from).collect();
     if let Some(link) = link {
-        let key = Rc::as_ptr(&link);
+        let key = Arc::as_ptr(&link);
         let name = links
             .entry(key)
             .or_insert_with(|| {
@@ -954,7 +955,7 @@ pub(crate) mod tests {
             color: Some((1, 2, 3)),
             highlight: Some((4, 5, 6)),
             script: Script::Super,
-            link: Some(Rc::from("https://example.test/chapter")),
+            link: Some(Arc::from("https://example.test/chapter")),
         };
         assert_eq!(style_tag_count(&full), char_tags(&full).len());
         let plain = CharStyle::default();
@@ -978,7 +979,10 @@ pub(crate) mod tests {
         let second = char_style(&names, &mut links);
         let left = first.link.clone().expect("first link");
         let right = second.link.clone().expect("second link");
-        assert!(Rc::ptr_eq(&left, &right), "each run allocated its own link");
+        assert!(
+            Arc::ptr_eq(&left, &right),
+            "each run allocated its own link"
+        );
     }
 
     #[test]
@@ -1062,14 +1066,14 @@ pub(crate) mod tests {
     }
 
     fn toggled(runs: usize) -> RichText {
-        let link: Rc<str> = Rc::from("https://example.test/chapter");
+        let link: Arc<str> = Arc::from("https://example.test/chapter");
         let mut paragraph = Paragraph::default();
         for i in 0..runs {
             paragraph.runs.push(Run {
                 text: "a".into(),
                 style: CharStyle {
                     bold: i % 2 == 0,
-                    link: Some(Rc::clone(&link)),
+                    link: Some(Arc::clone(&link)),
                     ..CharStyle::default()
                 },
             });

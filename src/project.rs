@@ -1650,6 +1650,17 @@ fn remove_dir_inside(root: &Path, dir: &Path) -> io::Result<()> {
 /// symlink to its target, and syncs the folder so the rename survives a
 /// power cut.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_if(path, bytes, || true).map(|_| ())
+}
+
+/// [`write_atomic`], asking `commit` once the bytes are on disk and just
+/// before the rename. When it answers false the temporary file is removed,
+/// `path` is left as it was, and the result is `Ok(false)`.
+pub fn write_atomic_if(
+    path: &Path,
+    bytes: &[u8],
+    commit: impl FnOnce() -> bool,
+) -> io::Result<bool> {
     use io::Write;
     use std::os::unix::fs::PermissionsExt;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1677,9 +1688,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, &target)
+        if !commit() {
+            return Ok(false);
+        }
+        std::fs::rename(&tmp, &target).map(|()| true)
     })();
-    if written.is_err() {
+    if !matches!(written, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
         return written;
     }
@@ -1688,7 +1702,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         let _ = d.sync_all();
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Scrivener's UUIDs: 36 characters of hex and dashes. Anything else is

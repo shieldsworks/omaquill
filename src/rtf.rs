@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::Hash;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[cfg(test)]
 thread_local! {
@@ -169,7 +169,7 @@ pub struct CharStyle {
     /// comment or footnote (`scrivcmt://`), whose text lives in the
     /// document's `content.comments`.
     /// Shared across runs. A bold toggle clones the style, not the target.
-    pub link: Option<Rc<str>>,
+    pub link: Option<Arc<str>>,
 }
 
 pub type Rgb = (u8, u8, u8);
@@ -852,7 +852,7 @@ impl Reader<'_> {
             }
             "fldrslt" => {
                 self.flush();
-                self.st.ch.link = self.field_link.take().map(Rc::from);
+                self.st.ch.link = self.field_link.take().map(Arc::from);
             }
             // Unicode.
             "uc" => self.st.uc = n.max(0) as usize,
@@ -1190,10 +1190,10 @@ pub fn write(text: &RichText) -> String {
     let mut cf = usize::MAX;
     // An open `\field`: its link, and the formatting outside it, which
     // comes back when its groups close.
-    let mut field: Option<(Rc<str>, CharStyle, usize)> = None;
+    let mut field: Option<(Arc<str>, CharStyle, usize)> = None;
     fn close_field(
         out: &mut String,
-        field: &mut Option<(Rc<str>, CharStyle, usize)>,
+        field: &mut Option<(Arc<str>, CharStyle, usize)>,
         ch: &mut CharStyle,
         cf: &mut usize,
     ) {

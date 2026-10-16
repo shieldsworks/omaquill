@@ -7,7 +7,8 @@
 //! when those are installed.
 
 use omaquill::compile::{self, Format, Headings, Options};
-use omaquill::project::{Kind, Project};
+use omaquill::export::{self, Done, Job, Stop};
+use omaquill::project::{self, Kind, Project};
 use omaquill::rtf::{self, RichText};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -855,4 +856,141 @@ fn pdf_manuscript_and_book() {
             assert!(squashed.contains("about 100 words"), "{squashed}");
         }
     }
+}
+
+// ------------------------------------------------------- off the main thread
+
+/// File names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn job(p: &Project, opts: &Options, format: Format, path: &Path) -> Job {
+    Job {
+        sections: compile::gather(p, opts).unwrap(),
+        opts: opts.clone(),
+        format,
+        path: path.to_path_buf(),
+    }
+}
+
+/// What `n` threads write when each runs the same job at once.
+fn on_workers(p: &Project, opts: &Options, format: Format, dir: &Path, n: usize) -> Vec<Vec<u8>> {
+    let workers: Vec<_> = (0..n)
+        .map(|i| {
+            let path = dir.join(format!("worker{i}.{}", format.extension()));
+            let job = job(p, opts, format, &path);
+            std::thread::spawn(move || {
+                assert_eq!(export::run(job, &Stop::default()), Ok(Done::Written));
+                std::fs::read(path).unwrap()
+            })
+        })
+        .collect();
+    workers.into_iter().map(|w| w.join().unwrap()).collect()
+}
+
+#[test]
+fn every_format_compiles_the_same_bytes_on_worker_threads() {
+    let p = fixture();
+    let dir = scratch("workers");
+    for manuscript in [true, false] {
+        let opts = Options {
+            manuscript,
+            ..opts(&p)
+        };
+        for format in Format::ALL {
+            // DOCX, EPUB and PDF carry the time to the second. Equal
+            // compiles on this thread before and after the workers show
+            // that the second did not change while they ran.
+            let attempt = (0..5).find_map(|_| {
+                let before = compile::compile(&p, &opts, format).unwrap();
+                let workers = on_workers(&p, &opts, format, &dir.0, 3);
+                let after = compile::compile(&p, &opts, format).unwrap();
+                (before == after).then_some((before, workers))
+            });
+            let (here, workers) = attempt.expect("the clock ticked during every attempt");
+            for bytes in workers {
+                assert!(
+                    bytes == here,
+                    "{format:?} (manuscript {manuscript}) differs on a worker thread"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_export_replaces_its_target_whole() {
+    let p = fixture();
+    let dir = scratch("export-replace");
+    let opts = opts(&p);
+    let path = dir.0.join("Out.md");
+    std::fs::write(&path, "an older and much longer compile ".repeat(1_000)).unwrap();
+    let stop = Stop::default();
+    let done = export::run(job(&p, &opts, Format::Markdown, &path), &stop);
+    assert_eq!(done, Ok(Done::Written));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        compile::compile(&p, &opts, Format::Markdown).unwrap()
+    );
+    assert!(
+        !stop.stop(),
+        "a stop after the rename reports it came too late"
+    );
+    assert_eq!(names(&dir.0), ["Out.md"]);
+}
+
+#[test]
+fn a_stopped_export_leaves_its_target() {
+    let p = fixture();
+    let dir = scratch("export-stop");
+    let opts = opts(&p);
+    let path = dir.0.join("Out.pdf");
+    std::fs::write(&path, "the last good compile").unwrap();
+    let stop = Stop::default();
+    assert!(stop.stop());
+    assert!(stop.stop(), "a second stop still reports the target kept");
+    let done = export::run(job(&p, &opts, Format::Pdf, &path), &stop);
+    assert_eq!(done, Ok(Done::Stopped));
+    assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+    assert_eq!(names(&dir.0), ["Out.pdf"]);
+    // A stop that lands after the bytes are on disk, just before the
+    // rename: the whole new file sits beside the target, and is removed.
+    let kept = project::write_atomic_if(&path, b"the new compile", || {
+        assert_eq!(names(&dir.0).len(), 2, "{:?}", names(&dir.0));
+        assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+        false
+    })
+    .unwrap();
+    assert!(!kept);
+    assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+    assert_eq!(names(&dir.0), ["Out.pdf"]);
+}
+
+#[test]
+fn an_export_that_cannot_write_reports_why_and_leaves_nothing() {
+    let p = fixture();
+    let dir = scratch("export-unwritable");
+    let opts = opts(&p);
+    let missing = dir.0.join("no such folder").join("Out.txt");
+    let err = export::run(
+        job(&p, &opts, Format::PlainText, &missing),
+        &Stop::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("No such file or directory"), "{err}");
+    // A folder where the file would go: the rename fails, and the folder
+    // keeps what it holds.
+    let folder = dir.0.join("Out.rtf");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "kept").unwrap();
+    let err = export::run(job(&p, &opts, Format::Rtf, &folder), &Stop::default()).unwrap_err();
+    assert!(!err.is_empty());
+    assert_eq!(names(&dir.0), ["Out.rtf"]);
+    assert_eq!(names(&folder), ["keep.txt"]);
 }
