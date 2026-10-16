@@ -20,6 +20,7 @@ mod theme;
 use adw::prelude::*;
 use editor::Editor;
 use gtk::{gio, glib};
+use omaquill::export;
 use omaquill::project::{Item, Kind, Project};
 use omaquill::rtf;
 use omaquill::state::{ProjectView, Settings, Today};
@@ -56,6 +57,8 @@ pub struct Win {
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
     last_toast: RefCell<String>,
+    /// Set while a compile runs on a worker. Stopping it keeps its target.
+    compiling: RefCell<Option<export::Stop>>,
     dirty_text: Cell<bool>,
     backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
     dirty_notes: Cell<bool>,
@@ -568,6 +571,7 @@ impl Win {
             current: RefCell::new(None),
             editor_uuid: RefCell::new(None),
             last_toast: RefCell::new(String::new()),
+            compiling: RefCell::new(None),
             dirty_text: Cell::new(false),
             backup_job: RefCell::new(None),
             dirty_notes: Cell::new(false),
@@ -763,6 +767,7 @@ impl Win {
             if let Err(e) = w.close_project() {
                 return w.confirm_close_after_error(&e);
             }
+            w.stop_compile();
             WINDOWS.with(|ws| ws.borrow_mut().retain(|x| !Rc::ptr_eq(x, &w)));
             glib::Propagation::Proceed
         });
@@ -1534,6 +1539,7 @@ impl Win {
                 && let Some(w) = weak.upgrade()
             {
                 *w.project.borrow_mut() = None;
+                w.stop_compile();
                 WINDOWS.with(|ws| ws.borrow_mut().retain(|x| !Rc::ptr_eq(x, &w)));
                 w.window.destroy();
             }
@@ -2398,6 +2404,10 @@ fn gtk_checks() {
     spell::tests::one_paragraph_is_one_spelling_line();
     id_less_text_is_read_only();
     a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
+    dialogs::tests::a_compile_leaves_the_main_loop_running();
+    dialogs::tests::cancel_and_closing_the_window_keep_the_target();
+    dialogs::tests::an_edit_during_a_compile_stays_out_of_it();
+    dialogs::tests::a_failed_or_panicking_compile_is_reported();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();

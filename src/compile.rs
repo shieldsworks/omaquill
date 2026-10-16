@@ -264,14 +264,19 @@ pub fn word_count(sections: &[Section]) -> usize {
 // ------------------------------------------------------------- compiling
 
 pub fn compile(project: &Project, opts: &Options, format: Format) -> Result<Vec<u8>> {
-    let sections = gather(project, opts)?;
+    render(&gather(project, opts)?, opts, format)
+}
+
+/// The output file for sections already gathered. Reads nothing from the
+/// project, so it runs on any thread.
+pub fn render(sections: &[Section], opts: &Options, format: Format) -> Result<Vec<u8>> {
     Ok(match format {
-        Format::Docx => docx(&sections, opts)?,
-        Format::Epub => epub(&sections, opts)?,
-        Format::Markdown => markdown(&sections, opts).into_bytes(),
-        Format::PlainText => plain_text(&sections, opts).into_bytes(),
-        Format::Rtf => rtf_file(&sections, opts).into_bytes(),
-        Format::Pdf => crate::pdf::pdf(&sections, opts)?,
+        Format::Docx => docx(sections, opts)?,
+        Format::Epub => epub(sections, opts)?,
+        Format::Markdown => markdown(sections, opts).into_bytes(),
+        Format::PlainText => plain_text(sections, opts).into_bytes(),
+        Format::Rtf => rtf_file(sections, opts).into_bytes(),
+        Format::Pdf => crate::pdf::pdf(sections, opts)?,
     })
 }
 

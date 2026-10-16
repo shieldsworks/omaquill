@@ -4,7 +4,27 @@ use super::{Win, rich};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use omaquill::compile::{self, Format, Headings, Options};
+use omaquill::export::{self, Done, Stop};
+use std::path::PathBuf;
 use std::rc::Rc;
+
+/// The parts of the Compile dialog that show a compile running.
+#[derive(Clone)]
+struct CompileUi {
+    dialog: adw::Dialog,
+    go: gtk::Button,
+    cancel: gtk::Button,
+}
+
+impl CompileUi {
+    fn busy(&self, busy: bool) {
+        self.go.set_sensitive(!busy);
+        self.go
+            .set_label(if busy { "Compiling…" } else { "Compile…" });
+        self.cancel.set_visible(busy);
+        self.cancel.set_sensitive(busy);
+    }
+}
 
 pub fn rename(win: &Rc<Win>, uuid: &str) {
     let Some(item) = win.item(uuid) else { return };
@@ -355,6 +375,10 @@ impl Win {
     }
 
     pub(super) fn show_compile(self: &Rc<Self>) {
+        if self.compiling.borrow().is_some() {
+            self.toast("A compile is already running");
+            return;
+        }
         let Some(mut opts) = self.project.borrow().as_ref().map(Options::for_project) else {
             self.toast("Open a project first");
             return;
@@ -434,8 +458,13 @@ impl Win {
             .label("Compile…")
             .css_classes(["suggested-action"])
             .build();
+        let cancel = gtk::Button::builder()
+            .label("Cancel")
+            .visible(false)
+            .build();
         let header = adw::HeaderBar::new();
         header.pack_end(&go);
+        header.pack_start(&cancel);
         let view = adw::ToolbarView::new();
         view.add_top_bar(&header);
         view.set_content(Some(&page));
@@ -444,9 +473,19 @@ impl Win {
             .content_width(520)
             .child(&view)
             .build();
+        let ui = CompileUi {
+            dialog: dialog.clone(),
+            go: go.clone(),
+            cancel: cancel.clone(),
+        };
 
         let weak = Rc::downgrade(self);
-        let d = dialog.clone();
+        cancel.connect_clicked(move |cancel| {
+            let Some(win) = weak.upgrade() else { return };
+            win.stop_compile();
+            cancel.set_sensitive(false);
+        });
+        let weak = Rc::downgrade(self);
         go.connect_clicked(move |_| {
             let Some(win) = weak.upgrade() else { return };
             let fmt = Format::ALL[format.selected() as usize % Format::ALL.len()];
@@ -484,43 +523,449 @@ impl Win {
                 .modal(true)
                 .build();
             let weak = Rc::downgrade(&win);
-            let d = d.clone();
+            let ui = ui.clone();
             chooser.save(Some(&win.window), gio::Cancellable::NONE, move |res| {
                 let (Some(win), Ok(file)) = (weak.upgrade(), res) else {
                     return;
                 };
                 let Some(path) = file.path() else { return };
-                let bytes = {
-                    let p = win.project.borrow();
-                    let Some(p) = p.as_ref() else { return };
-                    compile::compile(p, &opts, fmt)
-                };
-                let result = bytes
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string()));
-                match result {
-                    Ok(()) => {
-                        d.close();
-                        let toast = adw::Toast::builder()
-                            .title(format!(
-                                "Compiled {}",
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ))
-                            .button_label("Open")
-                            .build();
-                        let uri = gio::File::for_path(&path).uri();
-                        toast.connect_button_clicked(move |_| {
-                            let _ = gio::AppInfo::launch_default_for_uri(
-                                &uri,
-                                gio::AppLaunchContext::NONE,
-                            );
-                        });
-                        win.toasts.add_toast(toast);
-                    }
-                    Err(e) => win.toast(&format!("Compile failed: {e}")),
-                }
+                win.compile_to(&ui, opts, fmt, path);
             });
         });
         dialog.present(Some(&self.window));
+    }
+
+    /// Gathers the manuscript here, on the thread that owns the project, so
+    /// edits made while the compile runs stay out of it. A worker renders
+    /// and writes that copy.
+    fn compile_to(self: &Rc<Self>, ui: &CompileUi, opts: Options, format: Format, path: PathBuf) {
+        if self.compiling.borrow().is_some() {
+            self.toast("A compile is already running");
+            return;
+        }
+        let sections = {
+            let p = self.project.borrow();
+            let Some(p) = p.as_ref() else { return };
+            compile::gather(p, &opts)
+        };
+        let sections = match sections {
+            Ok(sections) => sections,
+            Err(e) => {
+                self.toast(&format!("Compile failed: {e}"));
+                return;
+            }
+        };
+        let job = export::Job {
+            sections,
+            opts,
+            format,
+            path: path.clone(),
+        };
+        self.run_compile(ui, path, move |stop| export::run(job, stop));
+    }
+
+    /// Runs `work` on a worker thread and reports its result here, on the
+    /// main loop, which keeps running meanwhile. The dialog shows the
+    /// compile until then, and a second compile can't start.
+    fn run_compile(
+        self: &Rc<Self>,
+        ui: &CompileUi,
+        path: PathBuf,
+        work: impl FnOnce(&Stop) -> Result<Done, String> + Send + 'static,
+    ) {
+        let stop = Stop::default();
+        *self.compiling.borrow_mut() = Some(stop.clone());
+        ui.busy(true);
+        let worker = gio::spawn_blocking(move || work(&stop));
+        let weak = Rc::downgrade(self);
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let done = worker.await.unwrap_or_else(|panic| {
+                let why = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned());
+                Err(match why {
+                    Some(why) => format!("the compiler stopped: {why}"),
+                    None => "the compiler stopped".to_string(),
+                })
+            });
+            ui.busy(false);
+            let Some(win) = weak.upgrade() else { return };
+            *win.compiling.borrow_mut() = None;
+            match done {
+                Ok(Done::Written) => {
+                    // The user may have closed the dialog meanwhile.
+                    if ui.dialog.parent().is_some() {
+                        ui.dialog.close();
+                    }
+                    let toast = adw::Toast::builder()
+                        .title(format!(
+                            "Compiled {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ))
+                        .button_label("Open")
+                        .build();
+                    let uri = gio::File::for_path(&path).uri();
+                    toast.connect_button_clicked(move |_| {
+                        let _ =
+                            gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+                    });
+                    win.toasts.add_toast(toast);
+                }
+                Ok(Done::Stopped) => win.toast("Compile canceled"),
+                Err(e) => win.toast(&format!("Compile failed: {e}")),
+            }
+        });
+    }
+
+    /// Stops a running compile before it replaces its target, if it is not
+    /// too late.
+    pub(super) fn stop_compile(&self) {
+        if let Some(stop) = self.compiling.borrow().as_ref() {
+            stop.stop();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use omaquill::project::{Kind, Project};
+    use omaquill::rtf::RichText;
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    /// A temporary folder, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One paragraph of about `bytes` bytes of words.
+    fn paragraph(bytes: usize) -> String {
+        let words = [
+            "the",
+            "lighthouse",
+            "keeper",
+            "remembered",
+            "extraordinary",
+            "storms",
+            "and",
+            "unaccountable",
+            "silences",
+        ];
+        let mut text = String::new();
+        for word in words.iter().cycle() {
+            if text.len() >= bytes {
+                break;
+            }
+            text.push_str(word);
+            text.push(' ');
+        }
+        text
+    }
+
+    /// A window on a new project whose one chapter is `text`, with the
+    /// Compile dialog open. Returns the chapter's id too.
+    fn compile_window(tag: &str, text: &str) -> (Scratch, Rc<Win>, CompileUi, String) {
+        let dir =
+            std::env::temp_dir().join(format!("omaquill-compile-ui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch(dir);
+        let path = dir.0.join("Novel.scriv");
+        let mut project = Project::create(&path).unwrap();
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let chapter = project
+            .add_item(Kind::Text, "Chapter", &draft, None)
+            .unwrap();
+        project
+            .set_text(&chapter, &RichText::from_plain(text))
+            .unwrap();
+        project.save().unwrap();
+        drop(project);
+        let app = adw::Application::builder()
+            .application_id(format!("io.github.shieldsworks.Omaquill.Compile{tag}"))
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let win = Win::new(&app);
+        win.open_project(&path);
+        win.window.present();
+        win.show_compile();
+        let ui = dialog_ui(&win);
+        pump(Duration::from_millis(200));
+        (dir, win, ui, chapter)
+    }
+
+    /// The Compile dialog on show in `win`.
+    fn dialog_ui(win: &Win) -> CompileUi {
+        let dialog = win.window.visible_dialog().expect("the Compile dialog");
+        let button = |label: &str| {
+            let mut stack = vec![dialog.clone().upcast::<gtk::Widget>()];
+            while let Some(w) = stack.pop() {
+                if let Ok(b) = w.clone().downcast::<gtk::Button>()
+                    && b.label().as_deref() == Some(label)
+                {
+                    return b;
+                }
+                let mut child = w.first_child();
+                while let Some(c) = child {
+                    child = c.next_sibling();
+                    stack.push(c);
+                }
+            }
+            panic!("no {label} button in the Compile dialog");
+        };
+        CompileUi {
+            go: button("Compile…"),
+            cancel: button("Cancel"),
+            dialog,
+        }
+    }
+
+    /// Starts the compile of `path` the dialog would start, on a worker that
+    /// waits for a send on the returned channel first.
+    fn held_compile(
+        win: &Rc<Win>,
+        ui: &CompileUi,
+        format: Format,
+        path: &Path,
+    ) -> std::sync::mpsc::Sender<()> {
+        let opts = book(win);
+        let sections = compile::gather(win.project.borrow().as_ref().unwrap(), &opts).unwrap();
+        let job = export::Job {
+            sections,
+            opts,
+            format,
+            path: path.to_path_buf(),
+        };
+        let (start, wait) = std::sync::mpsc::channel();
+        win.run_compile(ui, path.to_path_buf(), move |stop| {
+            let _ = wait.recv();
+            export::run(job, stop)
+        });
+        start
+    }
+
+    /// Runs the main loop for `time`.
+    fn pump(time: Duration) {
+        let context = glib::MainContext::default();
+        let end = Instant::now() + time;
+        while Instant::now() < end {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Runs the main loop until `done` holds.
+    fn pump_until(done: impl Fn() -> bool) {
+        let context = glib::MainContext::default();
+        let end = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < end, "timed out");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Runs the main loop until the window's compile reports back.
+    fn finish(win: &Win) {
+        let context = glib::MainContext::default();
+        let end = Instant::now() + Duration::from_secs(120);
+        while win.compiling.borrow().is_some() {
+            assert!(Instant::now() < end, "the compile never reported back");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pump(Duration::from_millis(100));
+    }
+
+    fn book(win: &Win) -> Options {
+        Options {
+            manuscript: false,
+            ..Options::for_project(win.project.borrow().as_ref().unwrap())
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    pub fn a_compile_leaves_the_main_loop_running() {
+        let (dir, win, ui, _) = compile_window("Busy", &paragraph(150_000));
+        let target = dir.0.join("Out.pdf");
+        let ticks = Rc::new(RefCell::new(Vec::new()));
+        let tick = {
+            let ticks = Rc::clone(&ticks);
+            glib::timeout_add_local(Duration::from_millis(10), move || {
+                ticks.borrow_mut().push(Instant::now());
+                glib::ControlFlow::Continue
+            })
+        };
+        let started = Instant::now();
+        win.compile_to(&ui, book(&win), Format::Pdf, target.clone());
+        assert!(!ui.go.is_sensitive());
+        assert_eq!(ui.go.label().as_deref(), Some("Compiling…"));
+        assert!(ui.cancel.is_visible() && ui.cancel.is_sensitive());
+        // A second compile, from this dialog or a new one, does not start.
+        let second = dir.0.join("Second.md");
+        win.compile_to(&ui, book(&win), Format::Markdown, second.clone());
+        assert_eq!(
+            win.last_toast.borrow().as_str(),
+            "A compile is already running"
+        );
+        win.last_toast.borrow_mut().clear();
+        win.show_compile();
+        assert_eq!(
+            win.last_toast.borrow().as_str(),
+            "A compile is already running"
+        );
+        assert_eq!(win.window.visible_dialog().as_ref(), Some(&ui.dialog));
+        let context = glib::MainContext::default();
+        while win.compiling.borrow().is_some() {
+            assert!(started.elapsed() < Duration::from_secs(120));
+            context.iteration(true);
+        }
+        let took = started.elapsed();
+        tick.remove();
+        let ticks = ticks.borrow();
+        let mut gap = Duration::ZERO;
+        let mut last = started;
+        for &t in ticks.iter() {
+            gap = gap.max(t - last);
+            last = t;
+        }
+        eprintln!(
+            "compile of a 150 KB paragraph: {took:?}, {} main loop ticks, longest gap {gap:?}",
+            ticks.len()
+        );
+        assert!(
+            took >= Duration::from_millis(150),
+            "the compile took {took:?}, too quick to show the main loop running"
+        );
+        assert!(
+            gap < Duration::from_millis(100),
+            "the main loop stalled {gap:?}"
+        );
+        pump(Duration::from_millis(300));
+        assert!(std::fs::read(&target).unwrap().starts_with(b"%PDF-"));
+        assert!(!second.exists());
+        assert_eq!(names(&dir.0), ["Novel.scriv", "Out.pdf"]);
+        assert!(ui.go.is_sensitive());
+        assert_eq!(ui.go.label().as_deref(), Some("Compile…"));
+        assert!(!ui.cancel.is_visible());
+        assert!(
+            win.window.visible_dialog().is_none(),
+            "a finished compile closes the dialog"
+        );
+        win.window.close();
+        win.join_backup_reader();
+    }
+
+    pub fn cancel_and_closing_the_window_keep_the_target() {
+        let (dir, win, ui, _) = compile_window("Cancel", "a short chapter");
+        let target = dir.0.join("Out.pdf");
+        std::fs::write(&target, "the last good compile").unwrap();
+        let start = held_compile(&win, &ui, Format::Pdf, &target);
+        ui.cancel.emit_clicked();
+        assert!(!ui.cancel.is_sensitive());
+        assert!(
+            !ui.go.is_sensitive(),
+            "no new compile until the worker stops"
+        );
+        start.send(()).unwrap();
+        finish(&win);
+        assert_eq!(win.last_toast.borrow().as_str(), "Compile canceled");
+        assert_eq!(std::fs::read(&target).unwrap(), b"the last good compile");
+        assert_eq!(names(&dir.0), ["Novel.scriv", "Out.pdf"]);
+        assert!(ui.go.is_sensitive());
+        assert_eq!(win.window.visible_dialog().as_ref(), Some(&ui.dialog));
+
+        // Closing the dialog leaves the compile running; it still writes.
+        let other = dir.0.join("Other.pdf");
+        let start = held_compile(&win, &ui, Format::Pdf, &other);
+        ui.dialog.close();
+        pump_until(|| win.window.visible_dialog().is_none());
+        assert!(win.compiling.borrow().is_some());
+        start.send(()).unwrap();
+        finish(&win);
+        assert!(std::fs::read(&other).unwrap().starts_with(b"%PDF-"));
+
+        // Closing the window stops it. A window's close takes an open
+        // dialog first, so the dialog goes first here.
+        win.show_compile();
+        let ui = dialog_ui(&win);
+        pump(Duration::from_millis(200));
+        let start = held_compile(&win, &ui, Format::Pdf, &target);
+        ui.dialog.close();
+        pump_until(|| win.window.visible_dialog().is_none());
+        win.window.close();
+        pump_until(|| !win.window.is_visible());
+        assert!(win.compiling.borrow().is_some());
+        start.send(()).unwrap();
+        finish(&win);
+        assert_eq!(std::fs::read(&target).unwrap(), b"the last good compile");
+        assert_eq!(names(&dir.0), ["Novel.scriv", "Other.pdf", "Out.pdf"]);
+        win.join_backup_reader();
+    }
+
+    pub fn an_edit_during_a_compile_stays_out_of_it() {
+        let (dir, win, ui, chapter) = compile_window("Edit", &paragraph(150_000));
+        let opts = book(&win);
+        let target = dir.0.join("Out.txt");
+        let expected = {
+            let p = win.project.borrow();
+            compile::compile(p.as_ref().unwrap(), &opts, Format::PlainText).unwrap()
+        };
+        win.compile_to(&ui, opts, Format::PlainText, target.clone());
+        win.with_project(|p| {
+            p.set_text(&chapter, &RichText::from_plain("rewritten"))
+                .unwrap();
+            p.save().unwrap();
+        });
+        finish(&win);
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        win.window.close();
+        win.join_backup_reader();
+    }
+
+    pub fn a_failed_or_panicking_compile_is_reported() {
+        let (dir, win, ui, _) = compile_window("Fail", "a short chapter");
+        let missing = dir.0.join("no such folder").join("Out.docx");
+        win.compile_to(&ui, book(&win), Format::Docx, missing.clone());
+        finish(&win);
+        let toast = win.last_toast.borrow().clone();
+        assert!(
+            toast.starts_with("Compile failed: ") && toast.contains("No such file"),
+            "{toast}"
+        );
+        assert_eq!(win.window.visible_dialog().as_ref(), Some(&ui.dialog));
+        assert!(ui.go.is_sensitive());
+
+        win.run_compile(&ui, missing, |_| panic!("this test panics on purpose"));
+        finish(&win);
+        assert_eq!(
+            win.last_toast.borrow().as_str(),
+            "Compile failed: the compiler stopped: this test panics on purpose"
+        );
+        assert!(ui.go.is_sensitive());
+        assert_eq!(ui.go.label().as_deref(), Some("Compile…"));
+        // The window still compiles.
+        let target = dir.0.join("Out.md");
+        win.compile_to(&ui, book(&win), Format::Markdown, target.clone());
+        finish(&win);
+        assert!(target.exists());
+        win.window.close();
+        win.join_backup_reader();
     }
 }
