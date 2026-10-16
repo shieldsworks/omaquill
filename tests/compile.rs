@@ -598,6 +598,60 @@ fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
     }
 }
 
+/// A paperback paragraph of 88,000 bytes of long hyphenating words with
+/// a Hindi word every 400 bytes or so, every other one ending in a virama.
+/// Laid out alone, a stretch of it breaks some lines otherwise than the
+/// whole paragraph does, and setting those lines again from the
+/// paragraph's start took 6 s in a release build.
+#[test]
+fn a_pdf_of_a_long_paragraph_with_hindi_words_compiles_quickly() {
+    use omaquill::compile::Section;
+    use omaquill::rtf::{CharStyle, Paragraph, Run};
+    let words = "incomprehensibilities uncharacteristically internationalization \
+                 counterrevolutionaries electroencephalography";
+    let mut text = String::new();
+    while text.len() < 88_000 {
+        for word in words.split(' ') {
+            text.push_str(word);
+            text.push(' ');
+            match text.len() / 20 % 40 {
+                39 => text.push_str("\u{905}\u{930}\u{94d}\u{925}\u{93e}\u{924}\u{94d} "),
+                19 => text.push_str("\u{935}\u{93f}\u{926}\u{94d}\u{92f}\u{93e}\u{932}\u{92f} "),
+                _ => {}
+            }
+        }
+    }
+    let p = Paragraph {
+        runs: vec![Run {
+            text,
+            style: CharStyle {
+                font: Some("DejaVu Serif".into()),
+                size: 22,
+                ..Default::default()
+            },
+        }],
+        ..Default::default()
+    };
+    let o = Options {
+        title: "Hindi".into(),
+        author: String::new(),
+        manuscript: false,
+        headings: Headings::None,
+        scene_separator: "#".into(),
+    };
+    let section = Section {
+        heading: None,
+        scenes: vec![RichText {
+            paragraphs: vec![p],
+            lossy: Vec::new(),
+        }],
+    };
+    let started = std::time::Instant::now();
+    let bytes = omaquill::pdf::pdf(&[section], &o).unwrap();
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(started.elapsed().as_secs() < 4, "{:?}", started.elapsed());
+}
+
 /// A styled lead-in, then a plain run of long words with a tab after every
 /// seventh. Pango sizes a tab from the font of the first byte it lays out,
 /// so a stretch of the paragraph set again on its own must size tabs from

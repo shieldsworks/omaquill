@@ -574,26 +574,25 @@ struct Setting<'a> {
     indent: f64,
 }
 
-/// The lines a window is to set: from byte `from`, a line's start, in the
-/// Pango paragraph that starts at byte `paragraph` with base direction
-/// `direction`. Within `reach` bytes of the paragraph's start, the window
-/// lays the paragraph out from there.
-#[derive(Clone, Copy)]
-struct Opening {
-    paragraph: usize,
-    direction: pango::Direction,
-    from: usize,
-    reach: usize,
-}
+/// Bytes the cap of a paragraph lays out before it starts no more windows,
+/// over every window and every layout of the whole paragraph: this many
+/// times the paragraph's length, plus [`SPARE`].
+const BUDGET: usize = 16;
 
-/// How far the windows reach back for the lines of a paragraph: as far as
-/// they need, to the start of each Pango paragraph, or no windows, the
-/// whole paragraph laid out after each removal.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Reach {
-    Windows,
-    Paragraphs,
-    Whole,
+/// Bytes of a paragraph's budget besides [`BUDGET`] times its length, for
+/// the windows near a Pango paragraph's start, which lay out from there.
+const SPARE: usize = 64 * WINDOW;
+
+/// How the cap of a paragraph ended.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    /// No line ends a third hyphenated one in a row, after this many
+    /// rounds of windows.
+    Capped(usize),
+    /// The budget ran out. From the last line checked on, the lines are
+    /// drawn as the whole layout breaks them, with no more soft hyphens
+    /// taken out.
+    Stopped,
 }
 
 /// A window's layout and the lines it sets.
@@ -606,6 +605,8 @@ struct Window {
     /// at a paragraph delimiter before the paragraph's end.
     to: usize,
     ends: bool,
+    /// Bytes laid out to find it.
+    cost: usize,
 }
 
 impl Setting<'_> {
@@ -627,87 +628,106 @@ impl Setting<'_> {
     /// kept. One layout of the whole paragraph then draws it. Where its
     /// lines start as the kept ones do, each word lost its break points on
     /// the lines this layout has, as when the whole paragraph is laid out
-    /// again after each removal. Else, from the first line that ends
-    /// otherwise, the words that lost them there or later get them back,
-    /// and the windows set those lines again, each laid out from the start
-    /// of its Pango paragraph. Should those lines still start otherwise,
-    /// the whole paragraph is laid out again after each removal from there.
+    /// again after each removal. Else the words the windows took them out
+    /// of on the first line that ends otherwise, or later, get them back,
+    /// and windows set the lines from there again.
+    ///
+    /// The cap starts no window once what it has laid out comes within two
+    /// lengths of the paragraph of [`BUDGET`] times its length, plus
+    /// [`SPARE`], and then lays the whole paragraph out at most twice more.
+    /// A window lays out a few times its own bytes, so the work stays linear
+    /// in the length whatever the text. Where the budget runs out the cap
+    /// ends: the lines checked keep their removals, and the rest of the
+    /// paragraph is drawn as the whole layout breaks it.
     fn paragraph(&self, p: &Paragraph, texts: Vec<String>) -> pango::Layout {
-        self.capped(p, texts).0
+        let len: usize = texts.iter().map(String::len).sum();
+        self.capped(p, texts, BUDGET * len + SPARE).0
     }
 
-    /// [`Setting::paragraph`], and how far the windows had to reach back.
-    fn capped(&self, p: &Paragraph, texts: Vec<String>) -> (pango::Layout, Reach) {
+    /// [`Setting::paragraph`] within `budget` bytes laid out, and how the
+    /// cap ended.
+    fn capped(
+        &self,
+        p: &Paragraph,
+        texts: Vec<String>,
+        mut budget: usize,
+    ) -> (pango::Layout, Outcome) {
         let mut joined = Joined::new(texts);
-        let mut reach = Reach::Windows;
-        let mut kept: Option<Vec<usize>> = None;
+        let len = joined.text.len();
+        let mut rounds = 0;
+        let mut kept: Option<(Vec<usize>, bool, usize)> = None;
+        let mut stop = false;
         loop {
-            let slice = joined.slice(p, 0..joined.text.len(), None);
+            let slice = joined.slice(p, 0..len, None);
             let layout = self.lay_out(self.ctx, &slice);
+            budget = budget.saturating_sub(len);
+            if stop {
+                return (layout, Outcome::Stopped);
+            }
             let lines = layout.lines_readonly();
             let at = |line: &pango::LayoutLine| slice.src[line.start_index() as usize];
-            if let Some(kept) = kept.take() {
+            if let Some((kept, done, decided)) = kept.take() {
                 let same = lines
                     .iter()
                     .zip(&kept)
                     .take_while(|&(line, &start)| at(line) == start)
                     .count();
-                if same == lines.len() && same == kept.len() {
-                    return (layout, reach);
+                if same == kept.len() && (!done || same == lines.len()) {
+                    let outcome = if done {
+                        Outcome::Capped(rounds)
+                    } else {
+                        Outcome::Stopped
+                    };
+                    return (layout, outcome);
                 }
                 // Both start at byte 0, so the line before ends otherwise.
-                joined.restore(lines.get(same.saturating_sub(1)).map_or(0, at));
-                reach = match reach {
-                    Reach::Windows => Reach::Paragraphs,
-                    _ => Reach::Whole,
-                };
+                joined.restore(decided, lines.get(same.saturating_sub(1)).map_or(0, at));
+                stop = !done || budget < 2 * len;
                 continue;
             }
             let Err(line) = cap_lines(&lines, &slice.text, 0, |start, end| {
                 joined.unhyphenate_word(slice.src[start], slice.src[end])
             }) else {
-                return (layout, reach);
+                return (layout, Outcome::Capped(rounds));
             };
-            let reach = match reach {
-                Reach::Windows => REACH,
-                Reach::Paragraphs => usize::MAX,
-                Reach::Whole => continue,
-            };
+            rounds += 1;
+            let decided = joined.taken.len();
             let mut starts = lines[..line].iter().map(at).collect();
-            self.cap_from(p, &mut joined, &mut starts, at(&lines[line]), reach);
-            kept = Some(starts);
+            let done = self.cap_from(p, &mut joined, &mut starts, at(&lines[line]), &mut budget);
+            kept = Some((starts, done, decided));
         }
     }
 
     /// Caps the hyphenated lines of `joined` from byte `from`, the start of
     /// a line that just lost a word, so two hyphenated lines are before it.
     /// `starts` holds the start of every line before it, and gets the start
-    /// of every line after. Windows reach back as [`Opening::reach`] says.
+    /// of every line set after. Each window's bytes come out of `budget`,
+    /// which keeps two layouts of the whole paragraph: the check, and one
+    /// more should the check put soft hyphens back. False when the budget
+    /// ran out before the end.
     fn cap_from(
         &self,
         p: &Paragraph,
         joined: &mut Joined,
         starts: &mut Vec<usize>,
         mut from: usize,
-        reach: usize,
-    ) {
+        budget: &mut usize,
+    ) -> bool {
+        let len = joined.text.len();
         let directions = directions(&joined.text, self.ctx.base_dir());
         let mut run = MAX_HYPHENS_IN_A_ROW;
         let mut size = WINDOW;
-        while from < joined.text.len() {
-            let (paragraph, direction) =
-                directions[directions.partition_point(|&(s, _)| s <= from) - 1];
-            let opening = Opening {
-                paragraph,
-                direction,
-                from,
-                reach,
-            };
-            let window = self.window(p, joined, starts, opening, size);
+        while from < len {
+            if *budget < 2 * len {
+                return false;
+            }
+            let paragraph = directions[directions.partition_point(|&(s, _)| s <= from) - 1];
+            let window = self.window(p, joined, starts, paragraph, from, size);
+            *budget = budget.saturating_sub(window.cost);
             let lines = window.layout.lines_readonly();
             // Text past `to` could still move the last lines' breaks, and
             // a cut paragraph leaves an empty line after its delimiter.
-            let keep = if window.to == joined.text.len() {
+            let keep = if window.to == len {
                 lines.len()
             } else if window.ends {
                 lines.len() - 1
@@ -715,8 +735,8 @@ impl Setting<'_> {
                 lines.len().saturating_sub(2)
             };
             if keep <= window.first {
-                if window.to == joined.text.len() {
-                    return;
+                if window.to == len {
+                    return true;
                 }
                 size *= 2;
                 continue;
@@ -742,36 +762,35 @@ impl Setting<'_> {
             };
             starts.extend(done.iter().map(at));
         }
+        true
     }
 
-    /// The window that sets the lines `opening` asks for, about `size`
-    /// bytes of them. `starts` holds the start of every line before.
+    /// The window that sets the lines from byte `from`, a line's start, in
+    /// the Pango paragraph that starts at byte `paragraph.0` with base
+    /// direction `paragraph.1`: about `size` bytes of them. `starts` holds
+    /// the start of every line before.
     ///
     /// Pango lays out a paragraph line by line from its start, and some of
     /// what it works out holds for the rest of it: the width of a tab, from
     /// the font at the layout's first byte; the width of a hyphen, from the
     /// font where it first weighs a break at a soft hyphen; the direction
-    /// of the text, from the letters before. So within the reach a window
-    /// lays out the paragraph from its start. Further on it lays out the
-    /// text from a line at least [`CONTEXT`] bytes before `from`, after a
-    /// line separator in the style of the text's first byte for the tabs,
-    /// and serves only if it breaks every line before `from` where `starts`
-    /// has them; else it reaches further back, up to [`REACH`] bytes, and
-    /// then starts at `from`. [`Setting::paragraph`] checks what it sets.
+    /// of the text, from the letters before. So within [`REACH`] bytes of
+    /// the paragraph's start a window lays the paragraph out from there.
+    /// Further on it lays out the text from a line at least [`CONTEXT`]
+    /// bytes before `from`, after a line separator in the style of the
+    /// text's first byte for the tabs, and serves only if it breaks every
+    /// line before `from` where `starts` has them; else it reaches further
+    /// back, up to [`REACH`] bytes, and then starts at `from`.
+    /// [`Setting::paragraph`] checks what it sets.
     fn window(
         &self,
         p: &Paragraph,
         joined: &Joined,
         starts: &[usize],
-        opening: Opening,
+        (paragraph, direction): (usize, pango::Direction),
+        from: usize,
         size: usize,
     ) -> Window {
-        let Opening {
-            paragraph,
-            direction,
-            from,
-            reach,
-        } = opening;
         self.windows.set_base_dir(direction);
         let (to, ends) = joined.window_end(from, size);
         let lead = p
@@ -784,8 +803,9 @@ impl Setting<'_> {
             .nth(BEFORE_PARAGRAPH - 1)
             .map_or(0, |(i, _)| i);
         let mut back = CONTEXT;
+        let mut cost = 0;
         loop {
-            let start = if from - paragraph <= reach {
+            let start = if from - paragraph <= REACH {
                 paragraph
             } else {
                 match starts[..starts.partition_point(|&s| s + back <= from)].last() {
@@ -801,6 +821,7 @@ impl Setting<'_> {
             let lead = lead.filter(|_| range.start > 0);
             let lead_len = lead.map_or(0, |_| '\u{2028}'.len_utf8());
             let slice = joined.slice(p, range.clone(), lead);
+            cost += slice.text.len();
             let layout = self.lay_out(self.windows, &slice);
             layout.set_auto_dir(false);
             let lines = layout.lines_readonly();
@@ -818,30 +839,25 @@ impl Setting<'_> {
                 }
                 (expect.next() != Some(&s)).then_some(None)
             });
-            match first {
-                Some(Some(first)) => {
-                    return Window {
-                        slice,
-                        layout,
-                        first,
-                        to,
-                        ends,
-                    };
+            let first = match first {
+                Some(Some(first)) => first,
+                _ if start == from || start == paragraph => lines
+                    .iter()
+                    .position(|l| source(l).is_some_and(|s| s >= from))
+                    .unwrap_or(lines.len()),
+                _ => {
+                    back *= 4;
+                    continue;
                 }
-                _ if start == from || start == paragraph => {
-                    let first = lines
-                        .iter()
-                        .position(|l| source(l).is_some_and(|s| s >= from));
-                    return Window {
-                        slice,
-                        layout,
-                        first: first.unwrap_or(lines.len()),
-                        to,
-                        ends,
-                    };
-                }
-                _ => back *= 4,
-            }
+            };
+            return Window {
+                slice,
+                layout,
+                first,
+                to,
+                ends,
+                cost,
+            };
         }
     }
 }
@@ -1072,14 +1088,16 @@ impl Joined {
         any
     }
 
-    /// Puts back the soft hyphens taken out after lines from byte `line`
-    /// on lost a word.
-    fn restore(&mut self, line: usize) {
-        let gone = &mut self.gone;
-        self.taken.retain(|&(l, at)| {
-            gone[at] &= l < line;
-            l < line
-        });
+    /// Puts back the soft hyphens taken out after the first `decided`,
+    /// where lines from byte `line` on lost a word.
+    fn restore(&mut self, decided: usize, line: usize) {
+        for (l, at) in self.taken.split_off(decided) {
+            if l < line {
+                self.taken.push((l, at));
+            } else {
+                self.gone[at] = false;
+            }
+        }
     }
 }
 
@@ -1324,6 +1342,22 @@ mod tests {
     /// The cap as one loop over the whole paragraph: lay out, take the
     /// soft hyphens out of the word ending the first third hyphenated
     /// line, and lay out again.
+    /// The bytes of `text` whose soft hyphens `laid`, the same text with
+    /// some of them taken out, lacks.
+    fn removed(text: &str, laid: &str) -> Vec<usize> {
+        let mut laid = laid.chars().peekable();
+        text.char_indices()
+            .filter(|&(_, c)| {
+                let kept = laid.peek() == Some(&c);
+                if kept {
+                    laid.next();
+                }
+                !kept
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn capped_whole(s: &Setting, p: &Paragraph, texts: Vec<String>) -> (pango::Layout, usize) {
         let mut joined = Joined::new(texts);
         let mut rounds = 0;
@@ -1359,7 +1393,7 @@ mod tests {
     /// paragraph delimiter.
     fn marked() -> String {
         let words = LONG.split_whitespace().collect::<Vec<_>>().join(" \u{301}");
-        let paragraph = format!("{words} \u{301}").repeat(10);
+        let paragraph = format!("{words} \u{301}").repeat(40);
         format!("{paragraph}\r\n\u{301}{paragraph}\n\u{301}{paragraph}")
     }
 
@@ -1470,30 +1504,87 @@ mod tests {
                 );
                 let (whole, rounds) = capped_whole(&s, &p, texts.clone());
                 assert!(rounds > 3, "{name} at {width}: {rounds} rounds");
-                let (windowed, reach) = s.capped(&p, texts);
-                assert_eq!(reach, Reach::Windows, "{name} at {width}");
+                let budget = BUDGET * texts.concat().len() + SPARE;
+                let (windowed, outcome) = s.capped(&p, texts, budget);
+                assert_eq!(outcome, Outcome::Capped(1), "{name} at {width}");
                 assert_eq!(windowed.text(), whole.text(), "{name} at {width}");
                 assert_eq!(lines(&windowed), lines(&whole), "{name} at {width}");
             }
         }
     }
 
-    /// Lines the windows set where a layout of the whole paragraph breaks
-    /// them otherwise are set again, at last by laying out the whole
-    /// paragraph after each removal. Windows laid out at another resolution
+    /// Soft hyphens the windows took out on lines a layout of the whole
+    /// paragraph breaks otherwise are put back, and when the budget runs
+    /// out the paragraph keeps all its text, keeps only removals the whole
+    /// paragraph laid out again after each one also makes, and is drawn as
+    /// the whole layout breaks it. Windows laid out at another resolution
     /// break the lines otherwise.
     #[test]
-    fn lines_the_windows_set_wrong_are_set_again() {
+    fn a_paragraph_the_windows_set_wrong_keeps_its_text() {
         let (ctx, windows) = (context(), context());
         pangocairo::functions::context_set_resolution(&windows, 80.0);
         let s = setting(&ctx, &windows, 330.0, 16.0);
         let (p, texts) = prepared(&[&LONG.repeat(50)]);
-        let (whole, rounds) = capped_whole(&s, &p, texts.clone());
-        assert!(rounds > 3, "{rounds} rounds");
-        let (capped, reach) = s.capped(&p, texts);
-        assert_eq!(reach, Reach::Whole);
-        assert_eq!(capped.text(), whole.text());
+        let text = texts.concat();
+        let (drawn, outcome) = s.capped(&p, texts.clone(), BUDGET * text.len() + SPARE);
+        assert_eq!(outcome, Outcome::Stopped);
+        assert_eq!(
+            drawn.text().replace('\u{ad}', ""),
+            text.replace('\u{ad}', "")
+        );
+        let (whole, _) = capped_whole(&s, &p, texts.clone());
+        let kept = removed(&text, &drawn.text());
+        let all = removed(&text, &whole.text());
+        assert!(!kept.is_empty() && kept.iter().all(|i| all.contains(i)));
+        let fresh = layout(&ctx, &s.font, s.width, s.align, &drawn.text());
+        fresh.set_indent((s.indent * pango::SCALE as f64) as i32);
+        assert_eq!(lines(&drawn), lines(&fresh));
+    }
+
+    /// A paragraph whose budget runs out keeps all its text, keeps the
+    /// removals made before, and stops taking soft hyphens out.
+    #[test]
+    fn a_paragraph_out_of_budget_keeps_its_text() {
+        let (ctx, windows) = (context(), context());
+        let s = setting(&ctx, &windows, 330.0, 16.0);
+        let (p, texts) = prepared(&[&LONG.repeat(50)]);
+        let text = texts.concat();
+        let (whole, _) = capped_whole(&s, &p, texts.clone());
+        let all = removed(&text, &whole.text());
+        let mut counts = Vec::new();
+        for budget in [0, 4 * text.len(), 8 * text.len()] {
+            let (layout, outcome) = s.capped(&p, texts.clone(), budget);
+            assert_eq!(outcome, Outcome::Stopped, "budget {budget}");
+            let laid = layout.text();
+            assert_eq!(laid.replace('\u{ad}', ""), text.replace('\u{ad}', ""));
+            let kept = removed(&text, &laid);
+            assert!(kept.iter().all(|i| all.contains(i)), "budget {budget}");
+            counts.push(kept.len());
+        }
+        assert!(
+            0 < counts[0] && counts[0] < counts[1] && counts[1] < counts[2],
+            "{counts:?}"
+        );
+        let (capped, outcome) = s.capped(&p, texts, BUDGET * text.len() + SPARE);
+        assert!(matches!(outcome, Outcome::Capped(_)));
         assert_eq!(lines(&capped), lines(&whole));
+    }
+
+    /// Putting soft hyphens back leaves out the ones taken out first.
+    #[test]
+    fn restoring_keeps_the_soft_hyphens_taken_out_first() {
+        let text = "il\u{ad}lu\u{ad}mi\u{ad}nat\u{ad}ed con\u{ad}cen\u{ad}trat\u{ad}ed";
+        let mut joined = Joined::new(vec![text.into()]);
+        assert!(joined.unhyphenate_word(0, 2));
+        let first = joined.taken.len();
+        assert!(joined.unhyphenate_word(0, text.find("con").unwrap() + 3));
+        joined.restore(first, 0);
+        let left: String = text
+            .char_indices()
+            .filter(|&(i, _)| !joined.gone[i])
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(left, "illuminated con\u{ad}cen\u{ad}trat\u{ad}ed");
     }
 
     /// A window set for any line of a paragraph, from a line before it
@@ -1516,9 +1607,10 @@ mod tests {
             \u{5de}\u{5da}\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{5e2}\u{5d5}\u{5dc}\u{5dd}\u{5de}\u{5d4}\
             \u{5e9}\u{5dc}\u{5d5} \u{e32}\u{e20}\u{e32}\u{e29} \u{924}\u{94d}\u{94d}\u{937}\
             \u{924}\u{915}\u{915}";
+        let virama = [devanagari; 16].join(" ");
         cases.push(Case {
             name: "virama",
-            runs: vec![(devanagari, CharStyle::default())],
+            runs: vec![(&virama, CharStyle::default())],
             font: "monospace 13",
             settings: &[(354.0, 36.0)],
         });
@@ -1535,16 +1627,14 @@ mod tests {
                 let starts: Vec<usize> = lines.iter().map(|l| l.start_index() as usize).collect();
                 assert!(starts.len() > 3, "{name}: {} lines", starts.len());
                 let directions = directions(&joined.text, ctx.base_dir());
+                let mut tried = 0;
                 for (k, &from) in starts.iter().enumerate().skip(1) {
-                    let (paragraph, direction) =
-                        directions[directions.partition_point(|&(s, _)| s <= from) - 1];
-                    let opening = Opening {
-                        paragraph,
-                        direction,
-                        from,
-                        reach: 0,
-                    };
-                    let window = s.window(&p, &joined, &starts[..k], opening, WINDOW);
+                    let paragraph = directions[directions.partition_point(|&(s, _)| s <= from) - 1];
+                    if from - paragraph.0 <= REACH {
+                        continue;
+                    }
+                    tried += 1;
+                    let window = s.window(&p, &joined, &starts[..k], paragraph, from, WINDOW);
                     let kept: Vec<usize> = window.layout.lines_readonly()[window.first..]
                         .iter()
                         .map(|l| window.slice.src[l.start_index() as usize])
@@ -1560,6 +1650,7 @@ mod tests {
                         "{name} at {width}, window for line {k}"
                     );
                 }
+                assert!(tried > 0, "{name}: no line past the reach");
             }
         }
     }
