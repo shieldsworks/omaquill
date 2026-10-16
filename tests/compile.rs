@@ -598,6 +598,115 @@ fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
     }
 }
 
+/// A styled lead-in, then a plain run of long words with a tab after every
+/// seventh. Pango sizes a tab from the font of the first byte it lays out,
+/// so a stretch of the paragraph set again on its own must size tabs from
+/// the lead-in too, or its lines break elsewhere and the cap takes the
+/// soft hyphens out of the wrong words. The paperback keeps at most two
+/// hyphenated lines in a row. Lines are checked with pdftotext when
+/// installed.
+#[test]
+fn a_pdf_with_tabs_after_a_styled_lead_in_keeps_two_hyphenated_lines_at_most() {
+    use omaquill::compile::Section;
+    use omaquill::rtf::{CharStyle, Paragraph, Run, Script};
+    let words = [
+        "incomprehensibilities",
+        "uncharacteristically",
+        "internationalization",
+        "counterrevolutionaries",
+        "electroencephalography",
+    ];
+    let mut body = String::new();
+    for i in 0..400 {
+        body.push_str(words[i % words.len()]);
+        body.push(if i % 7 == 6 { '\t' } else { ' ' });
+    }
+    let leads = [
+        (
+            "DejaVu Serif",
+            CharStyle {
+                bold: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "EB Garamond",
+            CharStyle {
+                bold: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "P052",
+            CharStyle {
+                script: Script::Super,
+                ..Default::default()
+            },
+        ),
+    ];
+    for (font, lead) in leads {
+        let style = |s: CharStyle| CharStyle {
+            font: Some(font.to_string()),
+            size: 22,
+            ..s
+        };
+        let p = Paragraph {
+            runs: vec![
+                Run {
+                    text: "Lo ".into(),
+                    style: style(lead),
+                },
+                Run {
+                    text: body.clone(),
+                    style: style(CharStyle::default()),
+                },
+            ],
+            ..Default::default()
+        };
+        let text = RichText {
+            paragraphs: vec![p],
+            lossy: Vec::new(),
+        };
+        let o = Options {
+            title: "Tabs".into(),
+            author: String::new(),
+            manuscript: false,
+            headings: Headings::None,
+            scene_separator: "#".into(),
+        };
+        let section = Section {
+            heading: None,
+            scenes: vec![text],
+        };
+        let bytes = omaquill::pdf::pdf(&[section], &o).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        if !have("pdftotext") {
+            continue;
+        }
+        let dir = scratch(&format!("tabs-{}", font.replace(' ', "-")));
+        let file = dir.0.join("out.pdf");
+        std::fs::write(&file, &bytes).unwrap();
+        let out = Command::new("pdftotext")
+            .arg(&file)
+            .arg("-")
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let (mut run, mut most, mut hyphenated) = (0, 0, 0);
+        for line in text.lines() {
+            if line.trim_end().ends_with('\u{ad}') {
+                run += 1;
+                hyphenated += 1;
+                most = most.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert!(hyphenated > 20, "{font}: {hyphenated} hyphenated lines");
+        assert!(most <= 2, "{font}: {most} hyphenated lines in a row");
+    }
+}
+
 /// Both PDF layouts: a real PDF with the text, the right page size, the
 /// title and author set. Text is checked with pdftotext when installed.
 #[test]
