@@ -562,18 +562,26 @@ fn a_pdf_of_one_huge_word_compiles_quickly() {
 /// A paperback paragraph of 88,000 letters in long words that hyphenate
 /// at nearly every line end. Each word that would make a third hyphenated
 /// line in a row used to send the whole paragraph back through Pango:
-/// 18 s in a release build.
+/// 18 s in a release build. The five long words make third lines in a row
+/// in P052, which stands in for Palatino where installed; in DejaVu Serif
+/// the 45-letter words do.
 #[test]
 fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
     let words = "incomprehensibilities uncharacteristically internationalization \
                  counterrevolutionaries electroencephalography ";
     let text = words.repeat(800);
-    for (tag, text) in [
-        ("hyphenating", text.clone()),
-        ("hyphenated-word", "concentrated".repeat(10_000)),
+    for (tag, text, font) in [
+        ("hyphenating", text.clone(), None),
+        (
+            "45-letter-words",
+            "pneumonoultramicroscopicsilicovolcanoconiosis ".repeat(1_950),
+            Some("DejaVu Serif"),
+        ),
+        ("hyphenated-word", "concentrated".repeat(10_000), None),
         (
             "word-after-words",
             format!("{}{}", words.repeat(2), "concentrated".repeat(10_000)),
+            None,
         ),
     ] {
         let dir = scratch(tag);
@@ -581,7 +589,14 @@ fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
         let draft = p.root_folder(Kind::Draft).unwrap().uuid;
         let chapter = p.add_item(Kind::Folder, "Chapter", &draft, None).unwrap();
         let scene = p.add_item(Kind::Text, "Scene", &chapter, None).unwrap();
-        p.set_text(&scene, &RichText::from_plain(&text)).unwrap();
+        let mut text = RichText::from_plain(&text);
+        if let Some(font) = font {
+            assert_installed(font);
+            for run in text.paragraphs.iter_mut().flat_map(|p| p.runs.iter_mut()) {
+                run.style.font = Some(font.into());
+            }
+        }
+        p.set_text(&scene, &text).unwrap();
         p.save().unwrap();
         let o = Options {
             manuscript: false,
@@ -598,11 +613,29 @@ fn a_pdf_of_a_long_hyphenating_paragraph_compiles_quickly() {
     }
 }
 
+/// Checks that Pango finds `family` itself rather than another font in its
+/// place: where a test's lines break depends on the font's widths.
+fn assert_installed(family: &str) {
+    use pango::prelude::*;
+    let found = pangocairo::FontMap::default()
+        .create_context()
+        .load_font(&pango::FontDescription::from_string(family))
+        .and_then(|font| font.describe().family());
+    assert_eq!(
+        found.as_deref(),
+        Some(family),
+        "{family} is not installed: the test needs fonts-dejavu-core"
+    );
+}
+
 /// A paperback paragraph of 88,000 bytes of long hyphenating words with
 /// a Hindi word every 400 bytes or so, every other one ending in a virama.
-/// Laid out alone, a stretch of it breaks some lines otherwise than the
-/// whole paragraph does, and setting those lines again from the
-/// paragraph's start took 6 s in a release build.
+/// With Pango 1.56, a stretch of it laid out alone breaks some lines
+/// otherwise than the whole paragraph does, and setting those lines again
+/// from the paragraph's start took 6 s in a release build. With Pango 1.52
+/// the stretch breaks them as the whole paragraph does;
+/// `a_long_paragraph_the_windows_set_wrong_is_capped_quickly` in the pdf
+/// module covers every version.
 #[test]
 fn a_pdf_of_a_long_paragraph_with_hindi_words_compiles_quickly() {
     use omaquill::compile::Section;
@@ -646,6 +679,7 @@ fn a_pdf_of_a_long_paragraph_with_hindi_words_compiles_quickly() {
             lossy: Vec::new(),
         }],
     };
+    assert_installed("DejaVu Serif");
     let started = std::time::Instant::now();
     let bytes = omaquill::pdf::pdf(&[section], &o).unwrap();
     assert!(bytes.starts_with(b"%PDF-"));
@@ -684,14 +718,14 @@ fn a_pdf_with_tabs_after_a_styled_lead_in_keeps_two_hyphenated_lines_at_most() {
             },
         ),
         (
-            "EB Garamond",
+            "DejaVu Sans",
             CharStyle {
                 bold: true,
                 ..Default::default()
             },
         ),
         (
-            "P052",
+            "DejaVu Sans Mono",
             CharStyle {
                 script: Script::Super,
                 ..Default::default()
@@ -699,6 +733,7 @@ fn a_pdf_with_tabs_after_a_styled_lead_in_keeps_two_hyphenated_lines_at_most() {
         ),
     ];
     for (font, lead) in leads {
+        assert_installed(font);
         let style = |s: CharStyle| CharStyle {
             font: Some(font.to_string()),
             size: 22,

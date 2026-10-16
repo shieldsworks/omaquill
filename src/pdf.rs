@@ -1220,6 +1220,24 @@ mod tests {
         ctx
     }
 
+    /// `desc`, which names a DejaVu family, after checking that Pango
+    /// finds that family rather than another in its place. Where lines
+    /// break, and so whether a test's paragraph needs the cap at all,
+    /// depends on the font's widths, and the tests' widths are set for
+    /// DejaVu's. `serif` is DejaVu Serif on CI and another font elsewhere.
+    fn dejavu(desc: &str) -> pango::FontDescription {
+        let wanted = pango::FontDescription::from_string(desc);
+        let found = context()
+            .load_font(&wanted)
+            .and_then(|font| font.describe().family());
+        assert_eq!(
+            found.as_deref(),
+            wanted.family().as_deref(),
+            "{desc} is not installed: the tests need fonts-dejavu-core"
+        );
+        wanted
+    }
+
     fn setting<'a>(
         ctx: &'a pango::Context,
         windows: &'a pango::Context,
@@ -1229,7 +1247,7 @@ mod tests {
         Setting {
             ctx,
             windows,
-            font: pango::FontDescription::from_string("serif 11"),
+            font: dejavu("DejaVu Serif 11"),
             width,
             align: Align::Justify,
             indent,
@@ -1316,7 +1334,7 @@ mod tests {
         let base = words.repeat(6);
         let (p, texts) = prepared(&[&base]);
         let hyphens = texts[0].matches('\u{ad}').count();
-        let layout = setting(&ctx, &windows, 90.0, 0.0).paragraph(&p, texts);
+        let layout = setting(&ctx, &windows, 100.0, 0.0).paragraph(&p, texts);
         let text = layout.text();
         assert!(
             text.matches('\u{ad}').count() < hyphens,
@@ -1425,22 +1443,22 @@ mod tests {
                 settings: &[(330.0, 16.0), (468.0, 16.0)],
             },
             Case {
-                name: "tabs after bold, EB Garamond",
+                name: "tabs after bold, sans",
                 runs: lead(bold),
-                font: "EB Garamond 11",
+                font: "DejaVu Sans 11",
                 settings: &[(330.0, 16.0)],
             },
             Case {
                 name: "tabs after superscript",
                 runs: lead(sup),
-                font: "P052 11",
+                font: "DejaVu Sans Mono 11",
                 settings: &[(330.0, 16.0)],
             },
             Case {
                 name: "marks at line starts",
                 runs: bold_every_other(&[marked]),
-                font: "P052 11",
-                settings: &[(330.0, 16.0), (150.0, 0.0)],
+                font: "DejaVu Sans 11",
+                settings: &[(300.0, 16.0), (150.0, 0.0)],
             },
         ]
     }
@@ -1470,7 +1488,10 @@ mod tests {
         );
         let rtl = format!("שלום {}", format!("{long}שלום 😀. {long}").repeat(15));
         let split: Vec<&str> = english.split_inclusive("ties").collect();
-        let widths = &[(330.0, 16.0), (150.0, 0.0), (90.0, 0.0)];
+        // Thai and Japanese take their glyphs from whatever fonts are
+        // installed. At these widths every case needs the cap whether
+        // Noto's fonts draw them or no installed font does.
+        let widths = &[(250.0, 16.0), (150.0, 0.0), (100.0, 0.0)];
         let mut cases: Vec<Case> = [
             ("english", vec![english.as_str()]),
             ("runs", split),
@@ -1486,7 +1507,7 @@ mod tests {
         .map(|(name, runs)| Case {
             name,
             runs: bold_every_other(&runs),
-            font: "serif 11",
+            font: "DejaVu Serif 11",
             settings: widths,
         })
         .collect();
@@ -1496,14 +1517,17 @@ mod tests {
             let name = case.name;
             for &(width, indent) in case.settings {
                 let mut s = setting(&ctx, &windows, width, indent);
-                s.font = pango::FontDescription::from_string(case.font);
+                s.font = dejavu(case.font);
                 let (p, texts) = styled(&case.runs);
                 assert!(
                     texts.concat().len() > 3 * WINDOW,
                     "{name}: shorter than three windows"
                 );
                 let (whole, rounds) = capped_whole(&s, &p, texts.clone());
-                assert!(rounds > 3, "{name} at {width}: {rounds} rounds");
+                assert!(
+                    rounds > 3,
+                    "{name} at {width} needed the cap {rounds} times; the test needs more than 3"
+                );
                 let budget = BUDGET * texts.concat().len() + SPARE;
                 let (windowed, outcome) = s.capped(&p, texts, budget);
                 assert_eq!(outcome, Outcome::Capped(1), "{name} at {width}");
@@ -1523,7 +1547,7 @@ mod tests {
     fn a_paragraph_the_windows_set_wrong_keeps_its_text() {
         let (ctx, windows) = (context(), context());
         pangocairo::functions::context_set_resolution(&windows, 80.0);
-        let s = setting(&ctx, &windows, 330.0, 16.0);
+        let s = setting(&ctx, &windows, 300.0, 16.0);
         let (p, texts) = prepared(&[&LONG.repeat(50)]);
         let text = texts.concat();
         let (drawn, outcome) = s.capped(&p, texts.clone(), BUDGET * text.len() + SPARE);
@@ -1541,12 +1565,29 @@ mod tests {
         assert_eq!(lines(&drawn), lines(&fresh));
     }
 
+    /// A paragraph of 90 KB whose windows set lines wrong in every round
+    /// is capped in time linear in its length. Which lines the windows of
+    /// a real paragraph set wrong depends on the Pango version and fonts;
+    /// windows at another resolution set them wrong everywhere.
+    #[test]
+    fn a_long_paragraph_the_windows_set_wrong_is_capped_quickly() {
+        let (ctx, windows) = (context(), context());
+        pangocairo::functions::context_set_resolution(&windows, 80.0);
+        let s = setting(&ctx, &windows, 300.0, 16.0);
+        let (p, texts) = prepared(&[&LONG.repeat(800)]);
+        let budget = BUDGET * texts.concat().len() + SPARE;
+        let started = std::time::Instant::now();
+        let (_, outcome) = s.capped(&p, texts, budget);
+        assert_eq!(outcome, Outcome::Stopped);
+        assert!(started.elapsed().as_secs() < 4, "{:?}", started.elapsed());
+    }
+
     /// A paragraph whose budget runs out keeps all its text, keeps the
     /// removals made before, and stops taking soft hyphens out.
     #[test]
     fn a_paragraph_out_of_budget_keeps_its_text() {
         let (ctx, windows) = (context(), context());
-        let s = setting(&ctx, &windows, 330.0, 16.0);
+        let s = setting(&ctx, &windows, 300.0, 16.0);
         let (p, texts) = prepared(&[&LONG.repeat(50)]);
         let text = texts.concat();
         let (whole, _) = capped_whole(&s, &p, texts.clone());
@@ -1611,14 +1652,14 @@ mod tests {
         cases.push(Case {
             name: "virama",
             runs: vec![(&virama, CharStyle::default())],
-            font: "monospace 13",
+            font: "DejaVu Sans Mono 13",
             settings: &[(354.0, 36.0)],
         });
         for case in &cases {
             let name = case.name;
             for &(width, indent) in case.settings {
                 let mut s = setting(&ctx, &windows, width, indent);
-                s.font = pango::FontDescription::from_string(case.font);
+                s.font = dejavu(case.font);
                 let (p, texts) = styled(&case.runs);
                 let joined = Joined::new(texts);
                 let slice = joined.slice(&p, 0..joined.text.len(), None);
