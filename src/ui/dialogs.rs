@@ -801,9 +801,14 @@ pub(super) mod tests {
         names
     }
 
-    pub fn a_compile_leaves_the_main_loop_running() {
-        let (dir, win, ui, _) = compile_window("Busy", &paragraph(150_000));
-        let target = dir.0.join("Out.pdf");
+    /// The longest the main loop may go without running a 10 ms timeout while
+    /// a compile runs.
+    const STALL: Duration = Duration::from_millis(100);
+
+    /// Calls `start`, which starts a compile in `win`, and runs the main loop
+    /// until the compile reports back. Returns how long that took and the
+    /// longest the main loop went without running a 10 ms timeout meanwhile.
+    fn longest_gap(win: &Win, start: impl FnOnce()) -> (Duration, Duration) {
         let ticks = Rc::new(RefCell::new(Vec::new()));
         let tick = {
             let ticks = Rc::clone(&ticks);
@@ -813,24 +818,7 @@ pub(super) mod tests {
             })
         };
         let started = Instant::now();
-        win.compile_to(&ui, book(&win), Format::Pdf, target.clone());
-        assert!(!ui.go.is_sensitive());
-        assert_eq!(ui.go.label().as_deref(), Some("Compiling…"));
-        assert!(ui.cancel.is_visible() && ui.cancel.is_sensitive());
-        // A second compile, from this dialog or a new one, does not start.
-        let second = dir.0.join("Second.md");
-        win.compile_to(&ui, book(&win), Format::Markdown, second.clone());
-        assert_eq!(
-            win.last_toast.borrow().as_str(),
-            "A compile is already running"
-        );
-        win.last_toast.borrow_mut().clear();
-        win.show_compile();
-        assert_eq!(
-            win.last_toast.borrow().as_str(),
-            "A compile is already running"
-        );
-        assert_eq!(win.window.visible_dialog().as_ref(), Some(&ui.dialog));
+        start();
         let context = glib::MainContext::default();
         while win.compiling.borrow().is_some() {
             assert!(started.elapsed() < Duration::from_secs(120));
@@ -838,25 +826,71 @@ pub(super) mod tests {
         }
         let took = started.elapsed();
         tick.remove();
-        let ticks = ticks.borrow();
         let mut gap = Duration::ZERO;
         let mut last = started;
-        for &t in ticks.iter() {
+        for &t in ticks.borrow().iter() {
             gap = gap.max(t - last);
             last = t;
         }
+        (took, gap)
+    }
+
+    pub fn a_compile_leaves_the_main_loop_running() {
+        let (dir, win, ui, _) = compile_window("Busy", &paragraph(150_000));
+        let target = dir.0.join("Out.pdf");
+        // Under xvfb GTK draws through Mesa's llvmpipe, which compiles the
+        // shaders for each drawing state it has not met on the main thread,
+        // in gsk_renderer_render. With an empty shader cache, as on a new CI
+        // runner, that holds the main loop for 250-390 ms the first time the
+        // busy dialog is drawn and up to 210 ms the second time, whatever the
+        // worker does. Workers that only sleep take the dialog through the
+        // same states without touching Pango, until one of them leaves the
+        // main loop under the limit. The compile measured after that draws
+        // only the states the workers drew, so its gap is the compile's own.
+        let mut quiet = None;
+        for _ in 0..6 {
+            let (_, gap) = longest_gap(&win, || {
+                win.run_compile(&ui, target.clone(), |_| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    Ok(Done::Stopped)
+                });
+            });
+            eprintln!("a worker that sleeps 300 ms: longest gap {gap:?}");
+            if gap < STALL {
+                quiet = Some(gap);
+                break;
+            }
+        }
+        let quiet = quiet.expect("the main loop stalls with a worker that only sleeps");
+        let second = dir.0.join("Second.md");
+        let (took, gap) = longest_gap(&win, || {
+            win.compile_to(&ui, book(&win), Format::Pdf, target.clone());
+            assert!(!ui.go.is_sensitive());
+            assert_eq!(ui.go.label().as_deref(), Some("Compiling…"));
+            assert!(ui.cancel.is_visible() && ui.cancel.is_sensitive());
+            // A second compile, from this dialog or a new one, does not start.
+            win.compile_to(&ui, book(&win), Format::Markdown, second.clone());
+            assert_eq!(
+                win.last_toast.borrow().as_str(),
+                "A compile is already running"
+            );
+            win.last_toast.borrow_mut().clear();
+            win.show_compile();
+            assert_eq!(
+                win.last_toast.borrow().as_str(),
+                "A compile is already running"
+            );
+            assert_eq!(win.window.visible_dialog().as_ref(), Some(&ui.dialog));
+        });
         eprintln!(
-            "compile of a 150 KB paragraph: {took:?}, {} main loop ticks, longest gap {gap:?}",
-            ticks.len()
+            "compile of a 150 KB paragraph: {took:?}, longest gap {gap:?} \
+             against {quiet:?} with a worker that sleeps"
         );
         assert!(
             took >= Duration::from_millis(150),
             "the compile took {took:?}, too quick to show the main loop running"
         );
-        assert!(
-            gap < Duration::from_millis(100),
-            "the main loop stalled {gap:?}"
-        );
+        assert!(gap < STALL, "the main loop stalled {gap:?}");
         pump(Duration::from_millis(300));
         assert!(std::fs::read(&target).unwrap().starts_with(b"%PDF-"));
         assert!(!second.exists());
