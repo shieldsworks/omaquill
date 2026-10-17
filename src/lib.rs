@@ -11,6 +11,7 @@ pub mod project;
 pub mod replace;
 pub mod rtf;
 pub mod sha1;
+mod snapshot;
 pub mod spell;
 pub mod state;
 pub mod xml;

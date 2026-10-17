@@ -170,16 +170,21 @@ pub fn run() -> glib::ExitCode {
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         let app = app.clone();
         glib_unix::unix_signal_add_local(signal, move || {
-            // Closing saves; a window whose save fails stays open with its
-            // "Changes Not Saved" question rather than quitting over it.
-            for w in app.windows() {
-                w.close();
-            }
+            close_every_window(&app);
             glib::ControlFlow::Break
         });
     }
     let _keep = theme;
     app.run()
+}
+
+/// Closes `app`'s windows as their close buttons would. Closing saves; a
+/// window whose save fails stays open with its "Changes Not Saved" question
+/// rather than quitting over it.
+fn close_every_window(app: &impl IsA<gtk::Application>) {
+    for w in app.windows() {
+        w.close();
+    }
 }
 
 /// A `.scrivx` inside a project opens the project.
@@ -2406,6 +2411,7 @@ fn gtk_checks() {
     a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
     dialogs::tests::a_compile_leaves_the_main_loop_running();
     dialogs::tests::cancel_and_closing_the_window_keep_the_target();
+    dialogs::tests::closing_every_window_waits_for_the_compile_to_finish();
     dialogs::tests::an_edit_during_a_compile_stays_out_of_it();
     dialogs::tests::a_failed_or_panicking_compile_is_reported();
     rich::tests::buffer_round_trip();

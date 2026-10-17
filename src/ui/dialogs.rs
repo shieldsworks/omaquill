@@ -561,7 +561,8 @@ impl Win {
             format,
             path: path.clone(),
         };
-        self.run_compile(ui, path, move |stop| export::run(job, stop));
+        let renderer = renderer();
+        self.run_compile(ui, path, move |stop| export::run(job, stop, &renderer));
     }
 
     /// Runs `work` on a worker thread and reports its result here, on the
@@ -576,10 +577,15 @@ impl Win {
         let stop = Stop::default();
         *self.compiling.borrow_mut() = Some(stop.clone());
         ui.busy(true);
+        // Closing the last window, as logout's SIGTERM does, stops the
+        // compile; the app runs on until the worker has put the target back
+        // as it was or replaced it whole.
+        let hold = self.window.application().map(|app| app.hold());
         let worker = gio::spawn_blocking(move || work(&stop));
         let weak = Rc::downgrade(self);
         let ui = ui.clone();
         glib::spawn_future_local(async move {
+            let _hold = hold;
             let done = worker.await.unwrap_or_else(|panic| {
                 let why = panic
                     .downcast_ref::<&str>()
@@ -626,6 +632,25 @@ impl Win {
             stop.stop();
         }
     }
+}
+
+/// The program that renders PDFs: this one, as the kernel holds it, so a
+/// package upgrade that replaces the file on disk does not change it.
+#[cfg(not(test))]
+fn renderer() -> PathBuf {
+    PathBuf::from("/proc/self/exe")
+}
+
+/// The tests run in libtest's program. Cargo builds omaquill's own next to
+/// it, a folder up, for the tests in `tests/`.
+#[cfg(test)]
+fn renderer() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test program's path");
+    let folder = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a target folder");
+    folder.join("omaquill")
 }
 
 #[cfg(test)]
@@ -747,7 +772,7 @@ pub(super) mod tests {
         let (start, wait) = std::sync::mpsc::channel();
         win.run_compile(ui, path.to_path_buf(), move |stop| {
             let _ = wait.recv();
-            export::run(job, stop)
+            export::run(job, stop, &renderer())
         });
         start
     }
@@ -950,6 +975,34 @@ pub(super) mod tests {
         finish(&win);
         assert_eq!(std::fs::read(&target).unwrap(), b"the last good compile");
         assert_eq!(names(&dir.0), ["Novel.scriv", "Other.pdf", "Out.pdf"]);
+        win.join_backup_reader();
+    }
+
+    pub fn closing_every_window_waits_for_the_compile_to_finish() {
+        let (dir, win, ui, _) = compile_window("Quit", "a short chapter");
+        let target = dir.0.join("Out.pdf");
+        std::fs::write(&target, "the last good compile").unwrap();
+        ui.dialog.close();
+        pump_until(|| win.window.visible_dialog().is_none());
+        let start = held_compile(&win, &ui, Format::Pdf, &target);
+        let app = win.window.application().unwrap();
+        app.connect_activate(|_| {});
+        // As at logout: SIGTERM closes every window, then the worker gets
+        // to the target.
+        glib::idle_add_local_once({
+            let app = app.clone();
+            move || super::super::close_every_window(&app)
+        });
+        glib::timeout_add_local_once(Duration::from_millis(300), move || {
+            start.send(()).unwrap();
+        });
+        app.run_with_args::<&str>(&[]);
+        assert!(
+            win.compiling.borrow().is_none(),
+            "the app stopped before its compile reported back"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"the last good compile");
+        assert_eq!(names(&dir.0), ["Novel.scriv", "Out.pdf"]);
         win.join_backup_reader();
     }
 
