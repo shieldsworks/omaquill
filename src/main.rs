@@ -13,6 +13,7 @@
 mod ui;
 
 use omaquill::compile::{self, Format, Options};
+use omaquill::export;
 use omaquill::project::{Item, Kind, Project};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,11 @@ fn main() -> ExitCode {
         }
         Some("check") => cli(check(&args[2..])),
         Some("compile") => cli(compile_cli(&args[2..])),
+        // The window's PDF compiles run here, a process each.
+        Some(export::RENDER_PDF) => cli(export::serve_render(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+        )),
         _ => {
             let code = ui::run();
             if code == gtk::glib::ExitCode::SUCCESS {

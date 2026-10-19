@@ -7,7 +7,8 @@
 //! when those are installed.
 
 use omaquill::compile::{self, Format, Headings, Options};
-use omaquill::project::{Kind, Project};
+use omaquill::export::{self, Done, Job, Stop};
+use omaquill::project::{self, Kind, Project};
 use omaquill::rtf::{self, RichText};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -855,4 +856,338 @@ fn pdf_manuscript_and_book() {
             assert!(squashed.contains("about 100 words"), "{squashed}");
         }
     }
+}
+
+// ------------------------------------------------------- off the main thread
+
+/// File names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// omaquill's program, which renders the PDFs [`export::run`] writes.
+fn renderer() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_omaquill"))
+}
+
+fn job(p: &Project, opts: &Options, format: Format, path: &Path) -> Job {
+    Job {
+        sections: compile::gather(p, opts).unwrap(),
+        opts: opts.clone(),
+        format,
+        path: path.to_path_buf(),
+    }
+}
+
+/// What `n` threads write when each runs the same job at once.
+fn on_workers(p: &Project, opts: &Options, format: Format, dir: &Path, n: usize) -> Vec<Vec<u8>> {
+    let workers: Vec<_> = (0..n)
+        .map(|i| {
+            let path = dir.join(format!("worker{i}.{}", format.extension()));
+            let job = job(p, opts, format, &path);
+            std::thread::spawn(move || {
+                assert_eq!(
+                    export::run(job, &Stop::default(), renderer()),
+                    Ok(Done::Written)
+                );
+                std::fs::read(path).unwrap()
+            })
+        })
+        .collect();
+    workers.into_iter().map(|w| w.join().unwrap()).collect()
+}
+
+#[test]
+fn every_format_compiles_the_same_bytes_on_worker_threads() {
+    let p = fixture();
+    let dir = scratch("workers");
+    for manuscript in [true, false] {
+        let opts = Options {
+            manuscript,
+            ..opts(&p)
+        };
+        for format in Format::ALL {
+            // DOCX, EPUB and PDF carry the time to the second. Equal
+            // compiles on this thread before and after the workers show
+            // that the second did not change while they ran.
+            let attempt = (0..5).find_map(|_| {
+                let before = compile::compile(&p, &opts, format).unwrap();
+                let workers = on_workers(&p, &opts, format, &dir.0, 3);
+                let after = compile::compile(&p, &opts, format).unwrap();
+                (before == after).then_some((before, workers))
+            });
+            let (here, workers) = attempt.expect("the clock ticked during every attempt");
+            for bytes in workers {
+                assert!(
+                    bytes == here,
+                    "{format:?} (manuscript {manuscript}) differs on a worker thread"
+                );
+            }
+        }
+    }
+}
+
+/// The streams of a PDF that cairo wrote, in order, less the last two: the
+/// object stream that holds the document information, with the time of the
+/// compile to the second, and the cross-reference stream, whose offsets
+/// move when that one's compressed length does.
+fn timeless(pdf: &[u8]) -> Vec<&[u8]> {
+    let find = |from: usize, what: &[u8]| {
+        pdf[from..]
+            .windows(what.len())
+            .position(|w| w == what)
+            .map(|at| from + at)
+    };
+    let mut streams = Vec::new();
+    let mut at = 0;
+    while let Some(start) = find(at, b">>\nstream\n") {
+        let end = find(start, b"endstream").expect("an unterminated stream");
+        streams.push(start..end);
+        at = end;
+    }
+    let last = streams.pop().expect("a PDF without streams");
+    let dict = &pdf[last.start.saturating_sub(300)..last.start];
+    assert!(
+        dict.windows(11).any(|w| w == b"/Type /XRef"),
+        "the last stream is not the cross-reference stream"
+    );
+    streams.pop();
+    streams.into_iter().map(|r| &pdf[r]).collect()
+}
+
+/// 400 paragraphs in DejaVu Sans, 110 pages of a paperback.
+fn long_manuscript() -> Vec<compile::Section> {
+    let words = "The keeper wrote in the log, uncharacteristically, that the storm had passed over the headland. ";
+    let style = rtf::CharStyle {
+        font: Some("DejaVu Sans".to_string()),
+        ..rtf::CharStyle::default()
+    };
+    let paragraphs = (0..400)
+        .map(|_| rtf::Paragraph {
+            runs: vec![rtf::Run {
+                text: words.repeat(6),
+                style: style.clone(),
+            }],
+            ..rtf::Paragraph::default()
+        })
+        .collect();
+    vec![compile::Section {
+        heading: Some("One".to_string()),
+        scenes: vec![RichText {
+            paragraphs,
+            lossy: Vec::new(),
+        }],
+    }]
+}
+
+/// Two windows can compile at once. Cairo's FreeType faces are shared by
+/// every thread in a process, and PDFs rendered at once on two threads of
+/// one process set some lines with other spaces than a PDF rendered alone.
+#[test]
+fn pdf_exports_at_once_each_write_what_one_alone_writes() {
+    assert_installed("DejaVu Sans");
+    let dir = scratch("at-once");
+    let opts = Options {
+        title: "T".to_string(),
+        author: String::new(),
+        manuscript: false,
+        headings: Headings::None,
+        scene_separator: "#".to_string(),
+    };
+    let alone = compile::render(&long_manuscript(), &opts, Format::Pdf).unwrap();
+    let alone = timeless(&alone);
+    assert!(alone.len() > 200, "{} streams", alone.len());
+    for round in 0..3 {
+        let workers: Vec<_> = (0..3)
+            .map(|i| {
+                let path = dir.0.join(format!("{round}-{i}.pdf"));
+                let job = Job {
+                    sections: long_manuscript(),
+                    opts: opts.clone(),
+                    format: Format::Pdf,
+                    path: path.clone(),
+                };
+                std::thread::spawn(move || {
+                    assert_eq!(
+                        export::run(job, &Stop::default(), renderer()),
+                        Ok(Done::Written)
+                    );
+                    std::fs::read(path).unwrap()
+                })
+            })
+            .collect();
+        for (i, worker) in workers.into_iter().enumerate() {
+            let bytes = worker.join().unwrap();
+            let streams = timeless(&bytes);
+            let differ = streams.iter().zip(&alone).filter(|(a, b)| a != b).count();
+            assert!(
+                streams.len() == alone.len() && differ == 0,
+                "round {round}, export {i}: {differ} of {} streams differ from a PDF rendered alone",
+                alone.len()
+            );
+        }
+    }
+}
+
+/// An executable `dir/name` that runs `script` in sh, standing in for the
+/// PDF renderer. A child sh writes it, so no thread of this process holds
+/// it open for writing when another test's fork copies the descriptors,
+/// which would make running it fail with ETXTBSY.
+fn fake_renderer(dir: &Path, name: &str, script: &str) -> PathBuf {
+    let path = dir.join(name);
+    let made = Command::new("sh")
+        .arg("-c")
+        .arg("printf '#!/bin/sh\\n%s\\n' \"$1\" > \"$2\" && chmod +x \"$2\"")
+        .arg("sh")
+        .arg(script)
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    path
+}
+
+#[test]
+fn a_pdf_export_reports_what_went_wrong_in_its_renderer() {
+    let p = fixture();
+    let dir = scratch("renderer");
+    let opts = opts(&p);
+    let path = dir.0.join("Out.pdf");
+    std::fs::write(&path, "the last good compile").unwrap();
+    let pdf = || job(&p, &opts, Format::Pdf, &path);
+    let missing = dir.0.join("no renderer");
+    let err = export::run(pdf(), &Stop::default(), &missing).unwrap_err();
+    assert!(
+        err.starts_with("couldn't start the PDF renderer: "),
+        "{err}"
+    );
+    let failing = fake_renderer(
+        &dir.0,
+        "failing",
+        "cat > /dev/null; echo 'omaquill: out of paper' >&2; exit 1",
+    );
+    let err = export::run(pdf(), &Stop::default(), &failing).unwrap_err();
+    assert_eq!(err, "out of paper");
+    // A renderer that crashes takes nothing else down with it.
+    let crashing = fake_renderer(&dir.0, "crashing", "kill -SEGV $$");
+    let err = export::run(pdf(), &Stop::default(), &crashing).unwrap_err();
+    assert!(err.contains("SIGSEGV"), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+    // Only a PDF needs the renderer.
+    let md = dir.0.join("Out.md");
+    let done = export::run(
+        job(&p, &opts, Format::Markdown, &md),
+        &Stop::default(),
+        &missing,
+    );
+    assert_eq!(done, Ok(Done::Written));
+    assert_eq!(names(&dir.0), ["Out.md", "Out.pdf", "crashing", "failing"]);
+}
+
+#[test]
+fn a_stop_ends_the_pdf_renderer_and_keeps_the_target() {
+    let p = fixture();
+    let dir = scratch("renderer-stop");
+    let opts = opts(&p);
+    let path = dir.0.join("Out.pdf");
+    std::fs::write(&path, "the last good compile").unwrap();
+    let slow = fake_renderer(&dir.0, "slow", "exec sleep 60");
+    let stop = Stop::default();
+    let worker = {
+        let (job, stop) = (job(&p, &opts, Format::Pdf, &path), stop.clone());
+        std::thread::spawn(move || export::run(job, &stop, &slow))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let stopped = std::time::Instant::now();
+    assert!(stop.stop());
+    assert_eq!(worker.join().unwrap(), Ok(Done::Stopped));
+    assert!(
+        stopped.elapsed() < std::time::Duration::from_secs(5),
+        "the renderer outlived its stop by {:?}",
+        stopped.elapsed()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+    assert_eq!(names(&dir.0), ["Out.pdf", "slow"]);
+}
+
+#[test]
+fn an_export_replaces_its_target_whole() {
+    let p = fixture();
+    let dir = scratch("export-replace");
+    let opts = opts(&p);
+    let path = dir.0.join("Out.md");
+    std::fs::write(&path, "an older and much longer compile ".repeat(1_000)).unwrap();
+    let stop = Stop::default();
+    let done = export::run(job(&p, &opts, Format::Markdown, &path), &stop, renderer());
+    assert_eq!(done, Ok(Done::Written));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        compile::compile(&p, &opts, Format::Markdown).unwrap()
+    );
+    assert!(
+        !stop.stop(),
+        "a stop after the rename reports it came too late"
+    );
+    assert_eq!(names(&dir.0), ["Out.md"]);
+}
+
+#[test]
+fn a_stopped_export_leaves_its_target() {
+    let p = fixture();
+    let dir = scratch("export-stop");
+    let opts = opts(&p);
+    let path = dir.0.join("Out.pdf");
+    std::fs::write(&path, "the last good compile").unwrap();
+    let stop = Stop::default();
+    assert!(stop.stop());
+    assert!(stop.stop(), "a second stop still reports the target kept");
+    let done = export::run(job(&p, &opts, Format::Pdf, &path), &stop, renderer());
+    assert_eq!(done, Ok(Done::Stopped));
+    assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+    assert_eq!(names(&dir.0), ["Out.pdf"]);
+    // A stop that lands after the bytes are on disk, just before the
+    // rename: the whole new file sits beside the target, and is removed.
+    let kept = project::write_atomic_if(&path, b"the new compile", || {
+        assert_eq!(names(&dir.0).len(), 2, "{:?}", names(&dir.0));
+        assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+        false
+    })
+    .unwrap();
+    assert!(!kept);
+    assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
+    assert_eq!(names(&dir.0), ["Out.pdf"]);
+}
+
+#[test]
+fn an_export_that_cannot_write_reports_why_and_leaves_nothing() {
+    let p = fixture();
+    let dir = scratch("export-unwritable");
+    let opts = opts(&p);
+    let missing = dir.0.join("no such folder").join("Out.txt");
+    let err = export::run(
+        job(&p, &opts, Format::PlainText, &missing),
+        &Stop::default(),
+        renderer(),
+    )
+    .unwrap_err();
+    assert!(err.contains("No such file or directory"), "{err}");
+    // A folder where the file would go: the rename fails, and the folder
+    // keeps what it holds.
+    let folder = dir.0.join("Out.rtf");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "kept").unwrap();
+    let err = export::run(
+        job(&p, &opts, Format::Rtf, &folder),
+        &Stop::default(),
+        renderer(),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty());
+    assert_eq!(names(&dir.0), ["Out.rtf"]);
+    assert_eq!(names(&folder), ["keep.txt"]);
 }

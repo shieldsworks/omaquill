@@ -20,6 +20,7 @@ mod theme;
 use adw::prelude::*;
 use editor::Editor;
 use gtk::{gio, glib};
+use omaquill::export;
 use omaquill::project::{Item, Kind, Project};
 use omaquill::rtf;
 use omaquill::state::{ProjectView, Settings, Today};
@@ -56,6 +57,8 @@ pub struct Win {
     /// one document's words into another.
     editor_uuid: RefCell<Option<String>>,
     last_toast: RefCell<String>,
+    /// Set while a compile runs on a worker. Stopping it keeps its target.
+    compiling: RefCell<Option<export::Stop>>,
     dirty_text: Cell<bool>,
     backup_job: RefCell<Option<std::thread::JoinHandle<()>>>,
     dirty_notes: Cell<bool>,
@@ -167,16 +170,21 @@ pub fn run() -> glib::ExitCode {
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         let app = app.clone();
         glib_unix::unix_signal_add_local(signal, move || {
-            // Closing saves; a window whose save fails stays open with its
-            // "Changes Not Saved" question rather than quitting over it.
-            for w in app.windows() {
-                w.close();
-            }
+            close_every_window(&app);
             glib::ControlFlow::Break
         });
     }
     let _keep = theme;
     app.run()
+}
+
+/// Closes `app`'s windows as their close buttons would. Closing saves; a
+/// window whose save fails stays open with its "Changes Not Saved" question
+/// rather than quitting over it.
+fn close_every_window(app: &impl IsA<gtk::Application>) {
+    for w in app.windows() {
+        w.close();
+    }
 }
 
 /// A `.scrivx` inside a project opens the project.
@@ -568,6 +576,7 @@ impl Win {
             current: RefCell::new(None),
             editor_uuid: RefCell::new(None),
             last_toast: RefCell::new(String::new()),
+            compiling: RefCell::new(None),
             dirty_text: Cell::new(false),
             backup_job: RefCell::new(None),
             dirty_notes: Cell::new(false),
@@ -763,6 +772,7 @@ impl Win {
             if let Err(e) = w.close_project() {
                 return w.confirm_close_after_error(&e);
             }
+            w.stop_compile();
             WINDOWS.with(|ws| ws.borrow_mut().retain(|x| !Rc::ptr_eq(x, &w)));
             glib::Propagation::Proceed
         });
@@ -1534,6 +1544,7 @@ impl Win {
                 && let Some(w) = weak.upgrade()
             {
                 *w.project.borrow_mut() = None;
+                w.stop_compile();
                 WINDOWS.with(|ws| ws.borrow_mut().retain(|x| !Rc::ptr_eq(x, &w)));
                 w.window.destroy();
             }
@@ -1842,7 +1853,7 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
         .add_item(Kind::Text, "Hostile", &draft, None)
         .unwrap();
     let short = project.add_item(Kind::Text, "Short", &draft, None).unwrap();
-    let link: Rc<str> = Rc::from("https://example.test/chapter");
+    let link: std::sync::Arc<str> = std::sync::Arc::from("https://example.test/chapter");
     let mut paragraph = rtf::Paragraph::default();
     paragraph.style.align = rtf::Align::Center;
     for i in 0..2_000 {
@@ -1850,7 +1861,7 @@ fn a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file() {
             text: "a".into(),
             style: rtf::CharStyle {
                 bold: i % 2 == 0,
-                link: Some(Rc::clone(&link)),
+                link: Some(std::sync::Arc::clone(&link)),
                 ..rtf::CharStyle::default()
             },
         });
@@ -2398,6 +2409,11 @@ fn gtk_checks() {
     spell::tests::one_paragraph_is_one_spelling_line();
     id_less_text_is_read_only();
     a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
+    dialogs::tests::a_compile_leaves_the_main_loop_running();
+    dialogs::tests::cancel_and_closing_the_window_keep_the_target();
+    dialogs::tests::closing_every_window_waits_for_the_compile_to_finish();
+    dialogs::tests::an_edit_during_a_compile_stays_out_of_it();
+    dialogs::tests::a_failed_or_panicking_compile_is_reported();
     rich::tests::buffer_round_trip();
     editor::tests::typing_carries_formatting();
     editor::tests::replace_all_is_one_undo_and_keeps_the_run_style();

@@ -42,14 +42,15 @@ What the tests cover:
 - `tests/project.rs` copies `tests/fixtures/Lighthouse.scriv` into a temp
   directory and edits the copy.
 - `tests/compile.rs` checks compiled `.docx`, PDF, EPUB, Markdown, plain
-  text, and RTF. `epubcheck`, `pdfinfo`, and `pdftotext` run only when they
+  text, and RTF, and that a compile on a worker thread writes the same
+  bytes. `epubcheck`, `pdfinfo`, and `pdftotext` run only when they
   are already installed. CI does not install them. Without them the PDF test
   still requires a `%PDF-` header, and it skips the page-size check.
 - `tests/real_project.rs` runs only when `OMAQUILL_REAL_PROJECT` is set.
   Point it at a `.scriv` folder. The tests only read that folder. With the
   variable unset, they return and pass.
 - Some modules under `src/` contain their own unit tests. `src/project.rs`,
-  `src/fonts.rs`, `src/main.rs`, `src/ui/binder.rs`, `src/ui/dialogs.rs`, and
+  `src/export.rs`, `src/fonts.rs`, `src/main.rs`, `src/ui/binder.rs`, and
   `src/ui/inspector.rs` do not.
 - There is no `tests/golden/` directory.
 
