@@ -14,12 +14,14 @@
 //! The `.scrivx` stays a lossless XML tree ([`crate::xml`]); every edit is
 //! made on that tree, so settings omaquill doesn't know about survive.
 
+use crate::fsdir::{self, Dir};
 use crate::rtf::{self, RichText};
 use crate::xml::{self, Element};
 use crate::{sha1, zip};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -356,10 +358,12 @@ fn index_items(
 
 pub struct Project {
     pub path: PathBuf,
-    /// `path` with every symlink resolved: nothing outside it is ever read,
-    /// written or deleted (see [`Project::inside`]).
-    root: PathBuf,
-    scrivx: PathBuf,
+    /// The project folder, opened once. Every read, write and delete in the
+    /// project goes through it and never follows a symlink (see
+    /// [`fsdir`]).
+    root: Dir,
+    /// The `.scrivx` file's name in `root`.
+    scrivx: OsString,
     doc: xml::Document,
     /// `lowercase-uuid/file` → SHA-1, in file order.
     checksums: Vec<(String, String)>,
@@ -369,20 +373,209 @@ pub struct Project {
     checksums_dirty: bool,
 }
 
+/// A media item's file, open for reading. See [`Project::media`].
+#[derive(Debug)]
+pub struct Media {
+    /// `content.<ext>`, the file's name in its item folder. Only its
+    /// extension is meant for deciding the type.
+    pub name: String,
+    uuid: String,
+    file: std::fs::File,
+}
+
+impl Media {
+    /// The whole file, or an `InvalidData` error when it is longer than
+    /// `max` bytes. At most `max + 1` bytes are read.
+    pub fn read_capped(&self, max: u64) -> io::Result<Vec<u8>> {
+        use io::{Read, Seek};
+        let mut file = &self.file;
+        file.seek(io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is larger than {max} bytes", self.name),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Up to `n` bytes from the start of the file.
+    pub fn head(&self, n: usize) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; n];
+        let mut got = 0;
+        while got < n {
+            match self.file.read_at(&mut buf[got..], got as u64) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        buf.truncate(got);
+        Ok(buf)
+    }
+
+    /// A second handle on the same open file, to read on another thread.
+    pub fn try_clone(&self) -> io::Result<Media> {
+        Ok(Media {
+            name: self.name.clone(),
+            uuid: self.uuid.clone(),
+            file: self.file.try_clone()?,
+        })
+    }
+
+    /// The media item's UUID.
+    pub fn uuid(&self) -> &str {
+        &self.uuid
+    }
+}
+
+/// Private copies of media for another app to open, in `base`. Every
+/// [`PrivateCopies::copy`] makes a new folder `omaquill-open-<random>`,
+/// created exclusively with mode `0o700`, holding one copy
+/// `content.<ext>` of mode `0o600`. Its path is the one to hand to another
+/// app: no other user can swap it, it is not in the project, and no later
+/// copy writes to it. Nothing is shared or reused between copies, so two
+/// projects whose items share UUIDs can't collide.
+#[derive(Debug, Clone)]
+pub struct PrivateCopies {
+    base: PathBuf,
+}
+
+impl PrivateCopies {
+    pub fn new(base: PathBuf) -> PrivateCopies {
+        PrivateCopies { base }
+    }
+
+    /// Copies `media` into a new folder and returns the copy's path. A
+    /// file longer than `max` bytes is a `FileTooLarge` error, and one
+    /// larger than half the free space in `base` a `StorageFull` error. On any
+    /// error the new folder is removed.
+    pub fn copy(&self, media: &Media, max: u64) -> io::Result<PathBuf> {
+        let too_large = || {
+            io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("{} is larger than {max} bytes", media.name),
+            )
+        };
+        if media.file.metadata()?.len() > max {
+            return Err(too_large());
+        }
+        let base = Dir::open(&self.base)?;
+        let size = media.file.metadata()?.len();
+        if size > base.free_bytes()? / 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "{} is larger than half the free space in {}",
+                    media.name,
+                    self.base.display()
+                ),
+            ));
+        }
+        let folder_name = format!("omaquill-open-{}", new_uuid());
+        let folder = base.create_private_dir_new(OsStr::new(&folder_name))?;
+        let copied = Self::fill(&folder, media, max).and_then(|copied| {
+            if copied > max {
+                Err(too_large())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = copied {
+            drop(folder);
+            let _ = base.remove_tree(Path::new(&folder_name));
+            return Err(e);
+        }
+        Ok(self.base.join(folder_name).join(&media.name))
+    }
+
+    /// Removes the folder of `copy`, a path [`PrivateCopies::copy`]
+    /// returned. Anything else is left alone: only an `omaquill-open-*`
+    /// folder right in `base` goes, and a link there goes as a link.
+    pub fn remove(&self, copy: &Path) -> io::Result<()> {
+        let folder = copy
+            .parent()
+            .filter(|f| f.parent() == Some(self.base.as_path()));
+        let name = folder
+            .and_then(|f| f.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.starts_with("omaquill-open-"));
+        match name {
+            Some(name) => Dir::open(&self.base)?.remove_tree(Path::new(name)),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a copy in {}",
+                    copy.display(),
+                    self.base.display()
+                ),
+            )),
+        }
+    }
+
+    /// Writes at most `max + 1` bytes of `media` to a new `0o600` file in
+    /// `folder` and returns how many were written.
+    fn fill(folder: &Dir, media: &Media, max: u64) -> io::Result<u64> {
+        use io::{Read, Seek};
+        use std::os::unix::fs::PermissionsExt;
+        let mut out = folder.create_new(OsStr::new(&media.name))?;
+        out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut from = &media.file;
+        from.seek(io::SeekFrom::Start(0))?;
+        let copied = io::copy(&mut from.take(max.saturating_add(1)), &mut out)?;
+        out.sync_all()?;
+        Ok(copied)
+    }
+
+    /// Removes `omaquill-open-*` entries in `base` last changed more than
+    /// `age` ago and returns how many went. An entry that can't be
+    /// removed, such as another user's folder, is skipped, and the rest
+    /// are still tried. Symlinks are removed as links, never followed.
+    /// Only for a `base` no other user can write in, such as
+    /// `$XDG_RUNTIME_DIR`.
+    pub fn remove_stale(&self, age: std::time::Duration) -> io::Result<usize> {
+        let base = Dir::open(&self.base)?;
+        let mut removed = 0;
+        for entry in base.entries()? {
+            let Some(name) = entry.to_str() else { continue };
+            if !name.starts_with("omaquill-open-") {
+                continue;
+            }
+            let stale = std::fs::symlink_metadata(self.base.join(name))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|d| d > age);
+            if stale && base.remove_tree(Path::new(name)).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
 /// Where a binder item sits: the path of item indices from the binder.
 type Loc = Vec<usize>;
 
 impl Project {
     pub fn open(path: &Path) -> Result<Project> {
-        let path = path.to_path_buf();
-        let root = std::fs::canonicalize(&path)?;
-        let scrivx = find_scrivx(&path).ok_or_else(|| Error::NotAProject(path.clone()))?;
-        let text = String::from_utf8_lossy(&read_inside(&root, &scrivx)?).into_owned();
+        let root = Dir::open(path)?;
+        Project::open_in(path.to_path_buf(), root)
+    }
+
+    fn open_in(path: PathBuf, root: Dir) -> Result<Project> {
+        let scrivx = find_scrivx(&root, &path).ok_or_else(|| Error::NotAProject(path.clone()))?;
+        let text = String::from_utf8_lossy(&root.read(Path::new(&scrivx))?).into_owned();
         let doc = xml::parse(&text)?;
         if doc.root.name != "ScrivenerProject" || doc.root.child("Binder").is_none() {
             return Err(Error::NotAProject(path));
         }
-        let checksums = read_inside(&root, &path.join("Files/Data/docs.checksum"))
+        let checksums = root
+            .read(Path::new("Files/Data/docs.checksum"))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default()
             .lines()
@@ -402,19 +595,36 @@ impl Project {
     }
 
     /// A new, empty Scrivener 3 project at `path` (which should end in
-    /// `.scriv` and not exist yet).
+    /// `.scriv` and not exist yet). The project folder is made with
+    /// `mkdirat` in its parent and opened without following a symlink, so
+    /// an entry that appears at `path` first is an error, not a place to
+    /// write.
     pub fn create(path: &Path) -> Result<Project> {
-        if path.exists() {
-            return Err(Error::Invalid(format!("{} already exists", path.display())));
+        let exists = || Error::Invalid(format!("{} already exists", path.display()));
+        if path.symlink_metadata().is_ok() {
+            return Err(exists());
         }
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("Untitled")
             .to_string();
-        std::fs::create_dir_all(path.join("Files/Data"))?;
-        std::fs::create_dir_all(path.join("Settings"))?;
-        std::fs::write(path.join("Files/version.txt"), "23")?;
+        let folder = path
+            .file_name()
+            .ok_or_else(|| Error::Invalid(format!("{} names no folder", path.display())))?;
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::create_dir_all(parent)?;
+        let root = match Dir::open(parent)?.create_dir_new(folder) {
+            Ok(root) => root,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(exists()),
+            Err(e) => return Err(e.into()),
+        };
+        root.walk(Path::new("Files/Data"), true)?;
+        root.walk(Path::new("Settings"), true)?;
+        root.write_atomic(Path::new("Files/version.txt"), b"23", false)?;
         let now = timestamp();
         let (draft, research, trash, chapter) = (new_uuid(), new_uuid(), new_uuid(), new_uuid());
         let scrivx = format!(
@@ -473,10 +683,13 @@ impl Project {
             ver = env!("CARGO_PKG_VERSION"),
             modid = new_uuid(),
         );
-        let file = path.join(format!("{name}.scrivx"));
-        std::fs::write(&file, scrivx)?;
-        std::fs::write(path.join("Files/Data/docs.checksum"), "")?;
-        Project::open(path)
+        root.write_atomic(
+            Path::new(&format!("{name}.scrivx")),
+            scrivx.as_bytes(),
+            false,
+        )?;
+        root.write_atomic(Path::new("Files/Data/docs.checksum"), b"", false)?;
+        Project::open_in(path.to_path_buf(), root)
     }
 
     pub fn name(&self) -> String {
@@ -933,7 +1146,7 @@ impl Project {
             if !is_uuid(uuid) {
                 continue;
             }
-            remove_dir_inside(&self.root, &self.data_dir(uuid))?;
+            self.root.remove_tree(&data_rel(uuid))?;
             let prefix = format!("{}/", uuid.to_lowercase());
             self.checksums.retain(|(k, _)| !k.starts_with(&prefix));
             self.reindex.insert(uuid.to_uppercase(), ());
@@ -946,13 +1159,21 @@ impl Project {
     // ---------------------------------------------------------- content
 
     pub fn data_dir(&self, uuid: &str) -> PathBuf {
-        self.path.join("Files/Data").join(uuid.to_uppercase())
+        self.path.join(data_rel(uuid))
     }
 
-    /// The file behind a media item (`content.png`, `content.pdf` ...).
-    /// The extension comes from the project's XML, so it must be a plain
-    /// one: letters and digits only, no path tricks.
-    pub fn media_path(&self, uuid: &str) -> Option<PathBuf> {
+    /// The file behind a media item (`content.png`, `content.pdf` ...),
+    /// opened through the project folder. The extension comes from the
+    /// project's XML, so it must be a plain one: letters and digits only,
+    /// no path tricks. `None` when the id or extension is not plain, or
+    /// when the file is missing, a symlink, under a folder that is one, or
+    /// not a regular file (a FIFO named like an image would block its
+    /// reader).
+    ///
+    /// The result is an open file, not a path. Everything that shows or
+    /// hands on the media reads this file, so a name swapped after the
+    /// check changes nothing.
+    pub fn media(&self, uuid: &str) -> Option<Media> {
         // An empty id is not a folder. Joining it would look at
         // `Files/Data/content.<ext>`, which is not a document.
         if !is_uuid(uuid) {
@@ -962,9 +1183,13 @@ impl Project {
         if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }
-        let p = self.data_dir(uuid).join(format!("content.{ext}"));
-        // A FIFO named like an image blocks the reader that opens it.
-        (p.is_file() && inside(&self.root, &p)).then_some(p)
+        let name = format!("content.{ext}");
+        let file = self.root.open_file(&data_rel(uuid).join(&name)).ok()?;
+        Some(Media {
+            name,
+            uuid: uuid.to_string(),
+            file,
+        })
     }
 
     fn read_rtf(&self, uuid: &str, file: &str) -> Result<RichText> {
@@ -974,7 +1199,7 @@ impl Project {
         if !is_uuid(uuid) {
             return Ok(RichText::from_plain(""));
         }
-        match read_inside(&self.root, &self.data_dir(uuid).join(file)) {
+        match self.root.read(&data_rel(uuid).join(file)) {
             Ok(bytes) => Ok(rtf::parse(&bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RichText::from_plain("")),
             Err(e) => Err(e.into()),
@@ -1011,13 +1236,12 @@ impl Project {
     /// the manuscript's first paragraph of text, so a new scene looks like
     /// the rest of the book.
     pub fn default_style(&self) -> Option<(rtf::ParaStyle, rtf::CharStyle)> {
-        let prefs = read_inside(
-            &self.root,
-            &self.path.join("Settings/projectpreferences.xml"),
-        )
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .and_then(|t| xml::parse(&t).ok());
+        let prefs = self
+            .root
+            .read(Path::new("Settings/projectpreferences.xml"))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .and_then(|t| xml::parse(&t).ok());
         if let Some(prefs) = prefs
             && prefs.root.child_text("UseProjectPreferences").as_deref() == Some("Yes")
             && let Some(hex) = prefs.root.child_text("TextFormatRTFData")
@@ -1069,7 +1293,8 @@ impl Project {
         if !is_uuid(uuid) {
             return String::new();
         }
-        read_inside(&self.root, &self.data_dir(uuid).join("synopsis.txt"))
+        self.root
+            .read(&data_rel(uuid).join("synopsis.txt"))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default()
     }
@@ -1130,13 +1355,11 @@ impl Project {
         if !is_uuid(uuid) {
             return Err(missing_item(uuid));
         }
-        let dir = self.data_dir(uuid);
-        let path = dir.join(file);
+        let rel = data_rel(uuid).join(file);
         let key = format!("{}/{file}", uuid.to_lowercase());
         match bytes {
             Some(bytes) => {
-                create_dir_inside(&self.root, &dir)?;
-                write_inside(&self.root, &path, bytes)?;
+                self.root.write_atomic(&rel, bytes, true)?;
                 #[cfg(test)]
                 if file == "content.rtf" {
                     CONTENT_WRITES.with(|n| n.set(n.get() + 1));
@@ -1148,7 +1371,7 @@ impl Project {
                 }
             }
             None => {
-                remove_file_inside(&self.root, &path)?;
+                self.root.remove_file(&rel)?;
                 self.checksums.retain(|(k, _)| *k != key);
             }
         }
@@ -1188,7 +1411,9 @@ impl Project {
             if self.doc.root.attr("ModID").is_some() {
                 self.doc.root.set_attr("ModID", &new_uuid());
             }
-            write_inside(&self.root, &self.scrivx, self.doc.to_xml().as_bytes())?;
+            let xml = self.doc.to_xml();
+            self.root
+                .write_atomic(Path::new(&self.scrivx), xml.as_bytes(), false)?;
             self.scrivx_dirty = false;
         }
         if self.checksums_dirty {
@@ -1196,9 +1421,8 @@ impl Project {
             for (k, v) in &self.checksums {
                 out.push_str(&format!("{k}={v}\n"));
             }
-            let dir = self.path.join("Files/Data");
-            create_dir_inside(&self.root, &dir)?;
-            write_inside(&self.root, &dir.join("docs.checksum"), out.as_bytes())?;
+            self.root
+                .write_atomic(Path::new("Files/Data/docs.checksum"), out.as_bytes(), true)?;
             self.checksums_dirty = false;
         }
         if !self.reindex.is_empty() {
@@ -1209,8 +1433,10 @@ impl Project {
     }
 
     fn save_search_index(&mut self) -> Result<()> {
-        let path = self.path.join("Files/search.indexes");
-        let existing = read_inside(&self.root, &path)
+        let path = Path::new("Files/search.indexes");
+        let existing = self
+            .root
+            .read(path)
             .ok()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
         let mut doc = match existing.as_deref().map(xml::parse) {
@@ -1278,28 +1504,51 @@ impl Project {
             entries.push(entry);
         }
         docs.append_elements(entries, "\n    ");
-        write_inside(&self.root, &path, doc.to_xml().as_bytes())?;
+        self.root
+            .write_atomic(path, doc.to_xml().as_bytes(), false)?;
         Ok(())
     }
 
-    /// Zips the whole project into `dir`; see [`backup`].
+    /// Zips the whole project into `dir`; see [`backup`]. The project is
+    /// read through its open folder.
     pub fn backup(&self, dir: &Path, keep: usize) -> Result<PathBuf> {
-        backup(&self.path, dir, keep)
+        backup_folder(&self.root, dir, keep, &timestamp())
+    }
+
+    /// [`Project::backup`] with `now` in place of the clock.
+    pub fn backup_at(&self, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
+        backup_folder(&self.root, dir, keep, now)
+    }
+
+    /// A second descriptor for the open project folder, for a backup on
+    /// another thread ([`backup_folder`]).
+    pub fn folder(&self) -> io::Result<Dir> {
+        self.root.try_clone()
     }
 }
 
 /// Zips the project at `path` into its own folder under `dir`
 /// (`<name>-<id>/<date>.zip`, the id from the project's full path, so two
 /// projects never share or prune each other's backups), and keeps only the
-/// newest `keep` there. A free function so it can run on another thread
-/// while the project is open.
+/// newest `keep` there. The project folder is opened once; see
+/// [`backup_folder`].
 pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
-    backup_at(path, dir, keep, &timestamp())
+    backup_folder(&Dir::open(path)?, dir, keep, &timestamp())
 }
 
 /// [`backup`] with `now` in place of the clock. `now` has the shape
 /// [`timestamp`] returns.
 pub fn backup_at(path: &Path, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
+    backup_folder(&Dir::open(path)?, dir, keep, now)
+}
+
+/// [`backup_at`] for a project folder that is already open, as
+/// [`Project::folder`] gives one. Every file is read through `root`. The
+/// backup folder's name and id come from the path `root` was opened by;
+/// that path is only hashed, never opened. A free function so it can run
+/// on another thread while the project is open.
+pub fn backup_folder(root: &Dir, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
+    let path = root.path();
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1308,35 +1557,30 @@ pub fn backup_at(path: &Path, dir: &Path, keep: usize, now: &str) -> Result<Path
     let id = &sha1::hex(full.to_string_lossy().as_bytes())[..8];
     let dir = dir.join(format!("{name}-{id}"));
     std::fs::create_dir_all(&dir)?;
+    let folder = Dir::open(&dir)?;
     let stamp = backup_stamp(now);
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = dir.join(format!(
+    let tmp = OsString::from(format!(
         ".backup.{}-{}.omaquill-tmp",
         std::process::id(),
         N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    if let Err(e) = write_backup(path, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = write_backup(root, &folder, &tmp) {
+        let _ = folder.remove_file(Path::new(&tmp));
         return Err(e);
     }
-    let out = publish_backup(&dir, &stamp, &tmp)?;
-    let mut old: Vec<PathBuf> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            *p != out
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(is_backup_name)
-        })
+    let out = publish_backup(&folder, &stamp, &tmp)?;
+    let mut old: Vec<String> = folder
+        .entries()?
+        .into_iter()
+        .filter_map(|n| n.into_string().ok())
+        .filter(|n| *n != out && is_backup_name(n))
         .collect();
-    old.sort_by_key(|p| {
-        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        backup_order(n).expect("filtered to backup names")
-    });
+    old.sort_by_key(|n| backup_order(n).expect("filtered to backup names"));
     while old.len() + 1 > keep.max(1) && !old.is_empty() {
-        let _ = std::fs::remove_file(old.remove(0));
+        let _ = folder.remove_file(Path::new(&old.remove(0)));
     }
-    Ok(out)
+    Ok(dir.join(out))
 }
 
 /// `2026-09-28 19-05-02.zip` or `2026-09-28 19-05-02 2.zip`: only files
@@ -1362,38 +1606,55 @@ fn is_backup_name(n: &str) -> bool {
             || (b[19] == b' ' && b[20..].iter().all(u8::is_ascii_digit) && b.len() > 20))
 }
 
-fn write_backup(path: &Path, tmp: &Path) -> Result<()> {
-    let file = open_backup_temp(tmp)?;
+/// Zips the project open at `root` into the new file `tmp` in `folder`,
+/// walking it through [`Dir`]: a file or folder that is a symlink is left
+/// out, including one swapped in while the backup runs.
+fn write_backup(root: &Dir, folder: &Dir, tmp: &OsStr) -> Result<()> {
+    let file = open_backup_temp(folder, tmp)?;
     let mut zip = zip::ZipWriter::new(io::BufWriter::new(file));
-    let top = path
+    let top = root
+        .path()
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let mut entries: Vec<_> = std::fs::read_dir(&d)?.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|e| e.file_name());
-        for e in entries {
-            let p = e.path();
-            let ft = e.file_type()?;
-            if ft.is_dir() {
-                stack.push(p);
-            } else if ft.is_file() {
-                let fname = e.file_name();
-                if fname.to_string_lossy().contains(".omaquill-tmp") {
-                    continue; // a save in flight
+    // Gone, a symlink now, or a folder that is a file now: a save or a
+    // second user changed it while the backup ran, and it is left out.
+    let skip = |e: &io::Error| {
+        e.kind() == io::ErrorKind::NotFound
+            || e.raw_os_error() == Some(libc::ENOTDIR)
+            || fsdir::is_link_refusal(e)
+    };
+    // The stack holds paths, not open folders: a project with thousands of
+    // documents has thousands of folders waiting, more than a process may
+    // hold open. Each one is walked again from `root` when its turn comes.
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let d = match root.walk(&rel, false) {
+            Ok(d) => d,
+            Err(e) if skip(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let mut names = d.entries()?;
+        names.sort();
+        for fname in names {
+            let one = Path::new(&fname);
+            match d.kind(one)? {
+                Some(fsdir::Kind::Dir) => stack.push(rel.join(&fname)),
+                Some(fsdir::Kind::File) => {
+                    if fname.to_string_lossy().contains(".omaquill-tmp") {
+                        continue; // a save in flight
+                    }
+                    let bytes = match d.read(one) {
+                        Ok(b) => b,
+                        // Renamed away mid-backup by a save, or swapped for a
+                        // symlink: skip it.
+                        Err(e) if skip(&e) => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    let entry = format!("{top}/{}", rel.join(&fname).to_string_lossy());
+                    zip.add(&entry, &bytes)?;
                 }
-                let bytes = match std::fs::read(&p) {
-                    Ok(b) => b,
-                    // Renamed away mid-backup by a save: skip it.
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                let rel = p.strip_prefix(path).map_err(|_| {
-                    Error::Invalid(format!("{} is outside the project", p.display()))
-                })?;
-                let entry = format!("{top}/{}", rel.to_string_lossy());
-                zip.add(&entry, &bytes)?;
+                _ => {}
             }
         }
     }
@@ -1407,11 +1668,13 @@ fn write_backup(path: &Path, tmp: &Path) -> Result<()> {
     Ok(())
 }
 
-fn publish_backup(dir: &Path, stamp: &str, tmp: &Path) -> Result<PathBuf> {
+/// Links `tmp` in `folder` to the next free backup name, removes `tmp`, and
+/// returns the name.
+fn publish_backup(folder: &Dir, stamp: &str, tmp: &OsStr) -> Result<String> {
     let linked = (|| {
         for _ in 0..10_000 {
-            let out = next_backup_path(dir, stamp)?;
-            match std::fs::hard_link(tmp, &out) {
+            let out = next_backup_name(folder, stamp)?;
+            match folder.link(tmp, OsStr::new(&out)) {
                 Ok(()) => return Ok(out),
                 Err(e) if already_exists(&e) => continue,
                 Err(e) => return Err(Error::from(e)),
@@ -1421,11 +1684,9 @@ fn publish_backup(dir: &Path, stamp: &str, tmp: &Path) -> Result<PathBuf> {
             "could not choose a backup name that was not already there".into(),
         ))
     })();
-    let _ = std::fs::remove_file(tmp);
-    if linked.is_ok()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
+    let _ = folder.remove_file(Path::new(tmp));
+    if linked.is_ok() {
+        let _ = folder.sync();
     }
     linked
 }
@@ -1448,16 +1709,18 @@ fn backup_order(name: &str) -> Option<(String, u32)> {
     Some((stamp, count))
 }
 
-fn next_backup_path(dir: &Path, stamp: &str) -> Result<PathBuf> {
-    let same_second = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+fn next_backup_name(folder: &Dir, stamp: &str) -> Result<String> {
+    let same_second = folder
+        .entries()?
+        .into_iter()
+        .filter_map(|n| n.into_string().ok())
         .filter_map(|n| backup_order(&n))
         .filter(|(got, _)| *got == stamp)
         .map(|(_, count)| count)
         .max();
     Ok(match same_second {
-        None => dir.join(format!("{stamp}.zip")),
-        Some(n) => dir.join(format!("{stamp} {}.zip", n + 1)),
+        None => format!("{stamp}.zip"),
+        Some(n) => format!("{stamp} {}.zip", n + 1),
     })
 }
 
@@ -1465,37 +1728,35 @@ fn already_exists(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(libc::EEXIST)
 }
 
-fn open_backup_temp(tmp: &Path) -> Result<std::fs::File> {
-    let open = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(tmp)
-    };
-    match open() {
+fn open_backup_temp(folder: &Dir, tmp: &OsStr) -> Result<std::fs::File> {
+    match folder.create_new(tmp) {
         Ok(file) => Ok(file),
         Err(e) if already_exists(&e) => {
-            std::fs::remove_file(tmp)?;
-            Ok(open()?)
+            folder.remove_file(Path::new(tmp))?;
+            Ok(folder.create_new(tmp)?)
         }
         Err(e) => Err(e.into()),
     }
 }
 
-fn find_scrivx(dir: &Path) -> Option<PathBuf> {
-    if dir.is_file() && dir.extension().is_some_and(|e| e == "scrivx") {
-        return Some(dir.to_path_buf());
-    }
-    let stem = dir.file_stem()?.to_string_lossy().into_owned();
-    let named = dir.join(format!("{stem}.scrivx"));
-    if named.is_file() {
+/// The `.scrivx` file's name in the project folder: `<stem>.scrivx` when
+/// that is a regular file, or else the first `.scrivx` entry, as a renamed
+/// project keeps its old one.
+fn find_scrivx(root: &Dir, path: &Path) -> Option<OsString> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let named = OsString::from(format!("{stem}.scrivx"));
+    if matches!(root.kind(Path::new(&named)), Ok(Some(fsdir::Kind::File))) {
         return Some(named);
     }
-    // Renamed projects keep their old .scrivx name.
-    std::fs::read_dir(dir)
+    root.entries()
         .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|e| e == "scrivx"))
+        .into_iter()
+        .find(|n| Path::new(n).extension().is_some_and(|e| e == "scrivx"))
+}
+
+/// Where an item's files live, relative to the project folder.
+fn data_rel(uuid: &str) -> PathBuf {
+    Path::new("Files/Data").join(uuid.to_uppercase())
 }
 
 /// File types omaquill will hand to another app ("Open in Default App"):
@@ -1513,196 +1774,6 @@ pub fn is_openable(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| OPENABLE.contains(&e.to_ascii_lowercase().as_str()))
-}
-
-// ------------------------------------------------------------ containment
-//
-// A `.scriv` folder can come from anyone. Its files could be symlinks (or
-// sit under a symlinked folder) pointing at the user's other files, and
-// editing a chapter must never overwrite `~/.bashrc`. So every read, write
-// and delete resolves the path first and acts only if it lands inside the
-// project's own (resolved) folder. Links that stay inside still work.
-
-/// Resolves `p` through every symlink that exists, keeping the parts that
-/// don't exist yet (a file about to be created).
-fn resolve(p: &Path) -> Option<PathBuf> {
-    let mut existing = p;
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            let mut out = real;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return Some(out);
-        }
-        rest.push(existing.file_name()?.to_os_string());
-        existing = existing.parent()?;
-    }
-}
-
-/// `p` resolves to somewhere inside `root`.
-fn inside(root: &Path, p: &Path) -> bool {
-    resolve(p).is_some_and(|r| r.starts_with(root))
-}
-
-fn outside_error(p: &Path) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!(
-            "{} links outside the project; omaquill won't follow it",
-            p.display()
-        ),
-    )
-}
-
-/// Reads `p` if it resolves inside the project and is a regular file. A
-/// FIFO blocks `open` until a writer appears and a device can read without
-/// end. `O_NONBLOCK` lets the open return, and the opened file's own type
-/// decides. A regular file is then read in blocking mode, as `fs::read` does.
-fn read_inside(root: &Path, p: &Path) -> io::Result<Vec<u8>> {
-    use io::Read;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    if !p.exists() {
-        return Err(io::ErrorKind::NotFound.into());
-    }
-    if !inside(root, p) {
-        return Err(outside_error(p));
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(p)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", p.display()),
-        ));
-    }
-    let fd = file.as_raw_fd();
-    // SAFETY: fcntl reads and sets the flags of a descriptor `file` owns.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-/// Writes `p` if its folder is inside the project. A file that's a symlink
-/// out of the project is replaced by an ordinary file (the link goes, what
-/// it pointed at is left alone).
-fn write_inside(root: &Path, p: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = p.parent().unwrap_or(p);
-    if !inside(root, parent) {
-        return Err(outside_error(p));
-    }
-    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
-    if is_link && !std::fs::canonicalize(p).is_ok_and(|t| t.starts_with(root)) {
-        std::fs::remove_file(p)?; // the link itself
-    }
-    write_atomic(p, bytes)
-}
-
-fn create_dir_inside(root: &Path, dir: &Path) -> io::Result<()> {
-    if !inside(root, dir) {
-        return Err(outside_error(dir));
-    }
-    std::fs::create_dir_all(dir)
-}
-
-fn remove_file_inside(root: &Path, p: &Path) -> io::Result<()> {
-    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
-    if !p.exists() && !is_link {
-        return Ok(());
-    }
-    // Removing a link removes only the link, but its folder must be ours.
-    if !inside(root, p.parent().unwrap_or(p)) {
-        return Err(outside_error(p));
-    }
-    std::fs::remove_file(p)
-}
-
-/// Deletes an item's folder. A folder that's a symlink loses just the
-/// link; one that resolves outside the project is left alone.
-fn remove_dir_inside(root: &Path, dir: &Path) -> io::Result<()> {
-    let Ok(meta) = std::fs::symlink_metadata(dir) else {
-        return Ok(());
-    };
-    if !inside(root, dir.parent().unwrap_or(dir)) {
-        return Err(outside_error(dir));
-    }
-    if meta.file_type().is_symlink() {
-        return std::fs::remove_file(dir);
-    }
-    if !inside(root, dir) {
-        return Err(outside_error(dir));
-    }
-    std::fs::remove_dir_all(dir)
-}
-
-/// Writes through a temporary file and a rename, so a crash never leaves a
-/// half-written chapter. Keeps the file's permissions, writes through a
-/// symlink to its target, and syncs the folder so the rename survives a
-/// power cut.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic_if(path, bytes, || true).map(|_| ())
-}
-
-/// [`write_atomic`], asking `commit` once the bytes are on disk and just
-/// before the rename. When it answers false the temporary file is removed,
-/// `path` is left as it was, and the result is `Ok(false)`.
-pub fn write_atomic_if(
-    path: &Path,
-    bytes: &[u8],
-    commit: impl FnOnce() -> bool,
-) -> io::Result<bool> {
-    use io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let target = match std::fs::canonicalize(path) {
-        Ok(real) => real,
-        Err(_) => path.to_path_buf(), // new file
-    };
-    let mode = std::fs::metadata(&target)
-        .ok()
-        .map(|m| m.permissions().mode());
-    let tmp = target.with_file_name(format!(
-        ".{}.{}-{}.omaquill-tmp",
-        target.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        if let Some(mode) = mode {
-            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        if !commit() {
-            return Ok(false);
-        }
-        std::fs::rename(&tmp, &target).map(|()| true)
-    })();
-    if !matches!(written, Ok(true)) {
-        let _ = std::fs::remove_file(&tmp);
-        return written;
-    }
-    if let Some(dir) = target.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(true)
 }
 
 /// Scrivener's UUIDs: 36 characters of hex and dashes. Anything else is
@@ -2415,7 +2486,7 @@ mod tests {
     }
 
     #[test]
-    fn media_path_refuses_an_empty_id() {
+    fn media_refuses_an_empty_id() {
         let (path, mut project) = temp_project("media-empty");
         let research = project.root_folder(Kind::Research).unwrap().uuid;
         let id = project
@@ -2453,7 +2524,7 @@ mod tests {
         std::fs::write(&bait, b"BAIT").unwrap();
         let project = Project::open(&path).unwrap();
         assert!(project.item("").is_some());
-        assert!(project.media_path("").is_none());
+        assert!(project.media("").is_none());
         assert_eq!(std::fs::read(&bait).unwrap(), b"BAIT");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -16,7 +16,7 @@ use omaquill::compile::{self, Format, Options};
 use omaquill::export;
 use omaquill::project::{Item, Kind, Project};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -166,7 +166,99 @@ fn compile_cli(args: &[String]) -> Result<(), String> {
         }
     };
     let bytes = compile::compile(&p, &opts, format).map_err(|e| e.to_string())?;
-    std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
-    println!("{}", out.display());
+    if write_output(out, &bytes)? == Wrote::File {
+        println!("{}", out.display());
+    }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Wrote {
+    /// Standard output got the bytes, so the path is not printed after them.
+    Stdout,
+    /// A file, device or FIFO got them.
+    File,
+}
+
+/// Writes the compiled `bytes` to `out`, the command's OUT argument.
+///
+/// - `-`, `/dev/stdout`, `/dev/fd/1` and `/proc/self/fd/1` are this
+///   process's standard output. The bytes go to that open stream, which
+///   also keeps `>>` appending.
+/// - A FIFO, device or socket at `out` gets a plain write, opened with
+///   `O_NOFOLLOW` and without creating anything.
+/// - A symlink at a name for a stream ([`names_a_stream`]) is followed for
+///   a plain write and is never replaced, as root too. When it leads to a
+///   regular file, nothing is written. A symlink anywhere else, including
+///   world-writable `/dev/shm` and `/dev/mqueue`, is replaced like any
+///   other file.
+/// - Anything else goes through [`omaquill::fsdir::write_atomic`]: a new
+///   file is renamed into place, and a symlink at `out` is replaced, not
+///   followed.
+fn write_output(out: &Path, bytes: &[u8]) -> Result<Wrote, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let shown = out.display();
+    let stdout_names = ["-", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"];
+    if stdout_names.iter().any(|n| out == Path::new(n)) {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(bytes)
+            .and_then(|()| stdout.flush())
+            .map_err(|e| format!("couldn't write to standard output: {e}"))?;
+        return Ok(Wrote::Stdout);
+    }
+    let meta = std::fs::symlink_metadata(out).ok();
+    let kind = meta.as_ref().map(|m| m.file_type());
+    let dev_link = names_a_stream(out) && kind.is_some_and(|k| k.is_symlink());
+    let special = kind
+        .is_some_and(|k| k.is_fifo() || k.is_char_device() || k.is_block_device() || k.is_socket());
+    if dev_link || special {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        if !dev_link {
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts
+            .open(out)
+            .map_err(|e| format!("couldn't open {shown} to write: {e}"))?;
+        let now = file
+            .metadata()
+            .map_err(|e| format!("couldn't check {shown}: {e}"))?;
+        if now.is_file() {
+            // A link in /dev to a regular file, or a name swapped since the
+            // check. A plain write there would leave the old tail.
+            return Err(format!(
+                "{shown} is a regular file now; give its own path to replace it"
+            ));
+        }
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .map_err(|e| format!("couldn't write {shown}: {e}"))?;
+        return Ok(Wrote::File);
+    }
+    omaquill::fsdir::write_atomic(out, bytes)
+        .map_err(|e| format!("couldn't write {shown}: {e}"))?;
+    Ok(Wrote::File)
+}
+
+/// Whether `out` is one of the system's names for an open stream:
+/// `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/*`, `/dev/tty*` or
+/// `/proc/self/fd/*`, with no `.` or `..` in it. Only root writes these
+/// names, so a symlink at one leads where the system put it.
+fn names_a_stream(out: &Path) -> bool {
+    if !out
+        .components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return false;
+    }
+    let in_dir = |dir: &str| out.parent() == Some(Path::new(dir));
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    ["/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        .iter()
+        .any(|n| out == Path::new(n))
+        || in_dir("/dev/fd")
+        || in_dir("/proc/self/fd")
+        || (in_dir("/dev") && name.starts_with("tty"))
 }

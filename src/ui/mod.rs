@@ -1038,14 +1038,20 @@ impl Win {
         if keep > 0 {
             self.join_backup_reader();
             let path = project.path.clone();
-            let job = std::thread::spawn(move || {
-                if let Err(e) =
-                    omaquill::project::backup(&path, &omaquill::state::backup_dir(), keep)
-                {
-                    eprintln!("omaquill: backup of {} failed: {e}", path.display());
+            match project.folder() {
+                Ok(folder) => {
+                    let job = std::thread::spawn(move || {
+                        let now = omaquill::project::timestamp();
+                        let dir = omaquill::state::backup_dir();
+                        if let Err(e) = omaquill::project::backup_folder(&folder, &dir, keep, &now)
+                        {
+                            eprintln!("omaquill: backup of {} failed: {e}", path.display());
+                        }
+                    });
+                    *self.backup_job.borrow_mut() = Some(job);
                 }
-            });
-            *self.backup_job.borrow_mut() = Some(job);
+                Err(e) => eprintln!("omaquill: backup of {} failed: {e}", path.display()),
+            }
         }
         omaquill::state::add_recent(&project.path);
         self.title.set_title(&project.name());
@@ -1231,29 +1237,22 @@ impl Win {
                 }
             }
             Kind::Image => {
-                let path = self
-                    .project
-                    .borrow()
-                    .as_ref()
-                    .and_then(|p| p.media_path(uuid));
-                if self.board.show_image(path.as_deref()) {
+                let media = self.project.borrow().as_ref().and_then(|p| p.media(uuid));
+                if self.board.show_image(media.as_ref()) {
                     self.stack.set_visible_child_name("media");
                 } else {
                     // Missing, unreadable, or too large to decode safely.
-                    self.board.show_file(&item.title, path.as_deref());
-                    if path.is_some() {
+                    let found = media.is_some();
+                    self.board.show_file(&item.title, media);
+                    if found {
                         self.board.say_image_too_large();
                     }
                     self.stack.set_visible_child_name("file");
                 }
             }
             _ => {
-                let path = self
-                    .project
-                    .borrow()
-                    .as_ref()
-                    .and_then(|p| p.media_path(uuid));
-                self.board.show_file(&item.title, path.as_deref());
+                let media = self.project.borrow().as_ref().and_then(|p| p.media(uuid));
+                self.board.show_file(&item.title, media);
                 self.stack.set_visible_child_name("file");
             }
         }
@@ -1554,12 +1553,16 @@ impl Win {
     }
 
     fn backup_now(&self) {
-        let Some(path) = self.project.borrow().as_ref().map(|p| p.path.clone()) else {
+        if self.project.borrow().is_none() {
             return;
-        };
+        }
         self.save_now();
         let keep = self.settings.borrow().backups.max(1);
-        match omaquill::project::backup(&path, &omaquill::state::backup_dir(), keep) {
+        let made = match self.project.borrow().as_ref() {
+            Some(p) => p.backup(&omaquill::state::backup_dir(), keep),
+            None => return,
+        };
+        match made {
             Ok(zip) => self.toast(&format!(
                 "Backed up to {}",
                 zip.file_name().unwrap_or_default().to_string_lossy()
@@ -2410,6 +2413,8 @@ fn gtk_checks() {
     id_less_text_is_read_only();
     a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
     dialogs::tests::a_compile_leaves_the_main_loop_running();
+    board::tests::an_open_copy_leaves_the_main_loop_running();
+    board::tests::repeated_opens_keep_one_copy_per_item();
     dialogs::tests::cancel_and_closing_the_window_keep_the_target();
     dialogs::tests::closing_every_window_waits_for_the_compile_to_finish();
     dialogs::tests::an_edit_during_a_compile_stays_out_of_it();

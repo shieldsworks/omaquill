@@ -125,7 +125,7 @@ fn write_kv(path: &Path, header: &str, kv: &BTreeMap<String, String>) -> std::io
     for (k, v) in kv {
         out.push_str(&format!("{k} = {v}\n"));
     }
-    crate::project::write_atomic(path, out.as_bytes())
+    crate::fsdir::write_atomic(path, out.as_bytes())
 }
 
 const SETTINGS_HEADER: &str = "# omaquill settings; the Preferences window writes this file.\n";
@@ -356,7 +356,7 @@ pub fn add_recent(path: &Path) {
     let text: String = list.iter().map(|p| format!("{}\n", p.display())).collect();
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let _ = crate::project::write_atomic(&dir.join("recent"), text.as_bytes());
+    let _ = crate::fsdir::write_atomic(&dir.join("recent"), text.as_bytes());
 }
 
 /// Per-project view state, kept out of the project so Scrivener's own
@@ -406,7 +406,7 @@ pub fn save_words(path: &Path, words: &BTreeSet<String>) -> std::io::Result<()> 
         out.push_str(w);
         out.push('\n');
     }
-    crate::project::write_atomic(path, out.as_bytes())
+    crate::fsdir::write_atomic(path, out.as_bytes())
 }
 
 impl ProjectView {
@@ -506,7 +506,7 @@ impl Today {
         );
         let dir = state_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let _ = crate::project::write_atomic(&Self::path(), json.as_bytes());
+        let _ = crate::fsdir::write_atomic(&Self::path(), json.as_bytes());
     }
 }
 

@@ -3,11 +3,11 @@
 
 use super::{Win, group};
 use adw::prelude::*;
-use gtk::gio;
-use omaquill::project::Item;
-use std::cell::RefCell;
+use gtk::{gio, glib};
+use omaquill::project::{Item, Media, PrivateCopies};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 pub struct Board {
@@ -18,7 +18,13 @@ pub struct Board {
     pub media_page: gtk::ScrolledWindow,
     picture: gtk::Picture,
     pub file_page: adw::StatusPage,
-    file_path: Rc<RefCell<Option<PathBuf>>>,
+    /// The media on the file page, kept open for Open in Default App.
+    file_media: Rc<RefCell<Option<Media>>>,
+    /// Open in Default App, on the file page.
+    open: gtk::Button,
+    /// Set while Open in Default App copies its file on a worker, so a
+    /// second click does not start another copy.
+    copying: Cell<bool>,
     /// UUIDs of the cards or rows on show, in order.
     shown: RefCell<Vec<String>>,
 }
@@ -68,25 +74,13 @@ impl Board {
             .margin_end(24)
             .build();
         let media_page = gtk::ScrolledWindow::builder().child(&picture).build();
-        let file_path: Rc<RefCell<Option<PathBuf>>> = Rc::default();
+        let file_media: Rc<RefCell<Option<Media>>> = Rc::default();
+
         let open = gtk::Button::builder()
             .label("Open in Default App")
             .css_classes(["pill", "suggested-action"])
             .halign(gtk::Align::Center)
             .build();
-        {
-            let file_path = file_path.clone();
-            open.connect_clicked(move |_| {
-                if let Some(p) = file_path.borrow().as_ref()
-                    && safe_to_open(p)
-                {
-                    let _ = gio::AppInfo::launch_default_for_uri(
-                        &gio::File::for_path(p).uri(),
-                        gio::AppLaunchContext::NONE,
-                    );
-                }
-            });
-        }
         let file_page = adw::StatusPage::builder()
             .icon_name("x-office-document-symbolic")
             .child(&open)
@@ -99,18 +93,25 @@ impl Board {
             media_page,
             picture,
             file_page,
-            file_path,
+            file_media,
+            open,
+            copying: Cell::new(false),
             shown: RefCell::new(Vec::new()),
         }
     }
 
-    /// Shows an image, if its header says it's a sane size. A tiny file
-    /// can claim to be 100,000 pixels square; decoding that would exhaust
-    /// memory, so only the header is read first. False: not shown.
-    pub fn show_image(&self, path: Option<&Path>) -> bool {
-        match path.filter(|p| image_size_ok(p)) {
-            Some(p) => {
-                self.picture.set_filename(Some(p));
+    /// Shows an image, read once from its open file and decoded from
+    /// those bytes. A tiny file can claim to be 100,000 pixels square, so
+    /// [`decode_image`] stops at the header when the size is not sane.
+    /// False: not shown.
+    pub fn show_image(&self, media: Option<&Media>) -> bool {
+        let pixbuf = media
+            .and_then(|m| m.read_capped(MAX_IMAGE_BYTES).ok())
+            .and_then(|bytes| decode_image(&bytes));
+        match pixbuf {
+            Some(pixbuf) => {
+                let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                self.picture.set_paintable(Some(&texture));
                 true
             }
             None => {
@@ -126,10 +127,13 @@ impl Board {
         ));
     }
 
-    pub fn show_file(&self, title: &str, path: Option<&Path>) {
+    pub fn show_file(&self, title: &str, media: Option<Media>) {
         self.file_page.set_title(title);
-        let openable = path.is_some_and(safe_to_open);
-        self.file_page.set_description(Some(match path {
+        let openable = media.as_ref().is_some_and(|m| {
+            m.head(SNIFF_BYTES)
+                .is_ok_and(|head| safe_to_open(Path::new(&m.name), &head))
+        });
+        self.file_page.set_description(Some(match media {
             Some(_) if openable => "omaquill doesn't display this kind of file itself.",
             Some(_) => {
                 "omaquill doesn't open this kind of file from a project, since it could run code. \
@@ -137,44 +141,66 @@ impl Board {
             }
             None => "The file for this item is missing from the project.",
         }));
-        *self.file_path.borrow_mut() = path.map(Path::to_path_buf);
+        *self.file_media.borrow_mut() = media;
         if let Some(button) = self.file_page.child() {
             button.set_visible(openable);
         }
     }
 }
 
+/// Bytes read to sniff a file's type.
+const SNIFF_BYTES: usize = 4096;
+
+/// Largest image file omaquill will read to decode: 256 MiB.
+const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Largest image omaquill will decode: 100 megapixels, 30,000 on a side.
 const MAX_PIXELS: u64 = 100_000_000;
 const MAX_SIDE: i32 = 30_000;
 
-fn image_size_ok(p: &Path) -> bool {
-    match gtk::gdk_pixbuf::Pixbuf::file_info(p) {
-        Some((_, w, h)) => {
-            w > 0
-                && h > 0
-                && w <= MAX_SIDE
-                && h <= MAX_SIDE
-                && (w as u64) * (h as u64) <= MAX_PIXELS
-        }
-        None => false,
-    }
+fn size_ok(w: i32, h: i32) -> bool {
+    w > 0 && h > 0 && w <= MAX_SIDE && h <= MAX_SIDE && (w as u64) * (h as u64) <= MAX_PIXELS
 }
 
-/// An allowed type by name (see `is_openable`) whose contents also look
-/// like a document or media file: the desktop decides how to open a file
-/// partly by sniffing it, so the name alone isn't enough.
-fn safe_to_open(p: &Path) -> bool {
-    use std::io::Read;
-    if !omaquill::project::is_openable(p) {
+/// Decodes `bytes` as an image. The loader reports the size from the
+/// header before it allocates pixels. A size over the limits sets the
+/// loader's size to 0 by 0, which makes gdk-pixbuf stop there, as
+/// `gdk_pixbuf_get_file_info` does, and the result is `None`.
+fn decode_image(bytes: &[u8]) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    use std::cell::Cell;
+    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    let refused = Rc::new(Cell::new(false));
+    let sized = Rc::new(Cell::new(false));
+    {
+        let (refused, sized) = (refused.clone(), sized.clone());
+        loader.connect_size_prepared(move |loader, w, h| {
+            sized.set(true);
+            if !size_ok(w, h) {
+                refused.set(true);
+                loader.set_size(0, 0);
+            }
+        });
+    }
+    for chunk in bytes.chunks(64 * 1024) {
+        if refused.get() || loader.write(chunk).is_err() {
+            break;
+        }
+    }
+    let closed = loader.close();
+    if refused.get() || !sized.get() || closed.is_err() {
+        return None;
+    }
+    loader.pixbuf()
+}
+
+/// An allowed type by name (see `is_openable`) whose first bytes, `head`,
+/// also look like a document or media file: the desktop decides how to
+/// open a file partly by sniffing it, so the name alone isn't enough.
+fn safe_to_open(name: &Path, head: &[u8]) -> bool {
+    if !omaquill::project::is_openable(name) {
         return false;
     }
-    let mut head = vec![0u8; 4096];
-    let n = std::fs::File::open(p)
-        .and_then(|mut f| f.read(&mut head))
-        .unwrap_or(0);
-    head.truncate(n);
-    let (kind, _) = gio::content_type_guess(Some(p), Some(&head[..]));
+    let (kind, _) = gio::content_type_guess(Some(name), Some(head));
     let mime = gio::content_type_get_mime_type(&kind)
         .map(|m| m.to_string())
         .unwrap_or_default();
@@ -184,6 +210,134 @@ fn safe_to_open(p: &Path) -> bool {
         || ["image/", "audio/", "video/"]
             .iter()
             .any(|t| mime.starts_with(t))
+}
+
+/// Largest file Open in Default App copies: 1 GiB. The copy usually goes
+/// in `$XDG_RUNTIME_DIR`, which is in memory.
+const MAX_OPEN_COPY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Copies left by earlier runs in `$XDG_RUNTIME_DIR` go once they are this
+/// old.
+const STALE_COPY_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Where Open in Default App puts its copies: `$XDG_RUNTIME_DIR`, or the
+/// temp folder when that is unset. The first copy of the process also
+/// removes stale copies, only in `$XDG_RUNTIME_DIR`, which only this user
+/// can write in.
+fn copies() -> PrivateCopies {
+    static CLEANED: std::sync::Once = std::sync::Once::new();
+    #[cfg(test)]
+    if let Some(base) = TEST_BASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return PrivateCopies::new(base);
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute());
+    let copies = PrivateCopies::new(runtime.clone().unwrap_or_else(std::env::temp_dir));
+    if runtime.is_some() {
+        CLEANED.call_once(|| {
+            let _ = copies.remove_stale(STALE_COPY_AGE);
+        });
+    }
+    copies
+}
+
+/// Where the copies go in tests, instead of the runtime folder.
+#[cfg(test)]
+static TEST_BASE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// The last launched copy's path per (canonical project folder, item
+/// UUID), on the main thread. A new launch of the same item removes the
+/// previous copy's folder, so repeated opens don't fill the runtime
+/// folder, which is in memory. An app still reading the old file keeps
+/// its open file.
+type LaunchedKey = (std::path::PathBuf, String);
+thread_local! {
+    static LAUNCHED: RefCell<HashMap<LaunchedKey, std::path::PathBuf>> =
+        RefCell::new(HashMap::new());
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Hands `copy` to its default app.
+fn launch(copy: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(fake) = *TEST_LAUNCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return fake(copy);
+    }
+    gio::AppInfo::launch_default_for_uri(
+        &gio::File::for_path(copy).uri(),
+        gio::AppLaunchContext::NONE,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+type Launcher = fn(&Path) -> Result<(), String>;
+
+/// Stands in for the default app in tests.
+#[cfg(test)]
+static TEST_LAUNCH: std::sync::Mutex<Option<Launcher>> = std::sync::Mutex::new(None);
+
+/// Held by a test to keep [`copy_for_app`] from starting.
+#[cfg(test)]
+static TEST_HOLD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A private copy of `media` for another app to open, in a new folder of
+/// its own (see [`PrivateCopies`]), when the copy's own bytes pass
+/// [`safe_to_open`]. Its type is sniffed from the copy, so what was
+/// checked is what the app gets, and no later open writes to it. The
+/// error is a sentence to show. This reads and writes up to 1 GiB, so it
+/// runs on a worker thread.
+fn copy_for_app(media: &Media) -> Result<std::path::PathBuf, String> {
+    use std::io::Read;
+    #[cfg(test)]
+    drop(
+        TEST_HOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let copy = copies()
+        .copy(media, MAX_OPEN_COPY_BYTES)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::FileTooLarge => format!(
+                "{} is over 1 GiB, too large for omaquill to hand to another app. \
+                 It's in the project's Files/Data folder.",
+                media.name
+            ),
+            std::io::ErrorKind::StorageFull => format!(
+                "{} is larger than half the free space where omaquill puts copies to open. \
+                 It's in the project's Files/Data folder.",
+                media.name
+            ),
+            _ => format!("Couldn't make a copy of {} to open: {e}", media.name),
+        })?;
+    let mut head = Vec::new();
+    std::fs::File::open(&copy)
+        .and_then(|f| f.take(SNIFF_BYTES as u64).read_to_end(&mut head))
+        .map_err(|e| format!("Couldn't read the copy of {}: {e}", media.name))?;
+    if safe_to_open(&copy, &head) {
+        Ok(copy)
+    } else {
+        let _ = std::fs::remove_file(&copy);
+        let _ = copy.parent().map(std::fs::remove_dir);
+        Err(format!(
+            "omaquill doesn't open {} from a project, since it could run code.",
+            media.name
+        ))
+    }
 }
 
 fn clear<W: IsA<gtk::Widget>>(container: &W, remove: impl Fn(&gtk::Widget)) {
@@ -249,7 +403,87 @@ fn card_text(win: &Win, item: &Item, bodies: &mut HashMap<String, String>) -> (S
 }
 
 impl Win {
+    /// Open in Default App: copies the file on show on a worker thread, then
+    /// launches the copy from the main thread. The button is off and a
+    /// toast says so while the copy runs; a click meanwhile does nothing.
+    /// When the window is gone by then, nothing is launched, and the copy
+    /// stays for the next open to replace.
+    pub(super) fn open_in_default_app(self: &Rc<Self>) {
+        if self.board.copying.get() {
+            return;
+        }
+        let media = match self
+            .board
+            .file_media
+            .borrow()
+            .as_ref()
+            .map(Media::try_clone)
+        {
+            Some(Ok(media)) => media,
+            Some(Err(e)) => {
+                self.toast(&format!("Couldn't read the file to open it: {e}"));
+                return;
+            }
+            None => {
+                self.toast("The file for this item is missing from the project.");
+                return;
+            }
+        };
+        let key = self.project.borrow().as_ref().map(|p| {
+            let root = std::fs::canonicalize(&p.path).unwrap_or_else(|_| p.path.clone());
+            (root, media.uuid().to_string())
+        });
+        self.board.copying.set(true);
+        self.board.open.set_sensitive(false);
+        self.toast(&format!("Copying {} to open it…", media.name));
+        let worker = gio::spawn_blocking(move || copy_for_app(&media));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let done = worker
+                .await
+                .unwrap_or_else(|_| Err("The copy to open stopped unexpectedly.".to_string()));
+            let win = weak.upgrade();
+            if let Some(win) = &win {
+                win.board.copying.set(false);
+                win.board.open.set_sensitive(true);
+            }
+            let copy = match done {
+                Ok(copy) => copy,
+                Err(message) => {
+                    if let Some(win) = win.filter(|w| w.window.is_visible()) {
+                        win.toast(&message);
+                    }
+                    return;
+                }
+            };
+            let Some(win) = win.filter(|w| w.window.is_visible()) else {
+                let _ = copies().remove(&copy);
+                return;
+            };
+            if let Err(e) = launch(&copy) {
+                let _ = copies().remove(&copy);
+                win.toast(&format!(
+                    "Couldn't open the copy of {}: {e}",
+                    file_name(&copy)
+                ));
+                return;
+            }
+            if let Some(key) = key {
+                let previous = LAUNCHED.with(|l| l.borrow_mut().insert(key, copy));
+                if let Some(previous) = previous {
+                    let _ = copies().remove(&previous);
+                }
+            }
+        });
+    }
+
     pub(super) fn wire_board(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.board.open.connect_clicked(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.open_in_default_app();
+            }
+        });
         let weak = Rc::downgrade(self);
         self.board.flow.connect_child_activated(move |_, child| {
             let Some(win) = weak.upgrade() else { return };
@@ -463,7 +697,7 @@ impl Win {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn png(width: u32, height: u32) -> Vec<u8> {
@@ -550,27 +784,266 @@ mod tests {
 
     #[test]
     fn images_are_size_checked_and_only_documents_open() {
-        let dir = std::env::temp_dir().join(format!("omaquill-media-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let small = dir.join("content.png");
-        std::fs::write(&small, png(1, 1)).unwrap();
-        let bomb = dir.join("bomb.png");
-        std::fs::write(&bomb, png(100_000, 100_000)).unwrap();
-        assert!(image_size_ok(&small));
-        assert!(!image_size_ok(&bomb), "a 10-gigapixel header was accepted");
-        assert!(!image_size_ok(&dir.join("missing.png")));
+        assert!(decode_image(&png(1, 1)).is_some());
+        assert!(
+            decode_image(&png(100_000, 100_000)).is_none(),
+            "a 10-gigapixel header was accepted"
+        );
+        assert!(decode_image(b"").is_none());
+        assert!(decode_image(b"not an image").is_none());
 
-        assert!(safe_to_open(&small));
-        let script = dir.join("content.sh");
-        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
-        assert!(!safe_to_open(&script));
-        let desktop = dir.join("content.desktop");
-        std::fs::write(&desktop, "[Desktop Entry]\nExec=sh\n").unwrap();
-        assert!(!safe_to_open(&desktop));
+        assert!(safe_to_open(Path::new("content.png"), &png(1, 1)));
+        let script = b"#!/bin/sh\necho hi\n";
+        assert!(!safe_to_open(Path::new("content.sh"), script));
+        let desktop = b"[Desktop Entry]\nExec=sh\n";
+        assert!(!safe_to_open(Path::new("content.desktop"), desktop));
         // A script wearing a .txt name is still only text to a viewer.
-        let text = dir.join("content.txt");
-        std::fs::write(&text, "plain words\n").unwrap();
-        assert!(safe_to_open(&text));
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(safe_to_open(Path::new("content.txt"), b"plain words\n"));
+    }
+
+    /// A copy of the fixture project with its image item turned into a
+    /// `.bin` file of `size` bytes, sparse after a short header. `.bin` is
+    /// never opened in another app, so the copy ends with a toast and
+    /// launches nothing.
+    fn bin_project(dir: &Path, ext: &str, size: u64) -> std::path::PathBuf {
+        const ITEM: &str = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Lighthouse.scriv");
+        std::fs::create_dir_all(dir).unwrap();
+        let project = dir.join("Lighthouse.scriv");
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(&fixture)
+            .arg(&project)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        let scrivx = project.join("Lighthouse.scrivx");
+        let text = std::fs::read_to_string(&scrivx).unwrap().replace(
+            "<FileExtension>png</FileExtension>",
+            &format!("<FileExtension>{ext}</FileExtension>"),
+        );
+        std::fs::write(&scrivx, text).unwrap();
+        let data = project.join("Files/Data").join(ITEM);
+        std::fs::remove_file(data.join("content.png")).unwrap();
+        let file = std::fs::File::create(data.join(format!("content.{ext}"))).unwrap();
+        std::io::Write::write_all(&mut &file, b"not for another app\n").unwrap();
+        file.set_len(size).unwrap();
+        project
+    }
+
+    /// A window on a [`bin_project`] of `size` bytes in `dir/tag`, with its
+    /// `.bin` item on the file page.
+    fn bin_window(dir: &Path, tag: &str, ext: &str, size: u64) -> Rc<Win> {
+        const ITEM: &str = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
+        let project = bin_project(&dir.join(tag), ext, size);
+        let app = adw::Application::builder()
+            .application_id(format!("io.github.shieldsworks.Omaquill.Open{tag}"))
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let win = Win::new(&app);
+        win.open_project(&project);
+        win.window.present();
+        let media = win.project.borrow().as_ref().unwrap().media(ITEM);
+        assert!(media.is_some(), "the .bin item has no file");
+        *win.board.file_media.borrow_mut() = media;
+        win
+    }
+
+    pub fn an_open_copy_leaves_the_main_loop_running() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("omaquill-open-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = dir.join("runtime");
+        std::fs::create_dir_all(&base).unwrap();
+        *TEST_BASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base.clone());
+        let context = glib::MainContext::default();
+
+        let win = bin_window(&dir, "Held", "bin", 4096);
+        // Draw the window and a toast before measuring.
+        win.toast("warming up");
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ticks = Rc::new(RefCell::new(Vec::new()));
+        let tick = {
+            let ticks = Rc::clone(&ticks);
+            glib::timeout_add_local(Duration::from_millis(10), move || {
+                ticks.borrow_mut().push(Instant::now());
+                glib::ControlFlow::Continue
+            })
+        };
+        // The worker waits on the hold for a second, as a slow copy would.
+        // Work done on the main thread instead would show as one gap of
+        // that second.
+        let hold = TEST_HOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = Instant::now();
+        win.board.open.emit_clicked();
+        assert!(win.board.copying.get() && !win.board.open.is_sensitive());
+        assert_eq!(
+            win.last_toast.borrow().as_str(),
+            "Copying content.bin to open it…"
+        );
+        // A second click while the copy runs starts nothing.
+        win.last_toast.borrow_mut().clear();
+        win.open_in_default_app();
+        assert_eq!(win.last_toast.borrow().as_str(), "");
+        while started.elapsed() < Duration::from_secs(1) {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(win.board.copying.get(), "the copy didn't wait for the hold");
+        drop(hold);
+        while win.board.copying.get() {
+            assert!(started.elapsed() < Duration::from_secs(30));
+            context.iteration(true);
+        }
+        let took = started.elapsed();
+        tick.remove();
+        let mut gap = Duration::ZERO;
+        let mut last = started;
+        for &t in ticks.borrow().iter() {
+            gap = gap.max(t - last);
+            last = t;
+        }
+        gap = gap.max(started + took - last);
+        eprintln!("open held for 1 s: {took:?}, longest main-loop gap {gap:?}");
+        assert!(
+            gap < Duration::from_millis(100),
+            "the main loop stalled {gap:?}"
+        );
+        assert!(win.board.open.is_sensitive());
+        assert_eq!(
+            win.last_toast.borrow().as_str(),
+            "omaquill doesn't open content.bin from a project, since it could run code."
+        );
+        win.window.close();
+
+        // A window closed while its copy runs shows and launches nothing,
+        // and its copy goes.
+        set_launch(Some(launch_must_not_happen));
+        let win = bin_window(&dir, "Closed", "txt", 1024);
+        win.open_in_default_app();
+        win.window.close();
+        let end = Instant::now() + Duration::from_secs(10);
+        while win.board.copying.get() {
+            assert!(Instant::now() < end, "the copy never reported back");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pump_ms(100);
+        assert_eq!(
+            win.last_toast.borrow().as_str(),
+            "Copying content.txt to open it…"
+        );
+        // Refused copies and a closed window's copy leave no folder.
+        assert_eq!(folders(&base), 0);
+        set_launch(None);
+        *TEST_BASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn launch_must_not_happen(copy: &Path) -> Result<(), String> {
+        panic!("{} was launched", copy.display())
+    }
+
+    fn launch_succeeds(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn launch_fails(_: &Path) -> Result<(), String> {
+        Err("no app for it".to_string())
+    }
+
+    fn set_launch(fake: Option<Launcher>) {
+        *TEST_LAUNCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fake;
+    }
+
+    fn pump_ms(ms: u64) {
+        let context = glib::MainContext::default();
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The copy folders in `base`.
+    fn folders(base: &Path) -> usize {
+        std::fs::read_dir(base).unwrap().count()
+    }
+
+    /// Clicks Open in Default App in `win` and runs the main loop until the
+    /// copy reports back.
+    fn open_and_wait(win: &Win) {
+        win.board.open.emit_clicked();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while win.board.copying.get() {
+            assert!(
+                std::time::Instant::now() < end,
+                "the copy never reported back"
+            );
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        pump_ms(50);
+    }
+
+    pub fn repeated_opens_keep_one_copy_per_item() {
+        let dir = std::env::temp_dir().join(format!("omaquill-open-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = dir.join("runtime");
+        std::fs::create_dir_all(&base).unwrap();
+        *TEST_BASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base.clone());
+        set_launch(Some(launch_succeeds));
+
+        let a = bin_window(&dir, "A", "txt", 64);
+        for _ in 0..5 {
+            open_and_wait(&a);
+        }
+        assert_eq!(folders(&base), 1, "five opens of one item");
+        let only = std::fs::read_dir(&base)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        // A copy of the project shares its UUIDs: its own folder, and A's
+        // launched copy stays.
+        let b = bin_window(&dir, "B", "txt", 64);
+        open_and_wait(&b);
+        assert_eq!(folders(&base), 2);
+        assert!(only.join("content.txt").exists());
+
+        // A failed launch removes its new copy, keeps the last launched
+        // one, and says why.
+        set_launch(Some(launch_fails));
+        open_and_wait(&a);
+        assert_eq!(folders(&base), 2);
+        assert!(only.join("content.txt").exists());
+        assert_eq!(
+            a.last_toast.borrow().as_str(),
+            "Couldn't open the copy of content.txt: no app for it"
+        );
+
+        set_launch(None);
+        a.window.close();
+        b.window.close();
+        *TEST_BASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

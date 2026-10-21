@@ -5,6 +5,7 @@ pub mod compile;
 pub mod enchant;
 pub mod export;
 pub mod fonts;
+pub mod fsdir;
 pub mod hyphen;
 pub mod pdf;
 pub mod project;

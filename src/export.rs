@@ -11,7 +11,7 @@
 //! [`RENDER_PDF`].
 
 use crate::compile::{self, Format, Options, Section};
-use crate::project;
+use crate::fsdir;
 use crate::snapshot;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -88,7 +88,7 @@ pub fn run(job: Job, stop: &Stop, renderer: &Path) -> Result<Done, String> {
     if stop.stopped() {
         return Ok(Done::Stopped);
     }
-    match project::write_atomic_if(&job.path, &bytes, || stop.commit()) {
+    match fsdir::write_atomic_if(&job.path, &bytes, || stop.commit()) {
         Ok(true) => Ok(Done::Written),
         Ok(false) => Ok(Done::Stopped),
         Err(e) => Err(e.to_string()),

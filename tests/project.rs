@@ -91,10 +91,7 @@ fn reads_the_binder() {
         ["No Label", "Red", "Blue"]
     );
     assert_eq!(p.statuses().len(), 3);
-    assert!(
-        p.media_path("6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06")
-            .is_some()
-    );
+    assert!(p.media("6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06").is_some());
 }
 
 #[test]
@@ -562,31 +559,31 @@ fn emptying_trash_never_touches_data_for_malformed_items() {
 }
 
 #[test]
-fn saves_keep_permissions_and_links_inside_the_project() {
+fn saves_keep_permissions_and_replace_links_inside_the_project() {
     use std::os::unix::fs::PermissionsExt;
     let c = copy_fixture("perms");
     let file = c.0.join("Files/Data").join(SCENE).join("content.rtf");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // The notes file links to another file inside the project: followed.
+    // The notes file links to another file inside the project. A save
+    // never follows a link: the link becomes an ordinary file, and the file
+    // it named keeps its bytes.
     let real = c.0.join("Files/notes-elsewhere.rtf");
     let notes = c.0.join("Files/Data").join(SCENE).join("notes.rtf");
     std::fs::rename(&notes, &real).unwrap();
+    let before = std::fs::read(&real).unwrap();
     std::os::unix::fs::symlink(&real, &notes).unwrap();
 
     let mut p = Project::open(&c.0).unwrap();
+    assert!(p.notes(SCENE).is_err(), "read through a link");
     p.set_text(SCENE, &RichText::from_plain("private")).unwrap();
     p.set_notes(SCENE, &RichText::from_plain("new note"))
         .unwrap();
     p.save().unwrap();
     let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    assert!(
-        std::fs::symlink_metadata(&notes)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(String::from_utf8_lossy(&std::fs::read(&real).unwrap()).contains("new note"));
+    assert!(std::fs::symlink_metadata(&notes).unwrap().is_file());
+    assert_eq!(p.notes(SCENE).unwrap().plain_text(), "new note");
+    assert_eq!(std::fs::read(&real).unwrap(), before);
 }
 
 /// A project someone sends you can't make omaquill touch your other files
@@ -656,7 +653,7 @@ fn media_extensions_are_plain_and_openable_types_are_few() {
     let c = copy_fixture("media");
     let img = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
     let p = Project::open(&c.0).unwrap();
-    assert!(p.media_path(img).is_some());
+    assert!(p.media(img).is_some());
     for (bad, ext) in [("../../x", "png"), ("desktop", "desktop")] {
         let x = scrivx(&c.0).replace(
             "<FileExtension>png</FileExtension>",
@@ -671,10 +668,10 @@ fn media_extensions_are_plain_and_openable_types_are_few() {
         )
         .unwrap();
         let p = Project::open(&c.0).unwrap();
-        let path = p.media_path(img);
+        let name = p.media(img).map(|m| m.name);
         assert!(
-            path.as_deref().is_none_or(|p| !is_openable(p)),
-            "{bad}: {path:?}"
+            name.as_deref().is_none_or(|n| !is_openable(Path::new(n))),
+            "{bad}: {name:?}"
         );
         std::fs::write(
             c.0.join("Lighthouse.scrivx"),
@@ -799,7 +796,7 @@ fn a_fifo_in_the_project_is_refused_without_blocking() {
     let path = c.0.clone();
     assert!(within(Box::new(move || {
         let p = Project::open(&path).unwrap();
-        p.text(SCENE).is_err() && p.media_path(img).is_none()
+        p.text(SCENE).is_err() && p.media(img).is_none()
     })));
     let c = copy_fixture("fifo-scrivx");
     fifo(&c.0.join("Lighthouse.scrivx"));
