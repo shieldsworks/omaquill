@@ -143,7 +143,7 @@ passes today's lints and has a test. Old code may predate the rules.
 
 ## Allowed unsafe
 
-Seventeen blocks, in sixteen functions. Do not add another unless std and the crates
+Eighteen blocks, in seventeen functions. Do not add another unless std and the crates
 already in `Cargo.toml` have no safe function for the job. A new block needs
 a `// SAFETY:` comment that says why it is sound, and the change names the
 site.
@@ -157,6 +157,8 @@ site.
     `AT_SYMLINK_NOFOLLOW` on it.
   - `Dir::mkdir`, `Dir::link`, `Dir::unlink`, and `Dir::rename` call
     `mkdirat`, `linkat` with no flags, `unlinkat`, and `renameat`.
+  - `Dir::free_bytes` zero-fills a `libc::statvfs` and calls
+    `libc::fstatvfs` on the folder's descriptor.
   - `Dir::open_file` clears `O_NONBLOCK` with `fcntl` on the file it
     opened, and a failed `fcntl` fails the open.
   - `Dir::entries` clears `errno` before each `readdir` and reads it after
@@ -355,13 +357,25 @@ project path is handed to GTK, gio, or another app.
 - `safe_to_open` checks the name and the sniffed type of the first 4096
   bytes.
 - Open in Default App copies the open file with `PrivateCopies` in
-  `src/project.rs`: `content.<ext>`, mode `0o600`, in an
-  `omaquill-open-*` folder of mode `0o700` in `$XDG_RUNTIME_DIR` (the temp
-  folder when that is unset). Each media item keeps one folder for the
-  session, and opening it again replaces the copy. Files over 1 GiB are
-  refused with a toast. In `$XDG_RUNTIME_DIR`, the first copy of a run
-  removes `omaquill-open-*` folders over a day old. It sniffs the copy
-  again and launches the copy.
+  `src/project.rs`. Every open makes a new `omaquill-open-<random>`
+  folder, created exclusively with mode `0o700`, in `$XDG_RUNTIME_DIR`
+  (the temp folder when that is unset), holding one `content.<ext>` of
+  mode `0o600`. No folder is shared or reused, so a copy an app was given
+  is never written again, and projects that share UUIDs can't collide.
+  Files over 1 GiB, or over half the free space in that folder
+  (`Dir::free_bytes`), are refused with a toast. After a launch succeeds,
+  the previous launched copy of the same item (keyed by canonical project
+  folder and UUID, per process) is removed, so repeated opens keep one
+  copy. A failed launch, or a window closed mid-copy, removes the new
+  copy. In `$XDG_RUNTIME_DIR`, the
+  process's first copy removes `omaquill-open-*` entries over a day old,
+  as links when they are links, skipping any it can't remove. The copy is
+  sniffed again and launched; a refused copy's folder is removed.
+- The copy runs on a `gio::spawn_blocking` worker. The button is off and
+  a toast says "Copying…" meanwhile, and the launch happens on the main
+  thread when the copy reports back, unless the window was closed.
+  `board::tests::an_open_copy_leaves_the_main_loop_running` holds the
+  worker for a second and checks the main loop's gaps from the click.
 
 Logout uses `glib_unix::unix_signal_add_local` for `SIGTERM`, `SIGINT`, and
 `SIGHUP`. The handler closes windows so a pending edit can save. Do not

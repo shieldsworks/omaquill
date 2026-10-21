@@ -2413,6 +2413,8 @@ fn gtk_checks() {
     id_less_text_is_read_only();
     a_hostile_paragraph_opens_read_only_and_a_switch_keeps_the_file();
     dialogs::tests::a_compile_leaves_the_main_loop_running();
+    board::tests::an_open_copy_leaves_the_main_loop_running();
+    board::tests::repeated_opens_keep_one_copy_per_item();
     dialogs::tests::cancel_and_closing_the_window_keep_the_target();
     dialogs::tests::closing_every_window_waits_for_the_compile_to_finish();
     dialogs::tests::an_edit_during_a_compile_stays_out_of_it();

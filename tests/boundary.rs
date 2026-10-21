@@ -484,7 +484,7 @@ fn media_for_another_app_is_a_private_copy() {
     std::fs::create_dir(&base).unwrap();
     let p = Project::open(&project).unwrap();
     let media = p.media(IMAGE).unwrap();
-    let mut copies = PrivateCopies::new(base.clone());
+    let copies = PrivateCopies::new(base.clone());
     let copy = copies.copy(&media, 1 << 30).unwrap();
     assert!(copy.starts_with(&base) && !copy.starts_with(&project));
     assert_eq!(copy.file_name().unwrap(), "content.png");
@@ -492,12 +492,13 @@ fn media_for_another_app_is_a_private_copy() {
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&copy), 0o600);
     assert_eq!(mode(copy.parent().unwrap()), 0o700);
-    // Opening it again replaces the copy in the same folder.
+    // Opening it again makes a new folder and leaves the first copy, which
+    // an app may still be reading, as it was.
     std::fs::write(&copy, "an app changed it").unwrap();
     let again = copies.copy(&media, 1 << 30).unwrap();
-    assert_eq!(again, copy);
+    assert_ne!(again.parent(), copy.parent());
     assert_eq!(std::fs::read(&again).unwrap(), std::fs::read(&png).unwrap());
-    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+    assert_eq!(std::fs::read(&copy).unwrap(), b"an app changed it");
     assert_eq!(
         std::fs::read_dir(copy.parent().unwrap()).unwrap().count(),
         1
@@ -514,7 +515,7 @@ fn media_over_the_cap_is_not_copied() {
     std::fs::create_dir(&base).unwrap();
     let p = Project::open(&project).unwrap();
     let media = p.media(IMAGE).unwrap();
-    let mut copies = PrivateCopies::new(base.clone());
+    let copies = PrivateCopies::new(base.clone());
     let err = copies.copy(&media, size - 1).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
     assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
@@ -537,11 +538,18 @@ fn stale_copies_from_earlier_runs_are_removed() {
     std::os::unix::fs::symlink(&elsewhere, base.join("omaquill-open-link")).unwrap();
     std::fs::write(base.join("unrelated"), "not ours").unwrap();
     let p = Project::open(&project).unwrap();
-    let mut copies = PrivateCopies::new(base.clone());
+    let copies = PrivateCopies::new(base.clone());
+    // The old entries were last changed two days ago.
+    let aged = std::process::Command::new("touch")
+        .args(["-h", "-d", "2 days ago"])
+        .arg(&old)
+        .arg(base.join("omaquill-open-link"))
+        .status()
+        .unwrap();
+    assert!(aged.success());
     let fresh = copies.copy(&p.media(IMAGE).unwrap(), 1 << 30).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
     let removed = copies
-        .remove_stale(std::time::Duration::from_millis(10))
+        .remove_stale(std::time::Duration::from_secs(24 * 60 * 60))
         .unwrap();
     assert_eq!(removed, 2);
     assert!(!old.exists());
@@ -565,4 +573,130 @@ fn a_backup_reads_the_open_project_not_its_old_path() {
     let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
     assert!(has(b"Lighthouse.scrivx"));
     assert!(!has(b"impostor.txt"));
+}
+
+#[test]
+fn stale_cleanup_goes_on_past_an_entry_it_cannot_remove() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = scratch("media-copy-stuck");
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    // A folder whose contents can't be removed: its inner folder has no
+    // write permission.
+    let stuck = base.join("omaquill-open-stuck");
+    let inner = stuck.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("content.png"), "stuck").unwrap();
+    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = inner.join("probe");
+    let as_root = std::fs::write(&probe, "").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    for n in 0..8 {
+        let old = base.join(format!("omaquill-open-old{n}"));
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("content.png"), "old").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let removed = PrivateCopies::new(base.clone())
+        .remove_stale(std::time::Duration::from_millis(10))
+        .unwrap();
+    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let left: Vec<_> = std::fs::read_dir(&base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    if as_root {
+        eprintln!("running as root: every folder is removable, so none was stuck");
+        assert_eq!((removed, left.len()), (9, 0));
+    } else {
+        assert_eq!(removed, 8);
+        assert_eq!(left, ["omaquill-open-stuck"]);
+    }
+}
+
+#[test]
+fn projects_sharing_uuids_get_their_own_copies() {
+    // A duplicated project keeps its items' UUIDs.
+    let s = scratch("media-copy-twins");
+    let a = s.0.join("Lighthouse.scriv");
+    let b = s.0.join("Lighthouse copy.scriv");
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(&a)
+        .arg(&b)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let png_b = b.join("Files/Data").join(IMAGE).join("content.png");
+    let mut bytes_b = std::fs::read(&png_b).unwrap();
+    bytes_b.extend_from_slice(b"project B");
+    std::fs::write(&png_b, &bytes_b).unwrap();
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    let (pa, pb) = (Project::open(&a).unwrap(), Project::open(&b).unwrap());
+    let copies = PrivateCopies::new(base.clone());
+    let launched = copies.copy(&pa.media(IMAGE).unwrap(), 1 << 30).unwrap();
+    let launched_bytes = std::fs::read(&launched).unwrap();
+    // Window B opens the same item of its own project.
+    let other = PrivateCopies::new(base.clone())
+        .copy(&pb.media(IMAGE).unwrap(), 1 << 30)
+        .unwrap();
+    assert_ne!(launched, other);
+    assert_eq!(std::fs::read(&launched).unwrap(), launched_bytes);
+    assert_eq!(std::fs::read(&other).unwrap(), bytes_b);
+}
+
+#[test]
+fn a_copy_over_half_the_free_space_is_refused() {
+    let s = scratch("media-copy-space");
+    let project = s.0.join("Lighthouse.scriv");
+    let png = project.join("Files/Data").join(IMAGE).join("content.png");
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    let df = std::process::Command::new("df")
+        .args(["-B1", "--output=avail"])
+        .arg(&base)
+        .output()
+        .unwrap();
+    let free: u64 = String::from_utf8_lossy(&df.stdout)
+        .lines()
+        .nth(1)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // A sparse file claiming 60% of the free space takes none of it.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&png)
+        .unwrap()
+        .set_len(free / 10 * 6)
+        .unwrap();
+    let p = Project::open(&project).unwrap();
+    let err = PrivateCopies::new(base.clone())
+        .copy(&p.media(IMAGE).unwrap(), u64::MAX)
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::StorageFull, "{err}");
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+}
+
+#[test]
+fn removing_a_copy_removes_only_its_folder() {
+    let s = scratch("media-copy-remove");
+    let project = s.0.join("Lighthouse.scriv");
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    let p = Project::open(&project).unwrap();
+    let copies = PrivateCopies::new(base.clone());
+    let keep = copies.copy(&p.media(IMAGE).unwrap(), 1 << 30).unwrap();
+    let copy = copies.copy(&p.media(IMAGE).unwrap(), 1 << 30).unwrap();
+    copies.remove(&copy).unwrap();
+    assert!(!copy.parent().unwrap().exists());
+    assert!(keep.exists());
+    // A path that is not a copy in this base is refused.
+    let png = project.join("Files/Data").join(IMAGE).join("content.png");
+    assert!(copies.remove(&png).is_err());
+    assert!(png.exists());
+    assert!(copies.remove(&base.join("content.png")).is_err());
+    assert!(keep.exists());
 }

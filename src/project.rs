@@ -418,42 +418,43 @@ impl Media {
         Ok(buf)
     }
 
+    /// A second handle on the same open file, to read on another thread.
+    pub fn try_clone(&self) -> io::Result<Media> {
+        Ok(Media {
+            name: self.name.clone(),
+            uuid: self.uuid.clone(),
+            file: self.file.try_clone()?,
+        })
+    }
+
     /// The media item's UUID.
     pub fn uuid(&self) -> &str {
         &self.uuid
     }
 }
 
-/// Private copies of media for another app to open, in `base`: one folder
-/// per media item, named `omaquill-open-<random>`, made with mode `0o700`.
-/// Each copy is `content.<ext>`, mode `0o600`. Its path is the one to hand
-/// to another app: no other user can swap it, and it is not in the
-/// project.
-///
-/// A folder this value made is held open and reused for the same item, so
-/// opening an item again replaces its copy instead of adding one. The
-/// copies stay after this value is dropped, for the app to read.
-#[derive(Debug)]
+/// Private copies of media for another app to open, in `base`. Every
+/// [`PrivateCopies::copy`] makes a new folder `omaquill-open-<random>`,
+/// created exclusively with mode `0o700`, holding one copy
+/// `content.<ext>` of mode `0o600`. Its path is the one to hand to another
+/// app: no other user can swap it, it is not in the project, and no later
+/// copy writes to it. Nothing is shared or reused between copies, so two
+/// projects whose items share UUIDs can't collide.
+#[derive(Debug, Clone)]
 pub struct PrivateCopies {
     base: PathBuf,
-    /// Media UUID → its folder's name in `base`, and the folder, open.
-    folders: HashMap<String, (String, Dir)>,
 }
 
 impl PrivateCopies {
     pub fn new(base: PathBuf) -> PrivateCopies {
-        PrivateCopies {
-            base,
-            folders: HashMap::new(),
-        }
+        PrivateCopies { base }
     }
 
-    /// Copies `media` into its item's folder and returns the copy's path.
-    /// A file longer than `max` bytes is a `FileTooLarge` error, and
-    /// nothing is copied.
-    pub fn copy(&mut self, media: &Media, max: u64) -> io::Result<PathBuf> {
-        use io::{Read, Seek};
-        use std::os::unix::fs::PermissionsExt;
+    /// Copies `media` into a new folder and returns the copy's path. A
+    /// file longer than `max` bytes is a `FileTooLarge` error, and one
+    /// larger than half the free space in `base` a `StorageFull` error. On any
+    /// error the new folder is removed.
+    pub fn copy(&self, media: &Media, max: u64) -> io::Result<PathBuf> {
         let too_large = || {
             io::Error::new(
                 io::ErrorKind::FileTooLarge,
@@ -463,50 +464,85 @@ impl PrivateCopies {
         if media.file.metadata()?.len() > max {
             return Err(too_large());
         }
-        let (folder_name, folder) = match self.folders.remove(&media.uuid) {
-            Some(held) => held,
-            None => {
-                let name = format!("omaquill-open-{}", new_uuid());
-                let dir = Dir::open(&self.base)?.create_private_dir_new(OsStr::new(&name))?;
-                (name, dir)
-            }
-        };
-        // The folder is this user's, mode 0o700, made by this value, so
-        // only this user's programs put anything in it.
-        for entry in folder.entries()? {
-            folder.remove_tree(Path::new(&entry))?;
+        let base = Dir::open(&self.base)?;
+        let size = media.file.metadata()?.len();
+        if size > base.free_bytes()? / 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "{} is larger than half the free space in {}",
+                    media.name,
+                    self.base.display()
+                ),
+            ));
         }
+        let folder_name = format!("omaquill-open-{}", new_uuid());
+        let folder = base.create_private_dir_new(OsStr::new(&folder_name))?;
+        let copied = Self::fill(&folder, media, max).and_then(|copied| {
+            if copied > max {
+                Err(too_large())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = copied {
+            drop(folder);
+            let _ = base.remove_tree(Path::new(&folder_name));
+            return Err(e);
+        }
+        Ok(self.base.join(folder_name).join(&media.name))
+    }
+
+    /// Removes the folder of `copy`, a path [`PrivateCopies::copy`]
+    /// returned. Anything else is left alone: only an `omaquill-open-*`
+    /// folder right in `base` goes, and a link there goes as a link.
+    pub fn remove(&self, copy: &Path) -> io::Result<()> {
+        let folder = copy
+            .parent()
+            .filter(|f| f.parent() == Some(self.base.as_path()));
+        let name = folder
+            .and_then(|f| f.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.starts_with("omaquill-open-"));
+        match name {
+            Some(name) => Dir::open(&self.base)?.remove_tree(Path::new(name)),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a copy in {}",
+                    copy.display(),
+                    self.base.display()
+                ),
+            )),
+        }
+    }
+
+    /// Writes at most `max + 1` bytes of `media` to a new `0o600` file in
+    /// `folder` and returns how many were written.
+    fn fill(folder: &Dir, media: &Media, max: u64) -> io::Result<u64> {
+        use io::{Read, Seek};
+        use std::os::unix::fs::PermissionsExt;
         let mut out = folder.create_new(OsStr::new(&media.name))?;
         out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let mut from = &media.file;
         from.seek(io::SeekFrom::Start(0))?;
         let copied = io::copy(&mut from.take(max.saturating_add(1)), &mut out)?;
-        if copied > max {
-            drop(out);
-            folder.remove_file(Path::new(&media.name))?;
-            self.folders
-                .insert(media.uuid.clone(), (folder_name, folder));
-            return Err(too_large());
-        }
         out.sync_all()?;
-        let path = self.base.join(&folder_name).join(&media.name);
-        self.folders
-            .insert(media.uuid.clone(), (folder_name, folder));
-        Ok(path)
+        Ok(copied)
     }
 
-    /// Removes `omaquill-open-*` folders in `base` last changed more than
-    /// `age` ago, left by earlier runs, and returns how many went. Only for
-    /// a `base` no other user can write in, such as `$XDG_RUNTIME_DIR`:
-    /// every folder there is this user's. Symlinks are removed as links,
-    /// never followed.
+    /// Removes `omaquill-open-*` entries in `base` last changed more than
+    /// `age` ago and returns how many went. An entry that can't be
+    /// removed, such as another user's folder, is skipped, and the rest
+    /// are still tried. Symlinks are removed as links, never followed.
+    /// Only for a `base` no other user can write in, such as
+    /// `$XDG_RUNTIME_DIR`.
     pub fn remove_stale(&self, age: std::time::Duration) -> io::Result<usize> {
         let base = Dir::open(&self.base)?;
-        let held: HashSet<&str> = self.folders.values().map(|(n, _)| n.as_str()).collect();
         let mut removed = 0;
         for entry in base.entries()? {
             let Some(name) = entry.to_str() else { continue };
-            if !name.starts_with("omaquill-open-") || held.contains(name) {
+            if !name.starts_with("omaquill-open-") {
                 continue;
             }
             let stale = std::fs::symlink_metadata(self.base.join(name))
@@ -514,8 +550,7 @@ impl PrivateCopies {
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|d| d > age);
-            if stale {
-                base.remove_tree(Path::new(name))?;
+            if stale && base.remove_tree(Path::new(name)).is_ok() {
                 removed += 1;
             }
         }

@@ -314,6 +314,20 @@ impl Dir {
         self.child(name, false)
     }
 
+    /// Bytes free for this user on the filesystem holding this folder.
+    pub fn free_bytes(&self) -> io::Result<u64> {
+        // SAFETY: `libc::statvfs` is a C struct of integers, so all-zero is
+        // a valid value. fstatvfs writes only into `st`, and `self.fd` is
+        // open for the whole call.
+        let (r, st) = unsafe {
+            let mut st: libc::statvfs = std::mem::zeroed();
+            let r = libc::fstatvfs(self.fd.as_raw_fd(), &mut st);
+            (r, st)
+        };
+        cvt(r)?;
+        Ok(st.f_bavail.saturating_mul(st.f_frsize))
+    }
+
     /// A second descriptor for this folder, with its own read position. It
     /// can move to another thread.
     pub fn try_clone(&self) -> io::Result<Dir> {
