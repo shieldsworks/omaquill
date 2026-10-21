@@ -8,7 +8,8 @@
 
 use omaquill::compile::{self, Format, Headings, Options};
 use omaquill::export::{self, Done, Job, Stop};
-use omaquill::project::{self, Kind, Project};
+use omaquill::fsdir;
+use omaquill::project::{Kind, Project};
 use omaquill::rtf::{self, RichText};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1152,7 +1153,7 @@ fn a_stopped_export_leaves_its_target() {
     assert_eq!(names(&dir.0), ["Out.pdf"]);
     // A stop that lands after the bytes are on disk, just before the
     // rename: the whole new file sits beside the target, and is removed.
-    let kept = project::write_atomic_if(&path, b"the new compile", || {
+    let kept = fsdir::write_atomic_if(&path, b"the new compile", || {
         assert_eq!(names(&dir.0).len(), 2, "{:?}", names(&dir.0));
         assert_eq!(std::fs::read(&path).unwrap(), b"the last good compile");
         false

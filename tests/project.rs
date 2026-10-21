@@ -562,31 +562,31 @@ fn emptying_trash_never_touches_data_for_malformed_items() {
 }
 
 #[test]
-fn saves_keep_permissions_and_links_inside_the_project() {
+fn saves_keep_permissions_and_replace_links_inside_the_project() {
     use std::os::unix::fs::PermissionsExt;
     let c = copy_fixture("perms");
     let file = c.0.join("Files/Data").join(SCENE).join("content.rtf");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // The notes file links to another file inside the project: followed.
+    // The notes file links to another file inside the project. A save
+    // never follows a link: the link becomes an ordinary file, and the file
+    // it named keeps its bytes.
     let real = c.0.join("Files/notes-elsewhere.rtf");
     let notes = c.0.join("Files/Data").join(SCENE).join("notes.rtf");
     std::fs::rename(&notes, &real).unwrap();
+    let before = std::fs::read(&real).unwrap();
     std::os::unix::fs::symlink(&real, &notes).unwrap();
 
     let mut p = Project::open(&c.0).unwrap();
+    assert!(p.notes(SCENE).is_err(), "read through a link");
     p.set_text(SCENE, &RichText::from_plain("private")).unwrap();
     p.set_notes(SCENE, &RichText::from_plain("new note"))
         .unwrap();
     p.save().unwrap();
     let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    assert!(
-        std::fs::symlink_metadata(&notes)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(String::from_utf8_lossy(&std::fs::read(&real).unwrap()).contains("new note"));
+    assert!(std::fs::symlink_metadata(&notes).unwrap().is_file());
+    assert_eq!(p.notes(SCENE).unwrap().plain_text(), "new note");
+    assert_eq!(std::fs::read(&real).unwrap(), before);
 }
 
 /// A project someone sends you can't make omaquill touch your other files

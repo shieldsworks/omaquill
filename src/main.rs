@@ -166,7 +166,7 @@ fn compile_cli(args: &[String]) -> Result<(), String> {
         }
     };
     let bytes = compile::compile(&p, &opts, format).map_err(|e| e.to_string())?;
-    std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    omaquill::fsdir::write_atomic(out, &bytes).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("{}", out.display());
     Ok(())
 }

@@ -46,6 +46,10 @@ What the tests cover:
   bytes. `epubcheck`, `pdfinfo`, and `pdftotext` run only when they
   are already installed. CI does not install them. Without them the PDF test
   still requires a `%PDF-` header, and it skips the page-size check.
+- `tests/boundary.rs` copies the fixture and races a second thread that
+  swaps files and folders for symlinks while omaquill saves and backs up.
+  It asserts that the files outside the project keep their bytes. Each race
+  runs for 2.5 seconds.
 - `tests/real_project.rs` runs only when `OMAQUILL_REAL_PROJECT` is set.
   Point it at a `.scriv` folder. The tests only read that folder. With the
   variable unset, they return and pass.
@@ -139,11 +143,24 @@ passes today's lints and has a test. Old code may predate the rules.
 
 ## Allowed unsafe
 
-Nine blocks, in eight functions. Do not add another unless std and the crates
+Seventeen blocks, in sixteen functions. Do not add another unless std and the crates
 already in `Cargo.toml` have no safe function for the job. A new block needs
 a `// SAFETY:` comment that says why it is sound, and the change names the
 site.
 
+- `src/fsdir.rs` calls the `*at` functions that std does not offer. std
+  opens files by path only. Each block is one call on a descriptor the
+  `Dir` owns and a NUL-terminated name that outlives the call.
+  - `Dir::openat` calls `libc::openat` and hands a descriptor it returns to
+    `OwnedFd`, which is then its only owner.
+  - `Dir::stat` zero-fills a `libc::stat` and calls `libc::fstatat` with
+    `AT_SYMLINK_NOFOLLOW` on it.
+  - `Dir::mkdir`, `Dir::link`, `Dir::unlink`, and `Dir::rename` call
+    `mkdirat`, `linkat` with no flags, `unlinkat`, and `renameat`.
+  - `Dir::read` clears `O_NONBLOCK` with `fcntl` on the file it opened.
+  - `Dir::entries` hands a fresh descriptor to `fdopendir`, copies each
+    name `readdir` returns before the next call, and calls `closedir` once.
+    When `fdopendir` fails, `OwnedFd` closes the descriptor.
 - `timestamp` in `src/project.rs` zero-fills a `libc::tm`, then calls
   `libc::localtime_r` on that struct. Scrivener stores a local modified time
   with a numeric offset. `SystemTime` does not provide the offset.
@@ -219,56 +236,73 @@ American English patterns. Keep the copyright notice in
 A `.scriv` folder is the user's book. These rules keep a save from leaving
 a half-written chapter. They also keep a write inside the project.
 
-Project text, the `.scrivx`, `Files/Data/docs.checksum`,
-`Files/search.indexes`, and the files `src/state.rs` writes are replaced
-through `write_atomic` in `src/project.rs`. `Project::create` writes a new
-project's first `.scrivx` and empty `docs.checksum` with `std::fs::write`.
+Every file in a project is reached through `fsdir::Dir` in
+`src/fsdir.rs`. `Project::open` opens the project folder once. Each read,
+write and delete after that starts from that descriptor and opens one name
+at a time with `openat` and `O_NOFOLLOW`. No path in the project is checked
+first and opened later.
 
-- `write_atomic` creates a new temp file in the same directory. The name is
-  `.<filename>.<pid>-<n>.omaquill-tmp`, opened with `create_new`.
-- When the target already exists, the temp file takes the target's
-  permission bits.
+- A folder on the way that is a symlink refuses the call with
+  `PermissionDenied`. This holds when the link points inside the project
+  too. `fsdir::is_link_refusal` tells that error apart.
+- A file that is a symlink is not read. A write replaces the link with an
+  ordinary file. The link's target keeps its bytes.
+- `..`, an absolute path, an empty name, and a NUL byte are refused with
+  `InvalidInput`.
+- A folder, FIFO, socket or device where a file is written is refused with
+  `InvalidInput`, and nothing is written.
+
+`Dir::write_atomic_if` replaces one file.
+
+- It creates `.<filename>.<pid>-<n>.omaquill-tmp` in the target's folder
+  with `O_CREAT | O_EXCL | O_NOFOLLOW`. A name already taken moves on to
+  the next `n`, up to 1,000 tries.
+- When the target is a regular file, the temp file takes its `0o777`
+  permission bits. Set-id and sticky bits are not copied.
 - It writes the bytes, calls `sync_all` on the temp file, and renames the
-  temp file onto the target. A failure deletes the temp file. The file
-  `sync_all` is part of that result, so a failed file sync does not rename.
-- It then opens the parent directory and calls `sync_all` on it, so the
-  rename survives a power cut. That directory call ignores its error. Do
-  not delete the call. Do not make a directory sync error fail the save in
-  an unrelated change. That is its own change, with a test.
-- If `path` is an existing symlink, `canonicalize` sends the write to the
-  target file.
+  temp file onto the target with `renameat` in that same folder. A failure
+  deletes the temp file. The file `sync_all` is part of that result, so a
+  failed file sync does not rename.
+- It then calls `sync_all` on the folder, so the rename survives a power
+  cut. That folder call ignores its error. Do not delete the call. Do not
+  make a folder sync error fail the save in an unrelated change. That is
+  its own change, with a test.
+- A rename replaces the directory entry. It does not write into the file
+  the entry named before, so a hard link at the target does not carry the
+  write anywhere else.
 
-`write_inside` is the project boundary around `write_atomic`.
+`set_text` writes `content.rtf` immediately through `Dir::write_atomic`.
+`set_notes` and `set_synopsis` write that way when the text is not empty,
+and remove the file through `Dir::remove_file` when it is. `Project::save`
+rewrites the `.scrivx`, `docs.checksum`, and the search index only when
+those are dirty. Do not make a save rewrite every document.
 
-- The parent directory must resolve inside the project. Otherwise the write
-  returns `PermissionDenied` and the outside file stays as it was.
-- A symlink whose target is outside the project is removed, and the new
-  file is a normal file inside the project. The outside target is left
-  unchanged.
-- A symlink whose target stays inside the project is kept, and the write
-  follows it.
-
-`read_inside` refuses a path that resolves outside the project.
-`remove_file_inside` and `remove_dir_inside` refuse a parent that resolves
-outside the project. A symlink is removed as a link, and its target is left
-unchanged. A real directory that resolves outside the project is left in
-place. `empty_trash` skips a child name that fails `is_uuid`, so a missing
-id cannot become a delete of `Files/Data`. A Trash folder with no id returns
+`Dir::remove_file` and `Dir::remove_tree` remove a symlink as a link and
+leave its target unchanged. `remove_tree` walks the folder through
+descriptors, so a symlink inside it is removed as a link too.
+`empty_trash` skips a child name that fails `is_uuid`, so a missing id
+cannot become a delete of `Files/Data`. A Trash folder with no id returns
 an error and deletes nothing.
 
-`set_text` writes `content.rtf` immediately through `write_inside`.
-`set_notes` and `set_synopsis` write through `write_inside` when the text
-is not empty, and remove the file through `remove_file_inside` when it is.
-`Project::save` rewrites the `.scrivx`, `docs.checksum`, and the search
-index only when those are dirty. Do not make a save rewrite every document.
+`Project::create` makes the project folder with `mkdirat` in its parent
+and opens it without following a symlink. An entry already at that path,
+a dangling symlink included, is an error.
 
-Settings, the recent-project list, per-project view state, and `today.json`
-call `write_atomic` directly. They live outside the project, under the paths
-documented in `src/state.rs`. Do not send them through `write_inside`.
+Files outside a project go through `fsdir::write_atomic` or
+`fsdir::write_atomic_if` with a path. These are the window's Compile, the
+`omaquill compile` command, settings, the recent-project list,
+per-project view state, the word lists, and `today.json`. That call opens
+the file's folder once, following symlinks in the folder's path, which the
+user chose. Then it is `Dir::write_atomic_if` in that folder. A symlink at
+the file itself is replaced, not followed. That covers a link planted in a
+shared folder where the user exports. It also means a settings file kept
+as a symlink into a dotfiles repository becomes a plain file on the next
+save.
 
 `project::backup` zips one project into `state::backup_dir`. The folder name
 includes a hash of the project's full path, so two projects do not share or
-prune each other's zips. The zip is written to
+prune each other's zips. It reads the project through a `Dir`, and a file
+or folder that is a symlink is left out of the zip. The zip is written to
 `.backup.<pid>-<n>.omaquill-tmp` in that folder, synced, then hard-linked
 to `<date>.zip` (or `<date> N.zip` when that second already has a backup).
 The link fails if the name is already there, so two backups never share a
@@ -283,8 +317,9 @@ into another.
 `is_openable` allows documents and media only. The test
 `media_extensions_are_plain_and_openable_types_are_few` refuses `.desktop`,
 `.sh`, `.html`, `.exe`, `.AppImage`, and `.py`. `media_path` accepts a
-short alphanumeric extension when the file exists and resolves inside the
-project.
+short alphanumeric extension when the file is a regular file reached
+through the project's `Dir` with no symlink on the way. It returns a path,
+and the app that opens that path resolves it again.
 `safe_to_open` in `src/ui/board.rs` also reads up to 4096 bytes and checks
 the sniffed type. `image_size_ok` reads the header and refuses an image of
 more than 100,000,000 pixels, or a side longer than 30,000, before decode.
@@ -293,7 +328,7 @@ Logout uses `glib_unix::unix_signal_add_local` for `SIGTERM`, `SIGINT`, and
 `SIGHUP`. The handler closes windows so a pending edit can save. Do not
 replace that handler with an exit that skips the close.
 
-A change to `write_atomic`, the inside checks, `is_uuid` in `empty_trash`,
+A change to `src/fsdir.rs`, `is_uuid` in `empty_trash`,
 `is_openable`, `safe_to_open`, `image_size_ok`, backup pruning, or the
 `editor_uuid` save path needs a test that fails when the guarantee is gone.
 
@@ -301,7 +336,8 @@ A change to `write_atomic`, the inside checks, `is_uuid` in `empty_trash`,
 
 - `src/main.rs` is the `omaquill` command. It handles `check`, `compile`, and the window.
 - `src/lib.rs` declares the library modules and does not import the `gtk` crate.
-- `src/project.rs` is the `.scriv` project, containment, `write_atomic`, backup, and timestamps.
+- `src/project.rs` is the `.scriv` project, backup, and timestamps.
+- `src/fsdir.rs` is `Dir`, the open folder every project file is reached through, and the atomic write.
 - `src/rtf.rs` reads and writes RTF.
 - `src/xml.rs` reads and writes the project XML.
 - `src/compile.rs` gathers the manuscript and dispatches each format. PDF layout is `src/pdf.rs`.
@@ -322,6 +358,7 @@ A change to `write_atomic`, the inside checks, `is_uuid` in `empty_trash`,
 - `ui/WordsBar.qml` is the bar widget. It reads `today.json` and does not write the project.
 - `tests/project.rs` edits a temp copy of the fixture.
 - `tests/compile.rs` checks each compile format.
+- `tests/boundary.rs` races symlink swaps against saves and backups.
 - `tests/real_project.rs` reads an external project when asked.
 - `tests/fixtures/Lighthouse.scriv` is the made-up project.
 - `scripts/install-local.sh` and `scripts/uninstall-local.sh` install and remove the local build.
