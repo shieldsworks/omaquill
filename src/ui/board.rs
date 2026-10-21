@@ -4,7 +4,7 @@
 use super::{Win, group};
 use adw::prelude::*;
 use gtk::gio;
-use omaquill::project::{Item, Media};
+use omaquill::project::{Item, Media, PrivateCopies};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -20,6 +20,11 @@ pub struct Board {
     pub file_page: adw::StatusPage,
     /// The media on the file page, kept open for Open in Default App.
     file_media: Rc<RefCell<Option<Media>>>,
+    /// Open in Default App, on the file page.
+    open: gtk::Button,
+    /// Copies made for Open in Default App, one per media item. `None`
+    /// until the first one.
+    copies: RefCell<Option<PrivateCopies>>,
     /// UUIDs of the cards or rows on show, in order.
     shown: RefCell<Vec<String>>,
 }
@@ -70,24 +75,12 @@ impl Board {
             .build();
         let media_page = gtk::ScrolledWindow::builder().child(&picture).build();
         let file_media: Rc<RefCell<Option<Media>>> = Rc::default();
+
         let open = gtk::Button::builder()
             .label("Open in Default App")
             .css_classes(["pill", "suggested-action"])
             .halign(gtk::Align::Center)
             .build();
-        {
-            let file_media = file_media.clone();
-            open.connect_clicked(move |_| {
-                if let Some(media) = file_media.borrow().as_ref()
-                    && let Some(copy) = private_copy_to_open(media)
-                {
-                    let _ = gio::AppInfo::launch_default_for_uri(
-                        &gio::File::for_path(&copy).uri(),
-                        gio::AppLaunchContext::NONE,
-                    );
-                }
-            });
-        }
         let file_page = adw::StatusPage::builder()
             .icon_name("x-office-document-symbolic")
             .child(&open)
@@ -101,6 +94,8 @@ impl Board {
             picture,
             file_page,
             file_media,
+            open,
+            copies: RefCell::new(None),
             shown: RefCell::new(Vec::new()),
         }
     }
@@ -217,29 +212,64 @@ fn safe_to_open(name: &Path, head: &[u8]) -> bool {
             .any(|t| mime.starts_with(t))
 }
 
-/// A private copy of `media` for another app to open, when the copy's own
-/// bytes pass [`safe_to_open`]. The copy goes in `$XDG_RUNTIME_DIR`, or
-/// the temp folder when that is unset. Its type is sniffed from the copy,
-/// so what was checked is what the app gets.
-fn private_copy_to_open(media: &Media) -> Option<std::path::PathBuf> {
-    use std::io::Read;
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(std::env::temp_dir);
-    let copy = media.copy_to_private_file(&base).ok()?;
-    let mut head = Vec::new();
-    std::fs::File::open(&copy)
-        .ok()?
-        .take(SNIFF_BYTES as u64)
-        .read_to_end(&mut head)
-        .ok()?;
-    if safe_to_open(&copy, &head) {
-        Some(copy)
-    } else {
-        let _ = std::fs::remove_file(&copy);
-        let _ = copy.parent().map(std::fs::remove_dir);
-        None
+/// Largest file Open in Default App copies: 1 GiB. The copy usually goes
+/// in `$XDG_RUNTIME_DIR`, which is in memory.
+const MAX_OPEN_COPY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Copies left by earlier runs in `$XDG_RUNTIME_DIR` go once they are this
+/// old.
+const STALE_COPY_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+impl Board {
+    /// A private copy of the media on the file page for another app to
+    /// open (see [`PrivateCopies`]), when the copy's own bytes pass
+    /// [`safe_to_open`]. Its type is sniffed from the copy, so what was
+    /// checked is what the app gets. The error is a sentence to show.
+    ///
+    /// Copies go in `$XDG_RUNTIME_DIR`, or the temp folder when that is
+    /// unset. Opening an item again replaces its copy. In
+    /// `$XDG_RUNTIME_DIR`, which only this user can write in, the first
+    /// copy also removes copies a day old left by earlier runs.
+    fn copy_to_open(&self) -> Result<std::path::PathBuf, String> {
+        use std::io::Read;
+        let media = self.file_media.borrow();
+        let Some(media) = media.as_ref() else {
+            return Err("The file for this item is missing from the project.".to_string());
+        };
+        let mut copies = self.copies.borrow_mut();
+        let copies = copies.get_or_insert_with(|| {
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute());
+            let copies = PrivateCopies::new(runtime.clone().unwrap_or_else(std::env::temp_dir));
+            if runtime.is_some() {
+                let _ = copies.remove_stale(STALE_COPY_AGE);
+            }
+            copies
+        });
+        let copy = copies
+            .copy(media, MAX_OPEN_COPY_BYTES)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::FileTooLarge => format!(
+                    "{} is over 1 GiB, too large for omaquill to hand to another app. \
+                     It's in the project's Files/Data folder.",
+                    media.name
+                ),
+                _ => format!("Couldn't make a copy of {} to open: {e}", media.name),
+            })?;
+        let mut head = Vec::new();
+        std::fs::File::open(&copy)
+            .and_then(|f| f.take(SNIFF_BYTES as u64).read_to_end(&mut head))
+            .map_err(|e| format!("Couldn't read the copy of {}: {e}", media.name))?;
+        if safe_to_open(&copy, &head) {
+            Ok(copy)
+        } else {
+            let _ = std::fs::remove_file(&copy);
+            Err(format!(
+                "omaquill doesn't open {} from a project, since it could run code.",
+                media.name
+            ))
+        }
     }
 }
 
@@ -307,6 +337,19 @@ fn card_text(win: &Win, item: &Item, bodies: &mut HashMap<String, String>) -> (S
 
 impl Win {
     pub(super) fn wire_board(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.board.open.connect_clicked(move |_| {
+            let Some(win) = weak.upgrade() else { return };
+            match win.board.copy_to_open() {
+                Ok(copy) => {
+                    let _ = gio::AppInfo::launch_default_for_uri(
+                        &gio::File::for_path(&copy).uri(),
+                        gio::AppLaunchContext::NONE,
+                    );
+                }
+                Err(message) => win.toast(&message),
+            }
+        });
         let weak = Rc::downgrade(self);
         self.board.flow.connect_child_activated(move |_, child| {
             let Some(win) = weak.upgrade() else { return };

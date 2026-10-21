@@ -1000,8 +1000,22 @@ fn pdf_exports_at_once_each_write_what_one_alone_writes() {
         headings: Headings::None,
         scene_separator: "#".to_string(),
     };
-    let alone = compile::render(&long_manuscript(), &opts, Format::Pdf).unwrap();
-    let alone = timeless(&alone);
+    // The reference is rendered in a child process, as the product renders.
+    // Cairo and FreeType share font faces within a process, so rendering
+    // it here, while other tests use fonts, could change its spacing.
+    let reference = dir.0.join("alone.pdf");
+    let job = Job {
+        sections: long_manuscript(),
+        opts: opts.clone(),
+        format: Format::Pdf,
+        path: reference.clone(),
+    };
+    assert_eq!(
+        export::run(job, &Stop::default(), renderer()),
+        Ok(Done::Written)
+    );
+    let reference = std::fs::read(&reference).unwrap();
+    let alone = timeless(&reference);
     assert!(alone.len() > 200, "{} streams", alone.len());
     for round in 0..3 {
         let workers: Vec<_> = (0..3)
@@ -1287,4 +1301,39 @@ fn the_compile_command_replaces_a_link_outside_dev() {
     assert!(!made.status.success());
     let err = String::from_utf8_lossy(&made.stderr);
     assert!(err.contains("is not a regular file"), "{err}");
+}
+
+#[test]
+fn the_compile_command_follows_only_the_system_stream_links() {
+    let dir = scratch("cli-streams");
+    let expected = compiled_markdown(&dir);
+    // /dev/stderr is a link to this process's standard error: followed.
+    let made = compile_cli("/dev/stderr", std::process::Stdio::piped());
+    assert!(made.status.success(), "{made:?}");
+    assert_eq!(made.stderr, expected);
+    // /proc/self/fd/2 is the same stream by another name.
+    let made = compile_cli("/proc/self/fd/2", std::process::Stdio::piped());
+    assert!(made.status.success(), "{made:?}");
+    assert_eq!(made.stderr, expected);
+
+    // A link in /dev/shm, which any user can write in, is not trusted: it
+    // is replaced, and the file it led to is left alone.
+    let shm = Path::new("/dev/shm");
+    let secret = dir.0.join("secret");
+    std::fs::write(&secret, "keep").unwrap();
+    let out = shm.join(format!("omaquill-test-{}.md", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    if let Err(e) = std::os::unix::fs::symlink(&secret, &out) {
+        // Some chroots and containers have no writable /dev/shm.
+        eprintln!("can't make a link in /dev/shm ({e}); its case was not checked");
+        return;
+    }
+    let made = compile_cli(out.to_str().unwrap(), std::process::Stdio::piped());
+    let replaced = std::fs::symlink_metadata(&out).map(|m| m.is_file());
+    let written = std::fs::read(&out);
+    let _ = std::fs::remove_file(&out);
+    assert!(made.status.success(), "{made:?}");
+    assert!(replaced.unwrap(), "the link in /dev/shm was followed");
+    assert_eq!(written.unwrap(), expected);
+    assert_eq!(std::fs::read(&secret).unwrap(), b"keep");
 }

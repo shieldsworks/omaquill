@@ -314,9 +314,12 @@ them in a dotfiles repository has to link the folder, not each file.
   process's own standard output. The path is not printed after the bytes.
 - A FIFO, device, or socket gets a plain write, opened with `O_NOFOLLOW`
   and with no file created. `/dev/null` works this way.
-- A symlink under `/dev` is followed for a plain write and never replaced,
-  as root too. When it leads to a regular file, the command writes nothing
-  and says so.
+- A symlink at a system name for a stream (`/dev/stdin`, `/dev/stdout`,
+  `/dev/stderr`, `/dev/fd/*`, `/dev/tty*`, `/proc/self/fd/*`; see
+  `names_a_stream`) is followed for a plain write and never replaced, as
+  root too. When it leads to a regular file, the command writes nothing
+  and says so. Links elsewhere in `/dev`, such as world-writable
+  `/dev/shm` and `/dev/mqueue`, are not trusted.
 - Anything else is `fsdir::write_atomic`. A symlink there is replaced, and
   a folder is refused with "is not a regular file".
 
@@ -351,10 +354,14 @@ project path is handed to GTK, gio, or another app.
   image of more than 100,000,000 pixels, or a side longer than 30,000.
 - `safe_to_open` checks the name and the sniffed type of the first 4096
   bytes.
-- Open in Default App copies the open file to `content.<ext>` in a new
-  `0o700` folder in `$XDG_RUNTIME_DIR` (the temp folder when that is
-  unset), mode `0o600`. It sniffs the copy again and launches the copy. The
-  copy stays for the app to read.
+- Open in Default App copies the open file with `PrivateCopies` in
+  `src/project.rs`: `content.<ext>`, mode `0o600`, in an
+  `omaquill-open-*` folder of mode `0o700` in `$XDG_RUNTIME_DIR` (the temp
+  folder when that is unset). Each media item keeps one folder for the
+  session, and opening it again replaces the copy. Files over 1 GiB are
+  refused with a toast. In `$XDG_RUNTIME_DIR`, the first copy of a run
+  removes `omaquill-open-*` folders over a day old. It sniffs the copy
+  again and launches the copy.
 
 Logout uses `glib_unix::unix_signal_add_local` for `SIGTERM`, `SIGINT`, and
 `SIGHUP`. The handler closes windows so a pending edit can save. Do not

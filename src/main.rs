@@ -187,10 +187,11 @@ enum Wrote {
 ///   also keeps `>>` appending.
 /// - A FIFO, device or socket at `out` gets a plain write, opened with
 ///   `O_NOFOLLOW` and without creating anything.
-/// - A symlink under `/dev` (`/dev/stderr`, `/dev/fd/N` and the like) is
-///   followed for a plain write and is never replaced, as root too. `/dev`
-///   belongs to the system, and a link there names a stream or a device.
-///   When it leads to a regular file, nothing is written.
+/// - A symlink at a name for a stream ([`names_a_stream`]) is followed for
+///   a plain write and is never replaced, as root too. When it leads to a
+///   regular file, nothing is written. A symlink anywhere else, including
+///   world-writable `/dev/shm` and `/dev/mqueue`, is replaced like any
+///   other file.
 /// - Anything else goes through [`omaquill::fsdir::write_atomic`]: a new
 ///   file is renamed into place, and a symlink at `out` is replaced, not
 ///   followed.
@@ -209,11 +210,7 @@ fn write_output(out: &Path, bytes: &[u8]) -> Result<Wrote, String> {
     }
     let meta = std::fs::symlink_metadata(out).ok();
     let kind = meta.as_ref().map(|m| m.file_type());
-    let in_dev = out.starts_with("/dev")
-        && out
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
-    let dev_link = in_dev && kind.is_some_and(|k| k.is_symlink());
+    let dev_link = names_a_stream(out) && kind.is_some_and(|k| k.is_symlink());
     let special = kind
         .is_some_and(|k| k.is_fifo() || k.is_char_device() || k.is_block_device() || k.is_socket());
     if dev_link || special {
@@ -243,4 +240,25 @@ fn write_output(out: &Path, bytes: &[u8]) -> Result<Wrote, String> {
     omaquill::fsdir::write_atomic(out, bytes)
         .map_err(|e| format!("couldn't write {shown}: {e}"))?;
     Ok(Wrote::File)
+}
+
+/// Whether `out` is one of the system's names for an open stream:
+/// `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/*`, `/dev/tty*` or
+/// `/proc/self/fd/*`, with no `.` or `..` in it. Only root writes these
+/// names, so a symlink at one leads where the system put it.
+fn names_a_stream(out: &Path) -> bool {
+    if !out
+        .components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return false;
+    }
+    let in_dir = |dir: &str| out.parent() == Some(Path::new(dir));
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    ["/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        .iter()
+        .any(|n| out == Path::new(n))
+        || in_dir("/dev/fd")
+        || in_dir("/proc/self/fd")
+        || (in_dir("/dev") && name.starts_with("tty"))
 }

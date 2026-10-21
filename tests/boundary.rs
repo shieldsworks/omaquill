@@ -3,7 +3,7 @@
 //! omaquill saves. Every test asserts that the files outside the project
 //! keep their bytes and that no new file appears beside them.
 
-use omaquill::project::Project;
+use omaquill::project::{PrivateCopies, Project};
 use omaquill::rtf::RichText;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -484,16 +484,70 @@ fn media_for_another_app_is_a_private_copy() {
     std::fs::create_dir(&base).unwrap();
     let p = Project::open(&project).unwrap();
     let media = p.media(IMAGE).unwrap();
-    let copy = media.copy_to_private_file(&base).unwrap();
+    let mut copies = PrivateCopies::new(base.clone());
+    let copy = copies.copy(&media, 1 << 30).unwrap();
     assert!(copy.starts_with(&base) && !copy.starts_with(&project));
     assert_eq!(copy.file_name().unwrap(), "content.png");
     assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&png).unwrap());
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&copy), 0o600);
     assert_eq!(mode(copy.parent().unwrap()), 0o700);
-    // A second copy gets a folder of its own.
-    let again = media.copy_to_private_file(&base).unwrap();
-    assert_ne!(again.parent(), copy.parent());
+    // Opening it again replaces the copy in the same folder.
+    std::fs::write(&copy, "an app changed it").unwrap();
+    let again = copies.copy(&media, 1 << 30).unwrap();
+    assert_eq!(again, copy);
+    assert_eq!(std::fs::read(&again).unwrap(), std::fs::read(&png).unwrap());
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_dir(copy.parent().unwrap()).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn media_over_the_cap_is_not_copied() {
+    let s = scratch("media-copy-cap");
+    let project = s.0.join("Lighthouse.scriv");
+    let png = project.join("Files/Data").join(IMAGE).join("content.png");
+    let size = std::fs::metadata(&png).unwrap().len();
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    let p = Project::open(&project).unwrap();
+    let media = p.media(IMAGE).unwrap();
+    let mut copies = PrivateCopies::new(base.clone());
+    let err = copies.copy(&media, size - 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+    assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+    assert!(copies.copy(&media, size).is_ok());
+}
+
+#[test]
+fn stale_copies_from_earlier_runs_are_removed() {
+    let s = scratch("media-copy-stale");
+    let project = s.0.join("Lighthouse.scriv");
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    let old = base.join("omaquill-open-old");
+    std::fs::create_dir(&old).unwrap();
+    std::fs::write(old.join("content.png"), "old copy").unwrap();
+    // A link of that name goes as a link; what it led to stays.
+    let elsewhere = s.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep"), "keep").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, base.join("omaquill-open-link")).unwrap();
+    std::fs::write(base.join("unrelated"), "not ours").unwrap();
+    let p = Project::open(&project).unwrap();
+    let mut copies = PrivateCopies::new(base.clone());
+    let fresh = copies.copy(&p.media(IMAGE).unwrap(), 1 << 30).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let removed = copies
+        .remove_stale(std::time::Duration::from_millis(10))
+        .unwrap();
+    assert_eq!(removed, 2);
+    assert!(!old.exists());
+    assert!(fresh.exists(), "a copy this run made was removed");
+    assert!(base.join("unrelated").exists());
+    assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
 }
 
 #[test]
