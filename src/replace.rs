@@ -751,7 +751,8 @@ pub fn apply_at(
         }
         return Ok(ApplyOutcome::SkippedOnly(skipped));
     }
-    let backup = project::backup_at(&project.path, backup_dir, keep.max(1), now)
+    let backup = project
+        .backup_at(backup_dir, keep.max(1), now)
         .map_err(ApplyError::Backup)?;
     let mut written = Vec::new();
     for (id, text) in pending {

@@ -28,7 +28,8 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +50,40 @@ pub enum Kind {
     Link,
     /// A FIFO, socket or device.
     Other,
+}
+
+/// What [`Dir::stat`] reads about one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stat {
+    kind: Kind,
+    mode: u32,
+    uid: u32,
+}
+
+/// The permission bits a replacement for `existing` takes, written by the
+/// user `me`. Only a regular file that `me` owns passes its bits on. A file
+/// someone else put at the name, with `0o666` say, does not make the new
+/// file readable to them. `None` leaves the mode `create_new` gave.
+fn inherited_mode(existing: Option<Stat>, me: u32) -> Option<u32> {
+    existing
+        .filter(|st| st.kind == Kind::File && st.uid == me)
+        .map(|st| st.mode)
+}
+
+/// The longest name one folder entry can have, in bytes.
+const NAME_MAX: usize = 255;
+
+/// `.<name>.<pid>-<n>.omaquill-tmp`, with `name` cut short so the whole
+/// stays within [`NAME_MAX`] bytes.
+fn temp_name(name: &OsStr, n: u64) -> OsString {
+    let tail = format!(".{}-{n}.omaquill-tmp", std::process::id());
+    let room = NAME_MAX - 1 - tail.len();
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(NAME_MAX);
+    out.push(b'.');
+    out.extend_from_slice(&b[..b.len().min(room)]);
+    out.extend_from_slice(tail.as_bytes());
+    OsString::from_vec(out)
 }
 
 /// The error a symlink on the way gets. [`is_link_refusal`] finds it.
@@ -155,23 +190,30 @@ impl Dir {
         // NUL-terminated string that outlives the call. openat returns -1
         // or a new descriptor that nothing else owns, and only the second
         // is handed to `OwnedFd`.
+        // A signal during an open on NFS or FUSE returns EINTR; the open
+        // is then tried again.
         unsafe {
-            let fd = libc::openat(
-                self.fd.as_raw_fd(),
-                name.as_ptr(),
-                flags | libc::O_CLOEXEC,
-                libc::c_uint::from(mode),
-            );
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
+            loop {
+                let fd = libc::openat(
+                    self.fd.as_raw_fd(),
+                    name.as_ptr(),
+                    flags | libc::O_CLOEXEC,
+                    libc::c_uint::from(mode),
+                );
+                if fd >= 0 {
+                    return Ok(OwnedFd::from_raw_fd(fd));
+                }
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
             }
-            Ok(OwnedFd::from_raw_fd(fd))
         }
     }
 
-    /// The kind and permission bits of `name`, or `None` when it is absent.
-    /// A symlink is reported as [`Kind::Link`], not followed.
-    fn stat(&self, name: &CStr) -> io::Result<Option<(Kind, u32)>> {
+    /// The kind, permission bits and owner of `name`, or `None` when it is
+    /// absent. A symlink is reported as [`Kind::Link`], not followed.
+    fn stat(&self, name: &CStr) -> io::Result<Option<Stat>> {
         // SAFETY: `libc::stat` is a C struct of integers, so all-zero is a
         // valid value. fstatat writes only into `st`. `self.fd` is open and
         // `name` is NUL-terminated for the whole call.
@@ -196,7 +238,11 @@ impl Dir {
             libc::S_IFLNK => Kind::Link,
             _ => Kind::Other,
         };
-        Ok(Some((kind, st.st_mode & 0o777)))
+        Ok(Some(Stat {
+            kind,
+            mode: st.st_mode & 0o777,
+            uid: st.st_uid,
+        }))
     }
 
     /// The child folder `name`, created first when `create` is set and it
@@ -205,7 +251,7 @@ impl Dir {
         let c = entry_name(name)?;
         let shown = self.shown.join(name);
         if create {
-            match self.mkdir(&c) {
+            match self.mkdir(&c, 0o777) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
@@ -218,7 +264,9 @@ impl Dir {
             // either way; the stat only picks the message.
             Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
                 match self.stat(&c) {
-                    Ok(Some((Kind::Link, _))) => Err(link_refused(shown)),
+                    Ok(Some(Stat {
+                        kind: Kind::Link, ..
+                    })) => Err(link_refused(shown)),
                     _ => Err(e),
                 }
             }
@@ -226,10 +274,10 @@ impl Dir {
         }
     }
 
-    fn mkdir(&self, name: &CStr) -> io::Result<()> {
+    fn mkdir(&self, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
         // SAFETY: `self.fd` is open and `name` is NUL-terminated for the
         // whole call. mkdirat reads nothing else.
-        cvt(unsafe { libc::mkdirat(self.fd.as_raw_fd(), name.as_ptr(), 0o777) })
+        cvt(unsafe { libc::mkdirat(self.fd.as_raw_fd(), name.as_ptr(), mode) })
     }
 
     /// The folder at `rel` under this one. Each folder on the way is opened
@@ -255,8 +303,21 @@ impl Dir {
     /// `AlreadyExists` error. The new folder is opened without following a
     /// symlink, so a link raced into its place is refused.
     pub fn create_dir_new(&self, name: &OsStr) -> io::Result<Dir> {
-        self.mkdir(&entry_name(name)?)?;
+        self.mkdir(&entry_name(name)?, 0o777)?;
         self.child(name, false)
+    }
+
+    /// [`Dir::create_dir_new`] with mode `0o700`: only this user can list
+    /// or open what is put in it.
+    pub fn create_private_dir_new(&self, name: &OsStr) -> io::Result<Dir> {
+        self.mkdir(&entry_name(name)?, 0o700)?;
+        self.child(name, false)
+    }
+
+    /// A second descriptor for this folder, with its own read position. It
+    /// can move to another thread.
+    pub fn try_clone(&self) -> io::Result<Dir> {
+        self.reopen()
     }
 
     /// What `rel` is, without following a symlink at its end. `None` when it
@@ -268,14 +329,16 @@ impl Dir {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(dir.stat(&entry_name(name)?)?.map(|(kind, _)| kind))
+        Ok(dir.stat(&entry_name(name)?)?.map(|st| st.kind))
     }
 
-    /// The bytes of the regular file at `rel`. A symlink, a FIFO, a device
-    /// or a folder is refused. A FIFO would block `open` until a writer
-    /// appears, so the open is non-blocking and the opened file's own type
-    /// decides; a regular file is then read in blocking mode.
-    pub fn read(&self, rel: &Path) -> io::Result<Vec<u8>> {
+    /// Opens the regular file at `rel` for reading. A symlink, a FIFO, a
+    /// device or a folder is refused. A FIFO would block `open` until a
+    /// writer appears, so the open is non-blocking and the opened file's
+    /// own type decides; a regular file is then switched to blocking mode.
+    /// The file stays the one that was checked, whatever happens to its
+    /// name later.
+    pub fn open_file(&self, rel: &Path) -> io::Result<File> {
         let (parts, name) = split(rel)?;
         let dir = self.walk_parts(&parts, false)?;
         let c = entry_name(name)?;
@@ -285,7 +348,7 @@ impl Dir {
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(link_refused(shown)),
             Err(e) => return Err(e),
         };
-        let mut file = File::from(fd);
+        let file = File::from(fd);
         if !file.metadata()?.is_file() {
             return Err(invalid(format!(
                 "{} is not a regular file",
@@ -295,14 +358,22 @@ impl Dir {
         let raw = file.as_raw_fd();
         // SAFETY: fcntl reads and sets the status flags of `raw`, which
         // `file` owns and keeps open for the whole block.
-        unsafe {
+        let set = unsafe {
             let flags = libc::fcntl(raw, libc::F_GETFL);
-            if flags >= 0 {
-                libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            if flags < 0 {
+                flags
+            } else {
+                libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK)
             }
-        }
+        };
+        cvt(set)?;
+        Ok(file)
+    }
+
+    /// The bytes of the regular file at `rel`; see [`Dir::open_file`].
+    pub fn read(&self, rel: &Path) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        self.open_file(rel)?.read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 
@@ -313,7 +384,10 @@ impl Dir {
         // it over on success, and closedir closes it once. On failure it is
         // still ours and `OwnedFd` closes it. Each `dirent` readdir returns
         // stays valid until the next readdir on the same stream, and its
-        // name is copied out before then.
+        // name is copied out before then. readdir returns null both at the
+        // end and on an error. Only an error sets errno, so errno is cleared
+        // before each call and read after a null. `__errno_location` is
+        // this thread's errno.
         unsafe {
             let stream = libc::fdopendir(raw);
             if stream.is_null() {
@@ -322,9 +396,15 @@ impl Dir {
                 return Err(err);
             }
             let mut out = Vec::new();
+            let mut failed = None;
             loop {
+                *libc::__errno_location() = 0;
                 let entry = libc::readdir(stream);
                 if entry.is_null() {
+                    let errno = *libc::__errno_location();
+                    if errno != 0 {
+                        failed = Some(io::Error::from_raw_os_error(errno));
+                    }
                     break;
                 }
                 let name = CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes();
@@ -333,7 +413,10 @@ impl Dir {
                 }
             }
             libc::closedir(stream);
-            Ok(out)
+            match failed {
+                Some(err) => Err(err),
+                None => Ok(out),
+            }
         }
     }
 
@@ -403,9 +486,9 @@ impl Dir {
 
     fn remove_entry(&self, name: &OsStr) -> io::Result<()> {
         let c = entry_name(name)?;
-        match self.stat(&c)? {
+        match self.stat(&c)?.map(|st| st.kind) {
             None => Ok(()),
-            Some((Kind::Dir, _)) => {
+            Some(Kind::Dir) => {
                 let inner = self.child(name, false)?;
                 for entry in inner.entries()? {
                     inner.remove_entry(&entry)?;
@@ -436,8 +519,10 @@ impl Dir {
     /// Replaces the file `name` in this folder with `bytes`.
     ///
     /// The bytes go to a new file `.<name>.<pid>-<n>.omaquill-tmp` in this
-    /// folder, created with `O_EXCL`. When `name` is a regular file, the new
-    /// file takes its permission bits (`0o777` of them). The new file is
+    /// folder, created with `O_EXCL`, with `name` cut short when the whole
+    /// would pass 255 bytes. When `name` is a regular file this user owns,
+    /// the new file takes its permission bits (`0o777` of them); otherwise
+    /// it keeps the mode `0o666` less the umask. The new file is
     /// written and synced. `commit` is asked once the bytes are on disk;
     /// when it answers false the new file is removed, `name` is left as it
     /// was, and the result is `Ok(false)`. Otherwise `renameat` puts the new
@@ -455,25 +540,20 @@ impl Dir {
     ) -> io::Result<bool> {
         static N: AtomicU64 = AtomicU64::new(0);
         let target = entry_name(name)?;
-        let mode = match self.stat(&target)? {
-            None | Some((Kind::Link, _)) => None,
-            Some((Kind::File, mode)) => Some(mode),
-            Some((Kind::Dir | Kind::Other, _)) => {
+        let existing = self.stat(&target)?;
+        match existing.map(|st| st.kind) {
+            None | Some(Kind::Link | Kind::File) => {}
+            Some(Kind::Dir | Kind::Other) => {
                 return Err(invalid(format!(
                     "{} is not a regular file",
                     self.shown.join(name).display()
                 )));
             }
-        };
+        }
         let mut tries = 0;
         let (tmp, mut file) = loop {
             tries += 1;
-            let tmp = OsString::from(format!(
-                ".{}.{}-{}.omaquill-tmp",
-                name.to_string_lossy(),
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
+            let tmp = temp_name(name, N.fetch_add(1, Ordering::Relaxed));
             match self.create_new(&tmp) {
                 Ok(file) => break (entry_name(&tmp)?, file),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 1_000 => continue,
@@ -481,7 +561,10 @@ impl Dir {
             }
         };
         let written = (|| {
-            if let Some(mode) = mode {
+            // The new file belongs to this process's user, so its owner is
+            // the user to compare with.
+            let me = file.metadata()?.uid();
+            if let Some(mode) = inherited_mode(existing, me) {
                 file.set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
             file.write_all(bytes)?;
@@ -750,5 +833,35 @@ mod tests {
         second.sort();
         assert_eq!(first, [OsString::from("a"), OsString::from("sub")]);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn only_an_owned_regular_file_passes_its_mode_on() {
+        let st = |kind, uid| {
+            Some(Stat {
+                kind,
+                mode: 0o640,
+                uid,
+            })
+        };
+        assert_eq!(inherited_mode(st(Kind::File, 1000), 1000), Some(0o640));
+        assert_eq!(inherited_mode(st(Kind::File, 1001), 1000), None);
+        assert_eq!(inherited_mode(st(Kind::Link, 1000), 1000), None);
+        assert_eq!(inherited_mode(None, 1000), None);
+    }
+
+    #[test]
+    fn a_long_name_gets_a_temporary_name_within_name_max() {
+        let (_s, root, dir) = scratch("long-name");
+        let long = "n".repeat(NAME_MAX);
+        let tmp = temp_name(OsStr::new(&long), u64::MAX);
+        assert!(tmp.len() <= NAME_MAX, "{}", tmp.len());
+        assert!(tmp.to_string_lossy().ends_with(".omaquill-tmp"));
+        root.write_atomic(Path::new(&long), b"long", false).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("inside").join(&long)).unwrap(),
+            b"long"
+        );
+        assert_eq!(names_in(&dir.join("inside")), [long, "sub".to_string()]);
     }
 }

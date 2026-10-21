@@ -91,10 +91,7 @@ fn reads_the_binder() {
         ["No Label", "Red", "Blue"]
     );
     assert_eq!(p.statuses().len(), 3);
-    assert!(
-        p.media_path("6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06")
-            .is_some()
-    );
+    assert!(p.media("6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06").is_some());
 }
 
 #[test]
@@ -656,7 +653,7 @@ fn media_extensions_are_plain_and_openable_types_are_few() {
     let c = copy_fixture("media");
     let img = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
     let p = Project::open(&c.0).unwrap();
-    assert!(p.media_path(img).is_some());
+    assert!(p.media(img).is_some());
     for (bad, ext) in [("../../x", "png"), ("desktop", "desktop")] {
         let x = scrivx(&c.0).replace(
             "<FileExtension>png</FileExtension>",
@@ -671,10 +668,10 @@ fn media_extensions_are_plain_and_openable_types_are_few() {
         )
         .unwrap();
         let p = Project::open(&c.0).unwrap();
-        let path = p.media_path(img);
+        let name = p.media(img).map(|m| m.name);
         assert!(
-            path.as_deref().is_none_or(|p| !is_openable(p)),
-            "{bad}: {path:?}"
+            name.as_deref().is_none_or(|n| !is_openable(Path::new(n))),
+            "{bad}: {name:?}"
         );
         std::fs::write(
             c.0.join("Lighthouse.scrivx"),
@@ -799,7 +796,7 @@ fn a_fifo_in_the_project_is_refused_without_blocking() {
     let path = c.0.clone();
     assert!(within(Box::new(move || {
         let p = Project::open(&path).unwrap();
-        p.text(SCENE).is_err() && p.media_path(img).is_none()
+        p.text(SCENE).is_err() && p.media(img).is_none()
     })));
     let c = copy_fixture("fifo-scrivx");
     fifo(&c.0.join("Lighthouse.scrivx"));

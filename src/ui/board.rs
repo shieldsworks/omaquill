@@ -4,10 +4,10 @@
 use super::{Win, group};
 use adw::prelude::*;
 use gtk::gio;
-use omaquill::project::Item;
+use omaquill::project::{Item, Media};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 pub struct Board {
@@ -18,7 +18,8 @@ pub struct Board {
     pub media_page: gtk::ScrolledWindow,
     picture: gtk::Picture,
     pub file_page: adw::StatusPage,
-    file_path: Rc<RefCell<Option<PathBuf>>>,
+    /// The media on the file page, kept open for Open in Default App.
+    file_media: Rc<RefCell<Option<Media>>>,
     /// UUIDs of the cards or rows on show, in order.
     shown: RefCell<Vec<String>>,
 }
@@ -68,20 +69,20 @@ impl Board {
             .margin_end(24)
             .build();
         let media_page = gtk::ScrolledWindow::builder().child(&picture).build();
-        let file_path: Rc<RefCell<Option<PathBuf>>> = Rc::default();
+        let file_media: Rc<RefCell<Option<Media>>> = Rc::default();
         let open = gtk::Button::builder()
             .label("Open in Default App")
             .css_classes(["pill", "suggested-action"])
             .halign(gtk::Align::Center)
             .build();
         {
-            let file_path = file_path.clone();
+            let file_media = file_media.clone();
             open.connect_clicked(move |_| {
-                if let Some(p) = file_path.borrow().as_ref()
-                    && safe_to_open(p)
+                if let Some(media) = file_media.borrow().as_ref()
+                    && let Some(copy) = private_copy_to_open(media)
                 {
                     let _ = gio::AppInfo::launch_default_for_uri(
-                        &gio::File::for_path(p).uri(),
+                        &gio::File::for_path(&copy).uri(),
                         gio::AppLaunchContext::NONE,
                     );
                 }
@@ -99,18 +100,23 @@ impl Board {
             media_page,
             picture,
             file_page,
-            file_path,
+            file_media,
             shown: RefCell::new(Vec::new()),
         }
     }
 
-    /// Shows an image, if its header says it's a sane size. A tiny file
-    /// can claim to be 100,000 pixels square; decoding that would exhaust
-    /// memory, so only the header is read first. False: not shown.
-    pub fn show_image(&self, path: Option<&Path>) -> bool {
-        match path.filter(|p| image_size_ok(p)) {
-            Some(p) => {
-                self.picture.set_filename(Some(p));
+    /// Shows an image, read once from its open file and decoded from
+    /// those bytes. A tiny file can claim to be 100,000 pixels square, so
+    /// [`decode_image`] stops at the header when the size is not sane.
+    /// False: not shown.
+    pub fn show_image(&self, media: Option<&Media>) -> bool {
+        let pixbuf = media
+            .and_then(|m| m.read_capped(MAX_IMAGE_BYTES).ok())
+            .and_then(|bytes| decode_image(&bytes));
+        match pixbuf {
+            Some(pixbuf) => {
+                let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                self.picture.set_paintable(Some(&texture));
                 true
             }
             None => {
@@ -126,10 +132,13 @@ impl Board {
         ));
     }
 
-    pub fn show_file(&self, title: &str, path: Option<&Path>) {
+    pub fn show_file(&self, title: &str, media: Option<Media>) {
         self.file_page.set_title(title);
-        let openable = path.is_some_and(safe_to_open);
-        self.file_page.set_description(Some(match path {
+        let openable = media.as_ref().is_some_and(|m| {
+            m.head(SNIFF_BYTES)
+                .is_ok_and(|head| safe_to_open(Path::new(&m.name), &head))
+        });
+        self.file_page.set_description(Some(match media {
             Some(_) if openable => "omaquill doesn't display this kind of file itself.",
             Some(_) => {
                 "omaquill doesn't open this kind of file from a project, since it could run code. \
@@ -137,44 +146,66 @@ impl Board {
             }
             None => "The file for this item is missing from the project.",
         }));
-        *self.file_path.borrow_mut() = path.map(Path::to_path_buf);
+        *self.file_media.borrow_mut() = media;
         if let Some(button) = self.file_page.child() {
             button.set_visible(openable);
         }
     }
 }
 
+/// Bytes read to sniff a file's type.
+const SNIFF_BYTES: usize = 4096;
+
+/// Largest image file omaquill will read to decode: 256 MiB.
+const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Largest image omaquill will decode: 100 megapixels, 30,000 on a side.
 const MAX_PIXELS: u64 = 100_000_000;
 const MAX_SIDE: i32 = 30_000;
 
-fn image_size_ok(p: &Path) -> bool {
-    match gtk::gdk_pixbuf::Pixbuf::file_info(p) {
-        Some((_, w, h)) => {
-            w > 0
-                && h > 0
-                && w <= MAX_SIDE
-                && h <= MAX_SIDE
-                && (w as u64) * (h as u64) <= MAX_PIXELS
-        }
-        None => false,
-    }
+fn size_ok(w: i32, h: i32) -> bool {
+    w > 0 && h > 0 && w <= MAX_SIDE && h <= MAX_SIDE && (w as u64) * (h as u64) <= MAX_PIXELS
 }
 
-/// An allowed type by name (see `is_openable`) whose contents also look
-/// like a document or media file: the desktop decides how to open a file
-/// partly by sniffing it, so the name alone isn't enough.
-fn safe_to_open(p: &Path) -> bool {
-    use std::io::Read;
-    if !omaquill::project::is_openable(p) {
+/// Decodes `bytes` as an image. The loader reports the size from the
+/// header before it allocates pixels. A size over the limits sets the
+/// loader's size to 0 by 0, which makes gdk-pixbuf stop there, as
+/// `gdk_pixbuf_get_file_info` does, and the result is `None`.
+fn decode_image(bytes: &[u8]) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    use std::cell::Cell;
+    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    let refused = Rc::new(Cell::new(false));
+    let sized = Rc::new(Cell::new(false));
+    {
+        let (refused, sized) = (refused.clone(), sized.clone());
+        loader.connect_size_prepared(move |loader, w, h| {
+            sized.set(true);
+            if !size_ok(w, h) {
+                refused.set(true);
+                loader.set_size(0, 0);
+            }
+        });
+    }
+    for chunk in bytes.chunks(64 * 1024) {
+        if refused.get() || loader.write(chunk).is_err() {
+            break;
+        }
+    }
+    let closed = loader.close();
+    if refused.get() || !sized.get() || closed.is_err() {
+        return None;
+    }
+    loader.pixbuf()
+}
+
+/// An allowed type by name (see `is_openable`) whose first bytes, `head`,
+/// also look like a document or media file: the desktop decides how to
+/// open a file partly by sniffing it, so the name alone isn't enough.
+fn safe_to_open(name: &Path, head: &[u8]) -> bool {
+    if !omaquill::project::is_openable(name) {
         return false;
     }
-    let mut head = vec![0u8; 4096];
-    let n = std::fs::File::open(p)
-        .and_then(|mut f| f.read(&mut head))
-        .unwrap_or(0);
-    head.truncate(n);
-    let (kind, _) = gio::content_type_guess(Some(p), Some(&head[..]));
+    let (kind, _) = gio::content_type_guess(Some(name), Some(head));
     let mime = gio::content_type_get_mime_type(&kind)
         .map(|m| m.to_string())
         .unwrap_or_default();
@@ -184,6 +215,32 @@ fn safe_to_open(p: &Path) -> bool {
         || ["image/", "audio/", "video/"]
             .iter()
             .any(|t| mime.starts_with(t))
+}
+
+/// A private copy of `media` for another app to open, when the copy's own
+/// bytes pass [`safe_to_open`]. The copy goes in `$XDG_RUNTIME_DIR`, or
+/// the temp folder when that is unset. Its type is sniffed from the copy,
+/// so what was checked is what the app gets.
+fn private_copy_to_open(media: &Media) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(std::env::temp_dir);
+    let copy = media.copy_to_private_file(&base).ok()?;
+    let mut head = Vec::new();
+    std::fs::File::open(&copy)
+        .ok()?
+        .take(SNIFF_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    if safe_to_open(&copy, &head) {
+        Some(copy)
+    } else {
+        let _ = std::fs::remove_file(&copy);
+        let _ = copy.parent().map(std::fs::remove_dir);
+        None
+    }
 }
 
 fn clear<W: IsA<gtk::Widget>>(container: &W, remove: impl Fn(&gtk::Widget)) {
@@ -550,27 +607,20 @@ mod tests {
 
     #[test]
     fn images_are_size_checked_and_only_documents_open() {
-        let dir = std::env::temp_dir().join(format!("omaquill-media-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let small = dir.join("content.png");
-        std::fs::write(&small, png(1, 1)).unwrap();
-        let bomb = dir.join("bomb.png");
-        std::fs::write(&bomb, png(100_000, 100_000)).unwrap();
-        assert!(image_size_ok(&small));
-        assert!(!image_size_ok(&bomb), "a 10-gigapixel header was accepted");
-        assert!(!image_size_ok(&dir.join("missing.png")));
+        assert!(decode_image(&png(1, 1)).is_some());
+        assert!(
+            decode_image(&png(100_000, 100_000)).is_none(),
+            "a 10-gigapixel header was accepted"
+        );
+        assert!(decode_image(b"").is_none());
+        assert!(decode_image(b"not an image").is_none());
 
-        assert!(safe_to_open(&small));
-        let script = dir.join("content.sh");
-        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
-        assert!(!safe_to_open(&script));
-        let desktop = dir.join("content.desktop");
-        std::fs::write(&desktop, "[Desktop Entry]\nExec=sh\n").unwrap();
-        assert!(!safe_to_open(&desktop));
+        assert!(safe_to_open(Path::new("content.png"), &png(1, 1)));
+        let script = b"#!/bin/sh\necho hi\n";
+        assert!(!safe_to_open(Path::new("content.sh"), script));
+        let desktop = b"[Desktop Entry]\nExec=sh\n";
+        assert!(!safe_to_open(Path::new("content.desktop"), desktop));
         // A script wearing a .txt name is still only text to a viewer.
-        let text = dir.join("content.txt");
-        std::fs::write(&text, "plain words\n").unwrap();
-        assert!(safe_to_open(&text));
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(safe_to_open(Path::new("content.txt"), b"plain words\n"));
     }
 }

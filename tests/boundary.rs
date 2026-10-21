@@ -277,7 +277,10 @@ fn a_backup_raced_by_link_swaps_never_reads_outside() {
                     );
                 }
             }
-            Err(_) => failed += 1,
+            Err(e) => {
+                eprintln!("backup failed: {e}");
+                failed += 1
+            }
         }
     }
     let rounds = swapper.finish();
@@ -340,4 +343,172 @@ fn emptying_the_trash_removes_links_inside_an_item_as_links() {
     p.empty_trash().unwrap();
     assert!(std::fs::symlink_metadata(&item).is_err());
     assert_eq!(tree(&private), before);
+}
+
+/// One way a second user replaces a file.
+type Swap<'a> = Box<dyn Fn(&Path) + 'a>;
+
+const IMAGE: &str = "6FBE5C7A-8D9B-4CAE-CFDA-4B5C6D7E8F06";
+
+/// Runs `f` on its own thread and fails the test when it takes more than
+/// five seconds, as a read of a FIFO would.
+fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("blocked: a FIFO was opened for reading")
+}
+
+fn mkfifo(p: &Path) {
+    let made = std::process::Command::new("mkfifo")
+        .arg(p)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo {}", p.display());
+}
+
+/// The second user swaps `content.png` after omaquill has looked at it: for
+/// a link to a private image, a FIFO, or a 10-gigapixel PNG. The media was
+/// opened at the check, so every later read gets the file that was checked.
+#[test]
+fn media_swapped_after_the_check_is_never_what_is_read() {
+    let s = scratch("media-swap");
+    let project = s.0.join("Lighthouse.scriv");
+    let private = private_tree(&s.0);
+    let png = project.join("Files/Data").join(IMAGE).join("content.png");
+    let original = std::fs::read(&png).unwrap();
+    let p = Project::open(&project).unwrap();
+    let swaps: [(&str, Swap); 3] = [
+        (
+            "link",
+            Box::new(|at: &Path| plant_link(&private.join("bashrc"), at)),
+        ),
+        (
+            "fifo",
+            Box::new(|at: &Path| {
+                std::fs::remove_file(at).unwrap();
+                mkfifo(at);
+            }),
+        ),
+        (
+            "bomb",
+            Box::new(|at: &Path| {
+                let mut bomb = original.clone();
+                // Width and height in the IHDR chunk, after the 8-byte
+                // signature, 4-byte length and 4-byte type.
+                bomb[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+                bomb[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+                let tmp = at.with_extension("swap");
+                std::fs::write(&tmp, bomb).unwrap();
+                std::fs::rename(&tmp, at).unwrap();
+            }),
+        ),
+    ];
+    for (what, swap) in swaps {
+        let media = p.media(IMAGE).expect("the fixture's image is offered");
+        swap(&png);
+        let bytes = within(move || {
+            let full = media.read_capped(1 << 20).unwrap();
+            let head = media.head(64).unwrap();
+            (full, head)
+        });
+        assert_eq!(bytes.0, original, "{what}: read something else");
+        assert_eq!(bytes.1, original[..64], "{what}: sniffed something else");
+        // The next look sees the swap and refuses a link or a FIFO.
+        let path = project.clone();
+        let next = within(move || Project::open(&path).unwrap().media(IMAGE).is_none());
+        assert_eq!(next, what != "bomb", "{what}");
+        std::fs::remove_file(&png).unwrap();
+        std::fs::write(&png, &original).unwrap();
+    }
+}
+
+/// The same swaps in a loop against repeated looks and reads. A look either
+/// refuses or reads bytes the project held; none hangs and none reads the
+/// private file.
+#[test]
+fn media_raced_by_swaps_never_reads_outside_or_hangs() {
+    let s = scratch("media-race");
+    let project = s.0.join("Lighthouse.scriv");
+    let private = private_tree(&s.0);
+    let png = project.join("Files/Data").join(IMAGE).join("content.png");
+    let original = std::fs::read(&png).unwrap();
+    let swapper = {
+        let (png, original, secret) = (png.clone(), original.clone(), private.join("bashrc"));
+        Swapper::start(move || {
+            plant_link(&secret, &png);
+            let fifo = png.with_extension("fifo");
+            let _ = std::fs::remove_file(&fifo);
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            if made.is_ok_and(|m| m.success()) {
+                let _ = std::fs::rename(&fifo, &png);
+            }
+            let tmp = png.with_extension("back");
+            if std::fs::write(&tmp, &original).is_ok() {
+                let _ = std::fs::rename(&tmp, &png);
+            }
+        })
+    };
+    let (read, refused) = within(move || {
+        let p = Project::open(&project).unwrap();
+        let (mut read, mut refused) = (0u64, 0u64);
+        let started = Instant::now();
+        while started.elapsed() < RACE_FOR {
+            match p.media(IMAGE) {
+                Some(m) => {
+                    assert_eq!(m.read_capped(1 << 20).unwrap(), original);
+                    read += 1;
+                }
+                None => refused += 1,
+            }
+        }
+        (read, refused)
+    });
+    let rounds = swapper.finish();
+    eprintln!("media race: {rounds} swaps, {read} reads, {refused} refused");
+    assert!(
+        rounds > 50 && read > 50 && refused > 50,
+        "the race barely ran"
+    );
+}
+
+#[test]
+fn media_for_another_app_is_a_private_copy() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = scratch("media-copy");
+    let project = s.0.join("Lighthouse.scriv");
+    let png = project.join("Files/Data").join(IMAGE).join("content.png");
+    let base = s.0.join("runtime");
+    std::fs::create_dir(&base).unwrap();
+    let p = Project::open(&project).unwrap();
+    let media = p.media(IMAGE).unwrap();
+    let copy = media.copy_to_private_file(&base).unwrap();
+    assert!(copy.starts_with(&base) && !copy.starts_with(&project));
+    assert_eq!(copy.file_name().unwrap(), "content.png");
+    assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&png).unwrap());
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&copy), 0o600);
+    assert_eq!(mode(copy.parent().unwrap()), 0o700);
+    // A second copy gets a folder of its own.
+    let again = media.copy_to_private_file(&base).unwrap();
+    assert_ne!(again.parent(), copy.parent());
+}
+
+#[test]
+fn a_backup_reads_the_open_project_not_its_old_path() {
+    let s = scratch("backup-renamed");
+    let project = s.0.join("Lighthouse.scriv");
+    let p = Project::open(&project).unwrap();
+    let moved = s.0.join("Moved.scriv");
+    std::fs::rename(&project, &moved).unwrap();
+    // Something else now sits at the old path.
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("impostor.txt"), "not the book").unwrap();
+    let zip = p.backup(&s.0.join("backups"), 3).unwrap();
+    let bytes = std::fs::read(zip).unwrap();
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(has(b"Lighthouse.scrivx"));
+    assert!(!has(b"impostor.txt"));
 }

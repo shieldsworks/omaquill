@@ -1192,3 +1192,99 @@ fn an_export_that_cannot_write_reports_why_and_leaves_nothing() {
     assert_eq!(names(&dir.0), ["Out.rtf"]);
     assert_eq!(names(&folder), ["keep.txt"]);
 }
+
+/// `omaquill compile` on the fixture to `out`, with `stdout` for its
+/// standard output.
+fn compile_cli(out: &str, stdout: std::process::Stdio) -> std::process::Output {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Lighthouse.scriv");
+    Command::new(env!("CARGO_BIN_EXE_omaquill"))
+        .arg("compile")
+        .arg(&fixture)
+        .arg(out)
+        .args(["--format", "md"])
+        .stdout(stdout)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap()
+}
+
+/// The Markdown the command writes to an ordinary file.
+fn compiled_markdown(dir: &Scratch) -> Vec<u8> {
+    let file = dir.0.join("Book.md");
+    let made = compile_cli(file.to_str().unwrap(), std::process::Stdio::piped());
+    assert!(made.status.success(), "{made:?}");
+    assert_eq!(made.stdout, format!("{}\n", file.display()).into_bytes());
+    std::fs::read(file).unwrap()
+}
+
+#[test]
+fn the_compile_command_writes_to_standard_output() {
+    let dir = scratch("cli-stdout");
+    let expected = compiled_markdown(&dir);
+    assert!(!expected.is_empty());
+    for out in ["-", "/dev/stdout"] {
+        let made = compile_cli(out, std::process::Stdio::piped());
+        assert!(made.status.success(), "{out}: {made:?}");
+        assert_eq!(made.stdout, expected, "{out}: the path was printed too");
+    }
+    // Standard output sent to a file: the bytes land in that file, and the
+    // file is not replaced.
+    let file = dir.0.join("redirected.md");
+    for out in ["-", "/dev/stdout"] {
+        let target = std::fs::File::create(&file).unwrap();
+        let made = compile_cli(out, target.into());
+        assert!(made.status.success(), "{out}: {made:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), expected, "{out}");
+    }
+}
+
+#[test]
+fn the_compile_command_writes_to_dev_null_and_a_fifo() {
+    let dir = scratch("cli-special");
+    let expected = compiled_markdown(&dir);
+    let made = compile_cli("/dev/null", std::process::Stdio::piped());
+    assert!(made.status.success(), "{made:?}");
+    assert_eq!(made.stdout, b"/dev/null\n");
+
+    let fifo = dir.0.join("pipe.md");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    let reader = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || std::fs::read(fifo).unwrap())
+    };
+    let made = compile_cli(fifo.to_str().unwrap(), std::process::Stdio::piped());
+    assert!(made.status.success(), "{made:?}");
+    assert_eq!(reader.join().unwrap(), expected);
+    use std::os::unix::fs::FileTypeExt;
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+#[test]
+fn the_compile_command_replaces_a_link_outside_dev() {
+    let dir = scratch("cli-link");
+    let expected = compiled_markdown(&dir);
+    let secret = dir.0.join("secret");
+    std::fs::write(&secret, "keep").unwrap();
+    let out = dir.0.join("Out.md");
+    std::os::unix::fs::symlink(&secret, &out).unwrap();
+    let made = compile_cli(out.to_str().unwrap(), std::process::Stdio::piped());
+    assert!(made.status.success(), "{made:?}");
+    assert!(std::fs::symlink_metadata(&out).unwrap().is_file());
+    assert_eq!(std::fs::read(&out).unwrap(), expected);
+    assert_eq!(std::fs::read(&secret).unwrap(), b"keep");
+    // A folder named OUT is an error that says so.
+    let folder = dir.0.join("Folder.md");
+    std::fs::create_dir(&folder).unwrap();
+    let made = compile_cli(folder.to_str().unwrap(), std::process::Stdio::piped());
+    assert!(!made.status.success());
+    let err = String::from_utf8_lossy(&made.stderr);
+    assert!(err.contains("is not a regular file"), "{err}");
+}

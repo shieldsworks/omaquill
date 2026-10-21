@@ -157,8 +157,11 @@ site.
     `AT_SYMLINK_NOFOLLOW` on it.
   - `Dir::mkdir`, `Dir::link`, `Dir::unlink`, and `Dir::rename` call
     `mkdirat`, `linkat` with no flags, `unlinkat`, and `renameat`.
-  - `Dir::read` clears `O_NONBLOCK` with `fcntl` on the file it opened.
-  - `Dir::entries` hands a fresh descriptor to `fdopendir`, copies each
+  - `Dir::open_file` clears `O_NONBLOCK` with `fcntl` on the file it
+    opened, and a failed `fcntl` fails the open.
+  - `Dir::entries` clears `errno` before each `readdir` and reads it after
+    a null, so a read error is returned and not taken for the end. It
+    hands a fresh descriptor to `fdopendir`, copies each
     name `readdir` returns before the next call, and calls `closedir` once.
     When `fdopendir` fails, `OwnedFd` closes the descriptor.
 - `timestamp` in `src/project.rs` zero-fills a `libc::tm`, then calls
@@ -257,8 +260,12 @@ first and opened later.
 - It creates `.<filename>.<pid>-<n>.omaquill-tmp` in the target's folder
   with `O_CREAT | O_EXCL | O_NOFOLLOW`. A name already taken moves on to
   the next `n`, up to 1,000 tries.
-- When the target is a regular file, the temp file takes its `0o777`
-  permission bits. Set-id and sticky bits are not copied.
+- When the target is a regular file owned by this user, the temp file
+  takes its `0o777` permission bits. A file someone else owns passes on
+  nothing, and the temp file keeps `0o666` less the umask. Set-id and
+  sticky bits are never copied.
+- A long target name is cut short in the temp name, so the temp name stays
+  within 255 bytes.
 - It writes the bytes, calls `sync_all` on the temp file, and renames the
   temp file onto the target with `renameat` in that same folder. A failure
   deletes the temp file. The file `sync_all` is part of that result, so a
@@ -290,19 +297,36 @@ a dangling symlink included, is an error.
 
 Files outside a project go through `fsdir::write_atomic` or
 `fsdir::write_atomic_if` with a path. These are the window's Compile, the
-`omaquill compile` command, settings, the recent-project list,
+`omaquill compile` command's file targets, settings, the recent-project list,
 per-project view state, the word lists, and `today.json`. That call opens
 the file's folder once, following symlinks in the folder's path, which the
 user chose. Then it is `Dir::write_atomic_if` in that folder. A symlink at
 the file itself is replaced, not followed. That covers a link planted in a
 shared folder where the user exports. It also means a settings file kept
 as a symlink into a dotfiles repository becomes a plain file on the next
-save.
+save. Settings and state files stay strict on purpose. A user who keeps
+them in a dotfiles repository has to link the folder, not each file.
+
+`omaquill compile PROJECT OUT` picks its write by what OUT is
+(`write_output` in `src/main.rs`).
+
+- `-`, `/dev/stdout`, `/dev/fd/1`, and `/proc/self/fd/1` write to the
+  process's own standard output. The path is not printed after the bytes.
+- A FIFO, device, or socket gets a plain write, opened with `O_NOFOLLOW`
+  and with no file created. `/dev/null` works this way.
+- A symlink under `/dev` is followed for a plain write and never replaced,
+  as root too. When it leads to a regular file, the command writes nothing
+  and says so.
+- Anything else is `fsdir::write_atomic`. A symlink there is replaced, and
+  a folder is refused with "is not a regular file".
 
 `project::backup` zips one project into `state::backup_dir`. The folder name
 includes a hash of the project's full path, so two projects do not share or
-prune each other's zips. It reads the project through a `Dir`, and a file
-or folder that is a symlink is left out of the zip. The zip is written to
+prune each other's zips. `Project::backup`, the backup before a project
+replace, and the backup the window starts on open read the open project
+folder (`Project::folder`, `backup_folder`). They do not open the project
+path again. A file or folder that is a symlink is left out of the zip, and
+so is one that vanishes or changes kind while the backup runs. The zip is written to
 `.backup.<pid>-<n>.omaquill-tmp` in that folder, synced, then hard-linked
 to `<date>.zip` (or `<date> N.zip` when that second already has a backup).
 The link fails if the name is already there, so two backups never share a
@@ -316,20 +340,28 @@ into another.
 
 `is_openable` allows documents and media only. The test
 `media_extensions_are_plain_and_openable_types_are_few` refuses `.desktop`,
-`.sh`, `.html`, `.exe`, `.AppImage`, and `.py`. `media_path` accepts a
-short alphanumeric extension when the file is a regular file reached
-through the project's `Dir` with no symlink on the way. It returns a path,
-and the app that opens that path resolves it again.
-`safe_to_open` in `src/ui/board.rs` also reads up to 4096 bytes and checks
-the sniffed type. `image_size_ok` reads the header and refuses an image of
-more than 100,000,000 pixels, or a side longer than 30,000, before decode.
+`.sh`, `.html`, `.exe`, `.AppImage`, and `.py`. `Project::media` accepts a
+short alphanumeric extension and opens the file through the project's
+`Dir`. A symlink, a folder link on the way, a FIFO, or anything else that
+is not a regular file is refused. It returns `Media`, an open file. No
+project path is handed to GTK, gio, or another app.
+
+- An image is read once from that file, up to 256 MiB, and decoded from
+  the bytes. `decode_image` in `src/ui/board.rs` stops at the header for an
+  image of more than 100,000,000 pixels, or a side longer than 30,000.
+- `safe_to_open` checks the name and the sniffed type of the first 4096
+  bytes.
+- Open in Default App copies the open file to `content.<ext>` in a new
+  `0o700` folder in `$XDG_RUNTIME_DIR` (the temp folder when that is
+  unset), mode `0o600`. It sniffs the copy again and launches the copy. The
+  copy stays for the app to read.
 
 Logout uses `glib_unix::unix_signal_add_local` for `SIGTERM`, `SIGINT`, and
 `SIGHUP`. The handler closes windows so a pending edit can save. Do not
 replace that handler with an exit that skips the close.
 
-A change to `src/fsdir.rs`, `is_uuid` in `empty_trash`,
-`is_openable`, `safe_to_open`, `image_size_ok`, backup pruning, or the
+A change to `src/fsdir.rs`, `is_uuid` in `empty_trash`, `is_openable`,
+`safe_to_open`, `decode_image`, `Project::media`, backup pruning, or the
 `editor_uuid` save path needs a test that fails when the guarantee is gone.
 
 ## Layout

@@ -373,6 +373,69 @@ pub struct Project {
     checksums_dirty: bool,
 }
 
+/// A media item's file, open for reading. See [`Project::media`].
+#[derive(Debug)]
+pub struct Media {
+    /// `content.<ext>`, the file's name in its item folder. Only its
+    /// extension is meant for deciding the type.
+    pub name: String,
+    file: std::fs::File,
+}
+
+impl Media {
+    /// The whole file, or an `InvalidData` error when it is longer than
+    /// `max` bytes. At most `max + 1` bytes are read.
+    pub fn read_capped(&self, max: u64) -> io::Result<Vec<u8>> {
+        use io::{Read, Seek};
+        let mut file = &self.file;
+        file.seek(io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is larger than {max} bytes", self.name),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Up to `n` bytes from the start of the file.
+    pub fn head(&self, n: usize) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; n];
+        let mut got = 0;
+        while got < n {
+            match self.file.read_at(&mut buf[got..], got as u64) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        buf.truncate(got);
+        Ok(buf)
+    }
+
+    /// Copies the file to `content.<ext>` in a new folder of its own, made
+    /// with mode `0o700` in `base`. The copy has mode `0o600`. Its path is
+    /// the one to hand to another app: no other user can swap it, and it
+    /// is not in the project. The copy is left for that app to read.
+    pub fn copy_to_private_file(&self, base: &Path) -> io::Result<PathBuf> {
+        use io::Seek;
+        use std::os::unix::fs::PermissionsExt;
+        let folder_name = format!("omaquill-open-{}", new_uuid());
+        let folder = Dir::open(base)?.create_private_dir_new(OsStr::new(&folder_name))?;
+        let mut out = folder.create_new(OsStr::new(&self.name))?;
+        out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut from = &self.file;
+        from.seek(io::SeekFrom::Start(0))?;
+        io::copy(&mut from, &mut out)?;
+        out.sync_all()?;
+        Ok(base.join(folder_name).join(&self.name))
+    }
+}
+
 /// Where a binder item sits: the path of item indices from the binder.
 type Loc = Vec<usize>;
 
@@ -977,10 +1040,18 @@ impl Project {
         self.path.join(data_rel(uuid))
     }
 
-    /// The file behind a media item (`content.png`, `content.pdf` ...).
-    /// The extension comes from the project's XML, so it must be a plain
-    /// one: letters and digits only, no path tricks.
-    pub fn media_path(&self, uuid: &str) -> Option<PathBuf> {
+    /// The file behind a media item (`content.png`, `content.pdf` ...),
+    /// opened through the project folder. The extension comes from the
+    /// project's XML, so it must be a plain one: letters and digits only,
+    /// no path tricks. `None` when the id or extension is not plain, or
+    /// when the file is missing, a symlink, under a folder that is one, or
+    /// not a regular file (a FIFO named like an image would block its
+    /// reader).
+    ///
+    /// The result is an open file, not a path. Everything that shows or
+    /// hands on the media reads this file, so a name swapped after the
+    /// check changes nothing.
+    pub fn media(&self, uuid: &str) -> Option<Media> {
         // An empty id is not a folder. Joining it would look at
         // `Files/Data/content.<ext>`, which is not a document.
         if !is_uuid(uuid) {
@@ -990,11 +1061,9 @@ impl Project {
         if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }
-        let rel = data_rel(uuid).join(format!("content.{ext}"));
-        // A FIFO named like an image blocks the reader that opens it. A
-        // symlink, or a folder on the way that is one, is not offered.
-        let plain = matches!(self.root.kind(&rel), Ok(Some(fsdir::Kind::File)));
-        plain.then(|| self.path.join(rel))
+        let name = format!("content.{ext}");
+        let file = self.root.open_file(&data_rel(uuid).join(&name)).ok()?;
+        Some(Media { name, file })
     }
 
     fn read_rtf(&self, uuid: &str, file: &str) -> Result<RichText> {
@@ -1314,24 +1383,46 @@ impl Project {
         Ok(())
     }
 
-    /// Zips the whole project into `dir`; see [`backup`].
+    /// Zips the whole project into `dir`; see [`backup`]. The project is
+    /// read through its open folder.
     pub fn backup(&self, dir: &Path, keep: usize) -> Result<PathBuf> {
-        backup(&self.path, dir, keep)
+        backup_folder(&self.root, dir, keep, &timestamp())
+    }
+
+    /// [`Project::backup`] with `now` in place of the clock.
+    pub fn backup_at(&self, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
+        backup_folder(&self.root, dir, keep, now)
+    }
+
+    /// A second descriptor for the open project folder, for a backup on
+    /// another thread ([`backup_folder`]).
+    pub fn folder(&self) -> io::Result<Dir> {
+        self.root.try_clone()
     }
 }
 
 /// Zips the project at `path` into its own folder under `dir`
 /// (`<name>-<id>/<date>.zip`, the id from the project's full path, so two
 /// projects never share or prune each other's backups), and keeps only the
-/// newest `keep` there. A free function so it can run on another thread
-/// while the project is open.
+/// newest `keep` there. The project folder is opened once; see
+/// [`backup_folder`].
 pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
-    backup_at(path, dir, keep, &timestamp())
+    backup_folder(&Dir::open(path)?, dir, keep, &timestamp())
 }
 
 /// [`backup`] with `now` in place of the clock. `now` has the shape
 /// [`timestamp`] returns.
 pub fn backup_at(path: &Path, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
+    backup_folder(&Dir::open(path)?, dir, keep, now)
+}
+
+/// [`backup_at`] for a project folder that is already open, as
+/// [`Project::folder`] gives one. Every file is read through `root`. The
+/// backup folder's name and id come from the path `root` was opened by;
+/// that path is only hashed, never opened. A free function so it can run
+/// on another thread while the project is open.
+pub fn backup_folder(root: &Dir, dir: &Path, keep: usize, now: &str) -> Result<PathBuf> {
+    let path = root.path();
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1348,7 +1439,7 @@ pub fn backup_at(path: &Path, dir: &Path, keep: usize, now: &str) -> Result<Path
         std::process::id(),
         N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    if let Err(e) = write_backup(path, &folder, &tmp) {
+    if let Err(e) = write_backup(root, &folder, &tmp) {
         let _ = folder.remove_file(Path::new(&tmp));
         return Err(e);
     }
@@ -1389,19 +1480,24 @@ fn is_backup_name(n: &str) -> bool {
             || (b[19] == b' ' && b[20..].iter().all(u8::is_ascii_digit) && b.len() > 20))
 }
 
-/// Zips the project at `path` into the new file `tmp` in `folder`. The
-/// project folder is opened once and walked through [`Dir`]: a file or
-/// folder that is a symlink is left out, including one swapped in while
-/// the backup runs.
-fn write_backup(path: &Path, folder: &Dir, tmp: &OsStr) -> Result<()> {
+/// Zips the project open at `root` into the new file `tmp` in `folder`,
+/// walking it through [`Dir`]: a file or folder that is a symlink is left
+/// out, including one swapped in while the backup runs.
+fn write_backup(root: &Dir, folder: &Dir, tmp: &OsStr) -> Result<()> {
     let file = open_backup_temp(folder, tmp)?;
     let mut zip = zip::ZipWriter::new(io::BufWriter::new(file));
-    let top = path
+    let top = root
+        .path()
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let skip = |e: &io::Error| e.kind() == io::ErrorKind::NotFound || fsdir::is_link_refusal(e);
-    let root = Dir::open(path)?;
+    // Gone, a symlink now, or a folder that is a file now: a save or a
+    // second user changed it while the backup ran, and it is left out.
+    let skip = |e: &io::Error| {
+        e.kind() == io::ErrorKind::NotFound
+            || e.raw_os_error() == Some(libc::ENOTDIR)
+            || fsdir::is_link_refusal(e)
+    };
     // The stack holds paths, not open folders: a project with thousands of
     // documents has thousands of folders waiting, more than a process may
     // hold open. Each one is walked again from `root` when its turn comes.
@@ -2264,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn media_path_refuses_an_empty_id() {
+    fn media_refuses_an_empty_id() {
         let (path, mut project) = temp_project("media-empty");
         let research = project.root_folder(Kind::Research).unwrap().uuid;
         let id = project
@@ -2302,7 +2398,7 @@ mod tests {
         std::fs::write(&bait, b"BAIT").unwrap();
         let project = Project::open(&path).unwrap();
         assert!(project.item("").is_some());
-        assert!(project.media_path("").is_none());
+        assert!(project.media("").is_none());
         assert_eq!(std::fs::read(&bait).unwrap(), b"BAIT");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

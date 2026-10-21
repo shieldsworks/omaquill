@@ -16,7 +16,7 @@ use omaquill::compile::{self, Format, Options};
 use omaquill::export;
 use omaquill::project::{Item, Kind, Project};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -166,7 +166,81 @@ fn compile_cli(args: &[String]) -> Result<(), String> {
         }
     };
     let bytes = compile::compile(&p, &opts, format).map_err(|e| e.to_string())?;
-    omaquill::fsdir::write_atomic(out, &bytes).map_err(|e| format!("{}: {e}", out.display()))?;
-    println!("{}", out.display());
+    if write_output(out, &bytes)? == Wrote::File {
+        println!("{}", out.display());
+    }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Wrote {
+    /// Standard output got the bytes, so the path is not printed after them.
+    Stdout,
+    /// A file, device or FIFO got them.
+    File,
+}
+
+/// Writes the compiled `bytes` to `out`, the command's OUT argument.
+///
+/// - `-`, `/dev/stdout`, `/dev/fd/1` and `/proc/self/fd/1` are this
+///   process's standard output. The bytes go to that open stream, which
+///   also keeps `>>` appending.
+/// - A FIFO, device or socket at `out` gets a plain write, opened with
+///   `O_NOFOLLOW` and without creating anything.
+/// - A symlink under `/dev` (`/dev/stderr`, `/dev/fd/N` and the like) is
+///   followed for a plain write and is never replaced, as root too. `/dev`
+///   belongs to the system, and a link there names a stream or a device.
+///   When it leads to a regular file, nothing is written.
+/// - Anything else goes through [`omaquill::fsdir::write_atomic`]: a new
+///   file is renamed into place, and a symlink at `out` is replaced, not
+///   followed.
+fn write_output(out: &Path, bytes: &[u8]) -> Result<Wrote, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let shown = out.display();
+    let stdout_names = ["-", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"];
+    if stdout_names.iter().any(|n| out == Path::new(n)) {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(bytes)
+            .and_then(|()| stdout.flush())
+            .map_err(|e| format!("couldn't write to standard output: {e}"))?;
+        return Ok(Wrote::Stdout);
+    }
+    let meta = std::fs::symlink_metadata(out).ok();
+    let kind = meta.as_ref().map(|m| m.file_type());
+    let in_dev = out.starts_with("/dev")
+        && out
+            .components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    let dev_link = in_dev && kind.is_some_and(|k| k.is_symlink());
+    let special = kind
+        .is_some_and(|k| k.is_fifo() || k.is_char_device() || k.is_block_device() || k.is_socket());
+    if dev_link || special {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        if !dev_link {
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts
+            .open(out)
+            .map_err(|e| format!("couldn't open {shown} to write: {e}"))?;
+        let now = file
+            .metadata()
+            .map_err(|e| format!("couldn't check {shown}: {e}"))?;
+        if now.is_file() {
+            // A link in /dev to a regular file, or a name swapped since the
+            // check. A plain write there would leave the old tail.
+            return Err(format!(
+                "{shown} is a regular file now; give its own path to replace it"
+            ));
+        }
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .map_err(|e| format!("couldn't write {shown}: {e}"))?;
+        return Ok(Wrote::File);
+    }
+    omaquill::fsdir::write_atomic(out, bytes)
+        .map_err(|e| format!("couldn't write {shown}: {e}"))?;
+    Ok(Wrote::File)
 }
