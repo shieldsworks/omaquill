@@ -1351,7 +1351,7 @@ fn walk(
         } else {
             format!("{path} / {}", item.title)
         };
-        let key = item.uuid.to_ascii_uppercase();
+        let key = item.uuid.clone();
         if item.kind.has_text() && scan.seen.insert((key.clone(), Field::Body)) {
             let text = scan.project.text(&item.uuid)?;
             push_group(scan, item, path, here, Field::Body, &text);

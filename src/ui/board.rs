@@ -352,7 +352,7 @@ fn plain_once(
     cache: &mut HashMap<String, String>,
     load: impl FnOnce() -> String,
 ) -> String {
-    let key = uuid.to_ascii_uppercase();
+    let key = uuid.to_string();
     if let Some(text) = cache.get(&key) {
         return text.clone();
     }
@@ -365,7 +365,7 @@ fn plain_once(
 fn folder_words(item: &Item, counts: &HashMap<String, usize>) -> usize {
     fn add(item: &Item, counts: &HashMap<String, usize>, seen: &mut HashSet<String>) -> usize {
         let mut total = 0;
-        if seen.insert(item.uuid.to_ascii_uppercase()) {
+        if seen.insert(item.uuid.clone()) {
             total += counts.get(&item.uuid).copied().unwrap_or(0);
         }
         for child in &item.children {

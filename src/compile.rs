@@ -129,7 +129,7 @@ pub fn survey(project: &Project, cache: &mut HashMap<String, RichText>) -> Resul
     ) -> Result<()> {
         for item in items {
             if item.kind.has_text() {
-                let key = item.uuid.to_ascii_uppercase();
+                let key = item.uuid.clone();
                 let fresh = !cache.contains_key(&key);
                 let text = project.text_shared(&item.uuid, cache)?;
                 if fresh {

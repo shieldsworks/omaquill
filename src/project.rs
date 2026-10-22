@@ -155,6 +155,8 @@ impl Kind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
+    /// The binder id in its [`canonical_id`] form, whatever case the
+    /// `.scrivx` spells it in.
     pub uuid: String,
     pub kind: Kind,
     pub title: String,
@@ -310,7 +312,7 @@ struct IndexSlot {
 
 fn index_rows(items: &[Item], rows: &mut HashMap<String, (String, bool)>) {
     for item in items {
-        rows.entry(item.uuid.to_ascii_uppercase())
+        rows.entry(item.uuid.clone())
             .or_insert_with(|| (item.title.clone(), item.kind.has_text()));
         index_rows(&item.children, rows);
     }
@@ -324,8 +326,7 @@ fn index_items(
 ) {
     for item in items {
         if is_uuid(&item.uuid) {
-            let key = item.uuid.to_ascii_uppercase();
-            let doc = docs.entry(key).or_insert_with(|| IndexedDoc {
+            let doc = docs.entry(item.uuid.clone()).or_insert_with(|| IndexedDoc {
                 synopsis: project.synopsis(&item.uuid),
                 body: String::new(),
                 body_loaded: false,
@@ -574,14 +575,12 @@ impl Project {
         if doc.root.name != "ScrivenerProject" || doc.root.child("Binder").is_none() {
             return Err(Error::NotAProject(path));
         }
-        let checksums = root
-            .read(Path::new("Files/Data/docs.checksum"))
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let checksums = parse_checksums(
+            &root
+                .read(Path::new("Files/Data/docs.checksum"))
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+        );
         Ok(Project {
             path,
             root,
@@ -724,7 +723,7 @@ impl Project {
                     let meta = e.child("MetaData");
                     let meta_text = |name: &str| meta.and_then(|m| m.child_text(name));
                     Item {
-                        uuid: e.attr("UUID").unwrap_or_default(),
+                        uuid: canonical_id(&e.attr("UUID").unwrap_or_default()),
                         kind: Kind::from_attr(&e.attr("Type").unwrap_or_default()),
                         title: e.child_text("Title").unwrap_or_default(),
                         label: meta_text("LabelID").and_then(|s| s.trim().parse().ok()),
@@ -767,7 +766,7 @@ impl Project {
         let mut out = Vec::new();
         for n in 1..loc.len() {
             if let Some(e) = self.element_at(&loc[..n]) {
-                out.push(e.attr("UUID").unwrap_or_default());
+                out.push(canonical_id(&e.attr("UUID").unwrap_or_default()));
             }
         }
         out
@@ -868,7 +867,7 @@ impl Project {
         let e = self.element_mut(uuid)?;
         e.set_child_text("Title", title, &Self::item_indent(depth));
         self.touch(uuid);
-        self.reindex.insert(uuid.to_uppercase(), ());
+        self.reindex.insert(canonical_id(uuid), ());
         Ok(())
     }
 
@@ -1149,7 +1148,7 @@ impl Project {
             self.root.remove_tree(&data_rel(uuid))?;
             let prefix = format!("{}/", uuid.to_lowercase());
             self.checksums.retain(|(k, _)| !k.starts_with(&prefix));
-            self.reindex.insert(uuid.to_uppercase(), ());
+            self.reindex.insert(canonical_id(uuid), ());
         }
         self.checksums_dirty = true;
         self.scrivx_dirty = true;
@@ -1211,14 +1210,15 @@ impl Project {
     }
 
     /// One parse of a document, then a clone for every later row with that
-    /// id. The key is the uppercase id, matching the `Files/Data` folder.
-    /// [`text`] itself stays uncached, so a save cannot hand back this copy.
+    /// id. The key is the id's [`canonical_id`] form, matching the
+    /// `Files/Data` folder. [`text`] itself stays uncached, so a save cannot
+    /// hand back this copy.
     pub fn text_shared(
         &self,
         uuid: &str,
         cache: &mut HashMap<String, RichText>,
     ) -> Result<RichText> {
-        let key = uuid.to_ascii_uppercase();
+        let key = canonical_id(uuid);
         if let Some(text) = cache.get(&key) {
             return Ok(text.clone());
         }
@@ -1270,7 +1270,7 @@ impl Project {
             for i in items.iter().filter(|i| i.include_in_compile) {
                 if i.kind.has_text()
                     && is_uuid(&i.uuid)
-                    && seen.insert(i.uuid.to_ascii_uppercase())
+                    && seen.insert(i.uuid.clone())
                     && let Ok(t) = p.text(&i.uuid)
                     && let Some(par) = t
                         .paragraphs
@@ -1303,23 +1303,17 @@ impl Project {
     ///
     /// Scrivener keeps a document's files in `Files/Data/<UUID>/`. Rows that
     /// share a UUID share that folder, and a row with no UUID has no folder.
-    /// Each distinct UUID is read once. The search entry still follows the
-    /// last row that used that id, which is what a per-row walk stored.
+    /// Each distinct UUID is read once and has one entry, and ids that
+    /// differ only in case are one UUID. The entry follows the last row
+    /// that used that id, which is what a per-row walk stored.
     pub fn binder_index(&self) -> BinderIndex {
         let mut docs: HashMap<String, IndexedDoc> = HashMap::new();
         let mut slots: HashMap<String, IndexSlot> = HashMap::new();
         index_items(self, &self.items(), &mut docs, &mut slots);
         let mut counts = HashMap::new();
         let mut search = HashMap::new();
-        let mut uses: HashMap<String, usize> = HashMap::new();
-        for uuid in slots.keys() {
-            if is_uuid(uuid) {
-                *uses.entry(uuid.to_ascii_uppercase()).or_default() += 1;
-            }
-        }
         for (uuid, slot) in slots {
-            let key = uuid.to_ascii_uppercase();
-            let doc = is_uuid(&uuid).then(|| docs.get_mut(&key)).flatten();
+            let doc = docs.remove(&uuid);
             let synopsis = doc.as_ref().map(|d| d.synopsis.as_str()).unwrap_or("");
             let mut text = format!("{}\n{synopsis}\n", slot.title);
             if slot.has_text {
@@ -1332,16 +1326,6 @@ impl Project {
             if doc.as_ref().is_none_or(|d| d.notes.is_some()) {
                 text.push('\n');
                 text.push_str(doc.as_ref().and_then(|d| d.notes.as_deref()).unwrap_or(""));
-            }
-            if let Some(doc) = doc {
-                let left = uses
-                    .get_mut(&key)
-                    .expect("every indexed document has a slot");
-                *left = left.saturating_sub(1);
-                if *left == 0 {
-                    doc.body = String::new();
-                    doc.notes = None;
-                }
             }
             search.insert(uuid, text.to_lowercase());
         }
@@ -1376,7 +1360,7 @@ impl Project {
             }
         }
         self.checksums_dirty = true;
-        self.reindex.insert(uuid.to_uppercase(), ());
+        self.reindex.insert(canonical_id(uuid), ());
         self.touch(uuid);
         Ok(())
     }
@@ -1482,7 +1466,7 @@ impl Project {
         index_rows(&self.items(), &mut rows);
         let mut entries = Vec::new();
         for uuid in uuids {
-            let Some((title, has_text)) = rows.get(&uuid.to_ascii_uppercase()) else {
+            let Some((title, has_text)) = rows.get(&uuid) else {
                 continue; // deleted
             };
             let mut entry = Element::new("Document");
@@ -1784,6 +1768,44 @@ pub fn is_uuid(s: &str) -> bool {
             8 | 13 | 18 | 23 => c == '-',
             _ => c.is_ascii_hexdigit(),
         })
+}
+
+/// The one form of a binder id that omaquill holds after reading a project.
+///
+/// Scrivener writes UUIDs in uppercase and names each `Files/Data` folder
+/// after the uppercase UUID, so ids that differ only in ASCII case name one
+/// document. A UUID comes back uppercase. Any other id has no folder and is
+/// returned unchanged.
+pub fn canonical_id(id: &str) -> String {
+    if is_uuid(id) {
+        id.to_ascii_uppercase()
+    } else {
+        id.to_string()
+    }
+}
+
+/// `docs.checksum` lines as `lowercase-uuid/file` → SHA-1, in file order.
+///
+/// Scrivener writes the id part in lowercase. A key whose id differs only in
+/// case names the same file, so it joins the first line for that file and
+/// the last value read for it is kept.
+fn parse_checksums(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for (key, sum) in text.lines().filter_map(|l| l.split_once('=')) {
+        let key = match key.split_once('/') {
+            Some((id, file)) if is_uuid(id) => format!("{}/{file}", id.to_ascii_lowercase()),
+            _ => key.to_string(),
+        };
+        match at.get(&key) {
+            Some(&i) => out[i].1 = sum.to_string(),
+            None => {
+                at.insert(key.clone(), out.len());
+                out.push((key, sum.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// A random (version 4) UUID in Scrivener's uppercase form.
@@ -2099,12 +2121,11 @@ mod tests {
             ids.len()
         );
         let upper = indexed.search.get(&shared).unwrap();
-        let folded = indexed.search.get(&lower).unwrap();
         assert!(upper.contains("lamp"), "{upper}");
-        assert!(folded.contains("lamp"), "{folded}");
+        assert!(!indexed.search.contains_key(&lower));
         let words = rtf::word_count(&body);
         assert_eq!(indexed.counts.get(&shared).copied(), Some(words));
-        assert_eq!(indexed.counts.get(&lower).copied(), Some(words));
+        assert!(!indexed.counts.contains_key(&lower));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -2527,5 +2548,181 @@ mod tests {
         assert!(project.media("").is_none());
         assert_eq!(std::fs::read(&bait).unwrap(), b"BAIT");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Gives the binder rows in `ids` the spellings in `to`, row for row,
+    /// as text in the `.scrivx`, leaving every other byte alone.
+    fn respell_ids(path: &Path, ids: &[String], to: &[String]) -> std::path::PathBuf {
+        let scrivx = std::fs::read_dir(path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "scrivx"))
+            .unwrap()
+            .path();
+        let mut xml = std::fs::read_to_string(&scrivx).unwrap();
+        for (from, to) in ids.iter().zip(to) {
+            let from = format!("UUID=\"{from}\"");
+            assert_eq!(xml.matches(&from).count(), 1, "{from}");
+            xml = xml.replacen(&from, &format!("UUID=\"{to}\""), 1);
+        }
+        std::fs::write(&scrivx, xml).unwrap();
+        scrivx
+    }
+
+    #[test]
+    fn case_variant_ids_are_one_document() {
+        let (path, mut project) = temp_project("case-variants");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let doc = project.add_item(Kind::Text, "Lamp", &draft, None).unwrap();
+        let body = "lamp ".repeat(20_000);
+        project
+            .set_text(&doc, &RichText::from_plain(&body))
+            .unwrap();
+        let mut rows = Vec::new();
+        for n in 0..16 {
+            rows.push(
+                project
+                    .add_item(Kind::Text, &format!("Alias {n}"), &draft, None)
+                    .unwrap(),
+            );
+        }
+        project.save().unwrap();
+        drop(project);
+        let fixed = "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF".to_string();
+        let data = path.join("Files/Data");
+        std::fs::rename(data.join(&doc), data.join(&fixed)).unwrap();
+        let spellings: Vec<String> = (0..16u32)
+            .map(|n| {
+                let mut letter = 0;
+                fixed
+                    .chars()
+                    .map(|c| {
+                        if !c.is_ascii_alphabetic() {
+                            return c;
+                        }
+                        letter += 1;
+                        if n >> (letter % 4) & 1 == 1 {
+                            c.to_ascii_lowercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let distinct: HashSet<&String> = spellings.iter().collect();
+        assert_eq!(distinct.len(), spellings.len());
+        let mut ids = vec![doc.clone()];
+        ids.extend(rows.iter().cloned());
+        let mut to = vec![fixed.clone()];
+        to.extend(spellings.iter().cloned());
+        let scrivx = respell_ids(&path, &ids, &to);
+        let before = std::fs::read(&scrivx).unwrap();
+
+        let mut project = Project::open(&path).unwrap();
+        let draft_item = project.root_folder(Kind::Draft).unwrap();
+        let respelled: Vec<&Item> = draft_item
+            .children
+            .iter()
+            .filter(|i| i.uuid.eq_ignore_ascii_case(&fixed))
+            .collect();
+        assert_eq!(respelled.len(), 17);
+        assert!(respelled.iter().all(|i| i.uuid == fixed));
+        assert_eq!(project.item(&spellings[5]).unwrap().uuid, fixed);
+        assert_eq!(
+            project.ancestors(&spellings[3]),
+            vec![draft_item.uuid.clone()]
+        );
+
+        let indexed = project.binder_index();
+        let entries: Vec<&String> = indexed
+            .search
+            .keys()
+            .filter(|id| id.eq_ignore_ascii_case(&fixed))
+            .collect();
+        assert_eq!(entries, vec![&fixed], "one search entry per document");
+        let held: usize = indexed.search.values().map(String::len).sum();
+        assert!(
+            held < body.len() * 2,
+            "search held {held} bytes for one {}-byte document",
+            body.len()
+        );
+        assert_eq!(
+            indexed
+                .counts
+                .keys()
+                .filter(|id| id.eq_ignore_ascii_case(&fixed))
+                .count(),
+            1
+        );
+        assert_eq!(
+            indexed.counts.get(&fixed).copied(),
+            Some(rtf::word_count(&body))
+        );
+        assert_eq!(
+            compile_words(&draft_item, &indexed.counts),
+            rtf::word_count(&body)
+        );
+
+        assert_eq!(std::fs::read(&scrivx).unwrap(), before);
+        project.set_title(&spellings[7], "Renamed").unwrap();
+        project.save().unwrap();
+        let after = std::fs::read_to_string(&scrivx).unwrap();
+        for spelling in &spellings {
+            let rows = if *spelling == fixed { 2 } else { 1 };
+            assert_eq!(after.matches(&format!("UUID=\"{spelling}\"")).count(), rows);
+        }
+        let index = std::fs::read_to_string(path.join("Files/search.indexes")).unwrap();
+        assert_eq!(
+            index
+                .to_ascii_uppercase()
+                .matches(&format!("ID=\"{fixed}\""))
+                .count(),
+            1,
+            "{index}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_checksum_key_in_another_case_is_the_same_file() {
+        let (path, mut project) = temp_project("checksum-case");
+        let draft = project.root_folder(Kind::Draft).unwrap().uuid;
+        let doc = project.add_item(Kind::Text, "Lamp", &draft, None).unwrap();
+        project.save().unwrap();
+        drop(project);
+        let sums = path.join("Files/Data/docs.checksum");
+        std::fs::write(
+            &sums,
+            format!("{doc}/content.rtf=old\nother/file=kept\n{doc}/content.rtf=older\n"),
+        )
+        .unwrap();
+        let mut project = Project::open(&path).unwrap();
+        project
+            .set_text(&doc, &RichText::from_plain("lamp"))
+            .unwrap();
+        project.save().unwrap();
+        let text = std::fs::read_to_string(&sums).unwrap();
+        let lower = doc.to_ascii_lowercase();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].starts_with(&format!("{lower}/content.rtf=")),
+            "{text}"
+        );
+        assert!(!lines[0].ends_with("=old") && !lines[0].ends_with("=older"));
+        assert_eq!(lines[1], "other/file=kept");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn canonical_id_uppercases_only_uuids() {
+        assert_eq!(
+            canonical_id("abcdefab-cdef-4abc-8def-abcdefabcdef"),
+            "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"
+        );
+        assert_eq!(canonical_id("Draft"), "Draft");
+        assert_eq!(canonical_id(""), "");
+        assert_eq!(canonical_id("../x"), "../x");
     }
 }
