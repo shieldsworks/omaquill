@@ -361,6 +361,8 @@ pub fn add_recent(path: &Path) {
 
 /// Per-project view state, kept out of the project so Scrivener's own
 /// settings files stay untouched.
+/// Ids are read back in their [`crate::project::canonical_id`] form, the
+/// form the binder holds.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectView {
     pub open: Option<String>,
@@ -411,15 +413,23 @@ pub fn save_words(path: &Path, words: &BTreeSet<String>) -> std::io::Result<()> 
 
 impl ProjectView {
     pub fn load(project: &Path) -> ProjectView {
-        let kv = read_kv(&project_file(project));
+        ProjectView::load_from(&project_file(project))
+    }
+
+    /// [`ProjectView::load`] from the view-state file at `path`.
+    fn load_from(path: &Path) -> ProjectView {
+        let kv = read_kv(path);
         ProjectView {
-            open: kv.get("open").filter(|v| !v.is_empty()).cloned(),
+            open: kv
+                .get("open")
+                .filter(|v| !v.is_empty())
+                .map(|v| crate::project::canonical_id(v)),
             expanded: kv
                 .get("expanded")
                 .map(|v| {
                     v.split(',')
                         .filter(|s| !s.is_empty())
-                        .map(String::from)
+                        .map(crate::project::canonical_id)
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1198,5 +1208,29 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         }
+    }
+
+    #[test]
+    fn view_state_ids_read_back_canonical() {
+        let dir = temp_dir("view-case");
+        let path = dir.join("view");
+        std::fs::write(
+            &path,
+            "open = abcdefab-cdef-4abc-8def-abcdefabcdef\nexpanded = aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee,Draft\n",
+        )
+        .unwrap();
+        let view = ProjectView::load_from(&path);
+        assert_eq!(
+            view.open.as_deref(),
+            Some("ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF")
+        );
+        assert_eq!(
+            view.expanded,
+            vec![
+                "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE".to_string(),
+                "Draft".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
