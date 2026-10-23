@@ -20,17 +20,19 @@ it, and CI does not run qmllint.
 
 ## Done means verified
 
-This repo has no `scripts/verify.sh`. You are not done until both of these
-pass from the repo root.
+You are not done until these pass from the repo root.
 
 ```sh
 mise lint
 mise test
+scripts/verify.sh
 ```
 
 `mise lint` runs `cargo fmt --check`, then
 `cargo clippy --locked --all-targets -- -D warnings`. `mise test` runs
-`cargo test --locked`. CI runs both, then `cargo build --release --locked`,
+`cargo test --locked`. `scripts/verify.sh` checks the sha256 pin on
+`scripts/check-comments.sh` with `sha256sum -c`, then runs that script.
+CI runs `mise lint` and `mise test`, then `cargo build --release --locked`,
 on x86_64 and on aarch64. It runs on pull requests and on pushes to `main`.
 Fix what a check reports. Do not weaken the check that reported it.
 
@@ -64,26 +66,28 @@ These files set the rules. Change them only in a change whose whole purpose
 is changing them. Such a PR merges only after review by someone other than
 its author, either Casey or Casey's delegated reviewer Dev. Dev's review
 means all three. An independent agent verifies the PR head on a clean
-checkout. That agent runs `mise lint` and `mise test` and drives the
-changed behavior. An adversarial review challenges the change. CI is green
-on the exact head SHA merged. The author agent never approves or merges
-its own PR. A `Cargo.lock` change or a dependency change merges only after
-that same review.
+checkout. That agent runs `mise lint`, `mise test`, and `scripts/verify.sh`,
+and drives the changed behavior. An adversarial review challenges the
+change. CI is green on the exact head SHA merged. The author agent never
+approves or merges its own PR. A `Cargo.lock` change or a dependency change
+merges only after that same review.
 
 - `.github/workflows/`
 - the `lint`, `test`, and `build` tasks in `mise.toml`
 - `#![cfg_attr(not(test), deny(clippy::unwrap_used))]` in `src/lib.rs` and
   in `src/main.rs`
+- `scripts/verify.sh` and `scripts/check-comments.sh`
 
-This repo has no `[lints]` table, no `clippy.toml`, no `scripts/verify.sh`,
-and no `scripts/check-comments.sh`. Do not add any of them in a change about
-behavior. A new gate is its own change. Such a PR merges only after review
+This repo has no `[lints]` table and no `clippy.toml`. Do not add either in
+a change about behavior. Do not change `scripts/verify.sh` or
+`scripts/check-comments.sh` in a change about behavior. A new gate is its
+own change. Such a PR merges only after review
 by someone other than its author, either Casey or Casey's delegated
 reviewer Dev. Dev's review means all three. An independent agent verifies
-the PR head on a clean checkout. That agent runs `mise lint` and `mise test`
-and drives the changed behavior. An adversarial review challenges the
-change. CI is green on the exact head SHA merged. The author agent never
-approves or merges its own PR.
+the PR head on a clean checkout. That agent runs `mise lint`, `mise test`,
+and `scripts/verify.sh`, and drives the changed behavior. An adversarial
+review challenges the change. CI is green on the exact head SHA merged.
+The author agent never approves or merges its own PR.
 
 Clippy's pedantic lints, the cast lints, `undocumented_unsafe_blocks`, and
 `allow_attributes_without_reason` are not turned on. Do not turn one on in
@@ -122,8 +126,26 @@ open an issue and leave the code honest. A constraint from outside the repo
 is written as the fact. Say what the outside thing does, and what this code
 does about it.
 
-No script in this repo checks those words. Do not add one in a behavior
-change.
+`scripts/check-comments.sh` is a byte-for-byte copy of omahoy's canonical
+script. The pin is this sha256. A copy with any other hash is not this
+rule.
+
+```
+f3ec8a2d07e8f1e7c50770d0bb93579fc7bb0d60fc8e359a22607ba55cebc6c6  scripts/check-comments.sh
+```
+
+From the repo root, pipe that line to `sha256sum -c`. `scripts/verify.sh`
+does that, then runs the script with no arguments to scan the default set.
+
+```sh
+scripts/check-comments.sh
+```
+
+The script reads tracked `.rs`, `.qml`, `.js`, `.sh`, `.py`, `.toml`, and
+`.yml` files. It skips `tests/fixtures/` and `**/vendor/**`. It does not
+read Markdown. The rule holds there too. Pass git pathspecs to scan a
+different set. Those arguments replace the default set. The script still
+excludes its own path.
 
 ## Copy the right pattern
 
@@ -200,10 +222,10 @@ site.
 A PR merges only after review by someone other than its author, either
 Casey or Casey's delegated reviewer Dev. Dev's review means all three. An
 independent agent verifies the PR head on a clean checkout. That agent runs
-`mise lint` and `mise test` and drives the changed behavior. An adversarial
-review challenges the change. CI is green on the exact head SHA merged. The
-author agent never approves or merges its own PR. The author agent does not
-mark the change verified.
+`mise lint`, `mise test`, and `scripts/verify.sh`, and drives the changed
+behavior. An adversarial review challenges the change. CI is green on the
+exact head SHA merged. The author agent never approves or merges its own
+PR. The author agent does not mark the change verified.
 
 The change lists what changed, the tests that prove it, and what was not
 checked. The reviewer reports what they ran and what they saw.
@@ -414,6 +436,8 @@ A change to `src/fsdir.rs`, `is_uuid` in `empty_trash`, `is_openable`,
 - `tests/boundary.rs` races symlink swaps against saves and backups.
 - `tests/real_project.rs` reads an external project when asked.
 - `tests/fixtures/Lighthouse.scriv` is the made-up project.
+- `scripts/check-comments.sh` is the byte-for-byte copy of omahoy's comment rule.
+- `scripts/verify.sh` checks that copy's sha256, then runs the script.
 - `scripts/install-local.sh` and `scripts/uninstall-local.sh` install and remove the local build.
 - `packaging/PKGBUILD` is the Arch package recipe.
 - `data/` holds the desktop entry, the icon, the mime type, and the hyphenation patterns.
