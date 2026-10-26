@@ -50,6 +50,14 @@ What the tests cover:
   swaps files and folders for symlinks while omaquill saves and backs up.
   It asserts that the files outside the project keep their bytes. Each race
   runs for 2.5 seconds.
+- `tests/backup_permissions.rs` sets the umask to `022`, backs up a
+  project whose folders are `0700` and files `0600`, and asserts the
+  backup folders are `0700` and the archive `0600`. It also widens those
+  folders and an old archive and asserts the next backup closes them
+  again. A symlink planted at a backup name, an unrelated file, and another
+  project's backup folder are left as they were. A leftover staging file
+  is narrowed to `0600` and kept. A
+  backups folder that is a symlink is refused with its path.
 - `tests/real_project.rs` runs only when `OMAQUILL_REAL_PROJECT` is set.
   Point it at a `.scriv` folder. The tests only read that folder. With the
   variable unset, they return and pass.
@@ -143,7 +151,8 @@ passes today's lints and has a test. Old code may predate the rules.
 
 ## Allowed unsafe
 
-Eighteen blocks, in seventeen functions. Do not add another unless std and the crates
+Eighteen blocks under `src/`, in seventeen functions, and three more in
+tests, listed after them. Do not add another unless std and the crates
 already in `Cargo.toml` have no safe function for the job. A new block needs
 a `// SAFETY:` comment that says why it is sound, and the change names the
 site.
@@ -194,6 +203,17 @@ site.
   dictionary.
 - `Drop` for `Broker` in `src/enchant.rs` frees the dictionary, then the
   broker. The library closes after those calls return.
+
+In tests:
+
+- `disk_full_backup_leaves_the_project` in `tests/replace.rs` has two
+  blocks. It calls `libc::signal` with `SIGXFSZ` and `SIG_IGN`, then
+  `libc::setrlimit` with `RLIMIT_FSIZE`, in the child process it runs in,
+  so the backup write returns `EFBIG`.
+- `backups_of_a_private_project_stay_private` in `tests/backup_permissions.rs`
+  calls `libc::umask` with `0o022` before it creates a file. std has no
+  umask call. The file is its own test binary with that one test, so no
+  other thread creates files under the new mask.
 
 ## Review
 

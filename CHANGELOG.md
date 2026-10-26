@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Backups are private to you. The backups folder and each project's backup folder are at most `0700`, and each backup zip is at most `0600` from the moment it is created. On the next backup, an existing backups folder and that project's backup folder are closed to other users, and that project's existing backup zips and leftover incomplete ones are narrowed to at most `0600`. Symlinks are not followed, and other files and folders are left alone. A backups folder that is a symlink is now refused, and the backup fails with a message naming it. The private copy that Open in Default App makes is created `0600` rather than narrowed after creation.
+
 ## 0.2.0 - 2026-10-12
 
 - F7 turns spelling marks on or off, and that choice is saved. F11 composition mode hides the marks unless Preferences shows them. The word being typed is not marked. Spellcheck needs libenchant-2. Without that library, the marks stay off and the app still runs.
