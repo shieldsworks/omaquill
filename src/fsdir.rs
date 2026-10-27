@@ -314,6 +314,44 @@ impl Dir {
         self.child(name, false)
     }
 
+    /// The child folder `name`, private to this user: made with mode
+    /// `0o700` when absent, and an existing folder loses its group and
+    /// other permission bits. A symlink in its place is refused as
+    /// [`Dir::walk`] refuses one. Any other failure, such as `fchmod`
+    /// refusing a folder another user owns, names the folder and the
+    /// reason.
+    pub fn private_dir(&self, name: &OsStr) -> io::Result<Dir> {
+        let made = (|| {
+            match self.mkdir(&entry_name(name)?, 0o700) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            let dir = self.child(name, false)?;
+            let handle = File::from(dir.fd.try_clone()?);
+            let mode = handle.metadata()?.mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                handle.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
+            }
+            Ok(dir)
+        })();
+        made.map_err(|e| {
+            if is_link_refusal(&e) {
+                return e;
+            }
+            let shown = self.shown.join(name);
+            io::Error::new(
+                e.kind(),
+                format!("{} can't be made private to you: {e}", shown.display()),
+            )
+        })
+    }
+
+    /// The user that owns this folder.
+    pub fn owner(&self) -> io::Result<u32> {
+        Ok(File::from(self.fd.try_clone()?).metadata()?.uid())
+    }
+
     /// Bytes free for this user on the filesystem holding this folder.
     pub fn free_bytes(&self) -> io::Result<u64> {
         // SAFETY: `libc::statvfs` is a C struct of integers, so all-zero is
@@ -438,10 +476,20 @@ impl Dir {
     /// already at that name, a symlink included, is an `AlreadyExists`
     /// error.
     pub fn create_new(&self, name: &OsStr) -> io::Result<File> {
+        self.create_new_with_mode(name, 0o666)
+    }
+
+    /// [`Dir::create_new`] with mode `0o600`, set as the file is made, so
+    /// no other user can open it at any point.
+    pub fn create_private_new(&self, name: &OsStr) -> io::Result<File> {
+        self.create_new_with_mode(name, 0o600)
+    }
+
+    fn create_new_with_mode(&self, name: &OsStr, mode: libc::mode_t) -> io::Result<File> {
         let fd = self.openat(
             &entry_name(name)?,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-            0o666,
+            mode,
         )?;
         Ok(File::from(fd))
     }
@@ -775,6 +823,45 @@ mod tests {
             std::fs::read(dir.join("outside/secret")).unwrap(),
             b"secret"
         );
+    }
+
+    #[test]
+    fn private_entries_are_closed_to_other_users() {
+        let (_s, root, dir) = scratch("private");
+        root.create_private_new(OsStr::new("archive")).unwrap();
+        root.private_dir(OsStr::new("made")).unwrap();
+        std::fs::create_dir(dir.join("inside/open")).unwrap();
+        std::fs::set_permissions(
+            dir.join("inside/open"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        root.private_dir(OsStr::new("open")).unwrap();
+        std::fs::write(dir.join("inside/file"), "x").unwrap();
+        let e = root.private_dir(OsStr::new("file")).unwrap_err();
+        assert!(
+            e.to_string().contains(&format!(
+                "{} can't be made private to you: ",
+                dir.join("inside/file").display()
+            )),
+            "{e}"
+        );
+        let mode = |n: &str| {
+            std::fs::metadata(dir.join("inside").join(n))
+                .unwrap()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("archive") & 0o077, 0);
+        assert_eq!(mode("made") & 0o077, 0);
+        assert_eq!(mode("open"), 0o700);
+        std::fs::set_permissions(dir.join("outside"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        symlink(dir.join("outside"), dir.join("inside/link")).unwrap();
+        let e = root.private_dir(OsStr::new("link")).unwrap_err();
+        assert!(is_link_refusal(&e), "{e}");
+        let outside = std::fs::metadata(dir.join("outside")).unwrap().mode() & 0o777;
+        assert_eq!(outside, 0o755, "a linked folder keeps its mode");
     }
 
     #[test]

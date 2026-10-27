@@ -522,9 +522,7 @@ impl PrivateCopies {
     /// `folder` and returns how many were written.
     fn fill(folder: &Dir, media: &Media, max: u64) -> io::Result<u64> {
         use io::{Read, Seek};
-        use std::os::unix::fs::PermissionsExt;
-        let mut out = folder.create_new(OsStr::new(&media.name))?;
-        out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let mut out = folder.create_private_new(OsStr::new(&media.name))?;
         let mut from = &media.file;
         from.seek(io::SeekFrom::Start(0))?;
         let copied = io::copy(&mut from.take(max.saturating_add(1)), &mut out)?;
@@ -1514,8 +1512,11 @@ impl Project {
 /// Zips the project at `path` into its own folder under `dir`
 /// (`<name>-<id>/<date>.zip`, the id from the project's full path, so two
 /// projects never share or prune each other's backups), and keeps only the
-/// newest `keep` there. The project folder is opened once; see
-/// [`backup_folder`].
+/// newest `keep` there. `dir` and that folder are private to this user
+/// ([`Dir::private_dir`]), each archive is made with mode `0o600` before
+/// any byte is written, and archives already there are narrowed to
+/// `0o600` ([`close_backups`]), so a backup never opens a project to other
+/// users. The project folder is opened once; see [`backup_folder`].
 pub fn backup(path: &Path, dir: &Path, keep: usize) -> Result<PathBuf> {
     backup_folder(&Dir::open(path)?, dir, keep, &timestamp())
 }
@@ -1539,9 +1540,20 @@ pub fn backup_folder(root: &Dir, dir: &Path, keep: usize, now: &str) -> Result<P
         .unwrap_or_default();
     let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let id = &sha1::hex(full.to_string_lossy().as_bytes())[..8];
-    let dir = dir.join(format!("{name}-{id}"));
-    std::fs::create_dir_all(&dir)?;
-    let folder = Dir::open(&dir)?;
+    let backups = dir
+        .file_name()
+        .ok_or_else(|| Error::Invalid(format!("{} names no folder", dir.display())))?;
+    let parent = match dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent)?;
+    let own = format!("{name}-{id}");
+    let folder = Dir::open(parent)?
+        .private_dir(backups)?
+        .private_dir(OsStr::new(&own))?;
+    let dir = dir.join(own);
+    close_backups(&folder)?;
     let stamp = backup_stamp(now);
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = OsString::from(format!(
@@ -1565,6 +1577,64 @@ pub fn backup_folder(root: &Dir, dir: &Path, keep: usize, now: &str) -> Result<P
         let _ = folder.remove_file(Path::new(&old.remove(0)));
     }
     Ok(dir.join(out))
+}
+
+/// Narrows each backup archive in `folder`, and each staging file
+/// ([`is_staging_name`]) an earlier run left behind, to at most `0o600`,
+/// so one an older omaquill left readable is closed too. Only a regular
+/// file this user owns with one of those names is changed, through a
+/// descriptor opened without following a symlink. A symlink, another kind
+/// of entry, or a file this user may not open or change is left as it is.
+/// The folder's owner stands for this user: [`Dir::private_dir`] has just
+/// made it, narrowed it, or opened a folder with no group or other access,
+/// which for a non-root user means this user owns it.
+fn close_backups(folder: &Dir) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let skip = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+        ) || fsdir::is_link_refusal(e)
+    };
+    let me = folder.owner()?;
+    for name in folder.entries()? {
+        if !name
+            .to_str()
+            .is_some_and(|n| is_backup_name(n) || is_staging_name(n))
+        {
+            continue;
+        }
+        let rel = Path::new(&name);
+        if folder.kind(rel)? != Some(fsdir::Kind::File) {
+            continue;
+        }
+        let file = match folder.open_file(rel) {
+            Ok(file) => file,
+            Err(e) if skip(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let meta = file.metadata()?;
+        let mode = meta.permissions().mode() & 0o7777;
+        if meta.uid() != me || mode & !0o600 == 0 {
+            continue;
+        }
+        match file.set_permissions(std::fs::Permissions::from_mode(mode & 0o600)) {
+            Ok(()) => {}
+            Err(e) if skip(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// `.backup.<pid>-<n>.omaquill-tmp`, the name [`backup_folder`] stages an
+/// archive under.
+fn is_staging_name(n: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    n.strip_prefix(".backup.")
+        .and_then(|rest| rest.strip_suffix(".omaquill-tmp"))
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(pid, count)| digits(pid) && digits(count))
 }
 
 /// `2026-09-28 19-05-02.zip` or `2026-09-28 19-05-02 2.zip`: only files
@@ -1713,11 +1783,11 @@ fn already_exists(e: &io::Error) -> bool {
 }
 
 fn open_backup_temp(folder: &Dir, tmp: &OsStr) -> Result<std::fs::File> {
-    match folder.create_new(tmp) {
+    match folder.create_private_new(tmp) {
         Ok(file) => Ok(file),
         Err(e) if already_exists(&e) => {
             folder.remove_file(Path::new(tmp))?;
-            Ok(folder.create_new(tmp)?)
+            Ok(folder.create_private_new(tmp)?)
         }
         Err(e) => Err(e.into()),
     }
